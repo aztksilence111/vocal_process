@@ -1,0 +1,11 @@
+.Rhistory
+.pytest_cache/
+.tmp/
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+venv/
+.venv/
+

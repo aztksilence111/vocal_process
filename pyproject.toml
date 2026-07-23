@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audio-processor-mvp"
+version = "0.1.0"
+description = "A small Python and FFmpeg based audio processing CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Local project" }]
+dependencies = []
+
+[project.scripts]
+audio-processor = "audio_processor.cli:main"
+audio-processor-gui = "audio_processor.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["audio_processor*"]
