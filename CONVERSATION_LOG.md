@@ -184,3 +184,38 @@
 1. 当前分支：`codex/add-gui-language-switch`。
 2. 提交前测试：`.venv\Scripts\python -m unittest discover`，结果通过，12 个测试全部 OK。
 3. 当前仓库尚未配置 Git 提交身份；由于用户目前没有 GitHub 账号，使用仓库本地配置，不写入全局 Git 配置。
+
+### User
+
+我已经注册好个人github账号，如何上传到github上
+
+### User
+
+我是问你如何上传到github上，帮我给出一些指导。就是Git仓库
+
+### Assistant Notes
+
+已向用户说明标准 GitHub 上传流程：在 GitHub 创建空仓库、配置 `origin`、推送 `main` 分支，以及 HTTPS 登录认证注意事项。
+
+### User
+
+请你帮我提交，我的用户名是aztksilence111，已经建好仓库
+
+### Assistant Notes
+
+检查后发现本地仓库已有第一次提交，当前远程仓库尚未配置。询问用户 GitHub 仓库名或完整地址。
+
+### User
+
+vocal_process
+
+### Assistant Notes
+
+执行 GitHub 推送流程：
+
+1. 配置远程仓库：`origin -> https://github.com/aztksilence111/vocal_process.git`。
+2. 从当前提交创建标准主分支：`main`。
+3. 首次推送 `main` 被 GitHub 拒绝，原因是远程 `main` 已有初始提交。
+4. 拉取远程 `origin/main` 后确认远程只有一个 `README.md`，内容为 `# vocal_process`。
+5. 使用 `--allow-unrelated-histories` 合并远程初始提交。
+6. README 出现 add/add 冲突；处理方式是保留本地完整说明，并将标题改为 `# vocal_process`。

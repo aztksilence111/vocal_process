@@ -1,4 +1,4 @@
-# Audio Processor MVP
+# vocal_process
 
 这是一个基于 Python 和 FFmpeg 的本地音频处理 MVP。当前版本提供命令行入口和桌面图形界面，用于检查环境、批量队列处理、读取音频元数据、处理和转码音频文件。
 
