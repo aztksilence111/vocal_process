@@ -36,6 +36,22 @@ class ProcessOptions:
     codec: str | None = None
 
 
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".aac",
+    ".aiff",
+    ".alac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wma",
+}
+RUBBERBAND_MIN_TEMPO = 0.01
+RUBBERBAND_MAX_TEMPO = 100.0
+DAW_WAV_CODEC = "pcm_s24le"
+
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
 
@@ -83,6 +99,21 @@ def get_environment_report() -> list[str]:
         lines.append(f"{tool}: {info.path}")
         lines.append(f"  {info.version_line}")
     return lines
+
+
+def list_audio_files(directory: Path) -> list[Path]:
+    material_dir = directory.expanduser()
+    if not material_dir.is_dir():
+        raise AudioProcessorError(f"Material directory does not exist: {material_dir}")
+
+    return sorted(
+        [
+            path
+            for path in material_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+        ],
+        key=lambda path: path.name.lower(),
+    )
 
 
 def probe_audio(input_path: Path) -> dict[str, Any]:
@@ -154,10 +185,63 @@ def build_process_args(options: ProcessOptions, *, progress: bool = False) -> li
     if options.channels is not None:
         args.extend(["-ac", str(options.channels)])
 
-    if options.codec:
-        args.extend(["-codec:a", options.codec])
+    codec = options.codec or _default_audio_codec(options.output_path)
+    if codec:
+        args.extend(["-codec:a", codec])
 
     args.append(str(options.output_path))
+    return args
+
+
+def build_material_assembly_args(
+    reference_path: Path,
+    material_paths: Sequence[Path],
+    output_path: Path,
+    options: ProcessOptions,
+    *,
+    progress: bool = False,
+) -> list[str]:
+    _validate_options(options)
+
+    if not material_paths:
+        raise AudioProcessorError("Material directory does not contain supported audio files")
+
+    reference_duration = get_audio_duration_seconds(probe_audio(reference_path))
+    material_duration = sum(get_audio_duration_seconds(probe_audio(path)) for path in material_paths)
+    if reference_duration <= 0:
+        raise AudioProcessorError(f"Could not read reference audio duration: {reference_path}")
+    if material_duration <= 0:
+        raise AudioProcessorError("Could not read material audio duration")
+
+    tempo = material_duration / reference_duration
+    _validate_rubberband_tempo(tempo)
+    filters = _build_material_filter_graph(
+        len(material_paths),
+        tempo,
+        options,
+        target_duration=reference_duration,
+    )
+
+    args = ["ffmpeg", "-hide_banner"]
+    if progress:
+        args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+
+    args.append("-y" if options.overwrite else "-n")
+    for path in material_paths:
+        args.extend(["-i", str(path)])
+    args.extend(["-filter_complex", filters, "-map", "[outa]"])
+
+    if options.sample_rate is not None:
+        args.extend(["-ar", str(options.sample_rate)])
+
+    if options.channels is not None:
+        args.extend(["-ac", str(options.channels)])
+
+    codec = options.codec or _default_audio_codec(output_path)
+    if codec:
+        args.extend(["-codec:a", codec])
+
+    args.append(str(output_path))
     return args
 
 
@@ -174,44 +258,59 @@ def process_audio_with_progress(
     normalized_options = _normalize_options(options)
     duration_seconds = get_audio_duration_seconds(probe_audio(normalized_options.input_path))
     args = build_process_args(normalized_options, progress=True)
-    process = _open_progress_process(args)
-    stderr = ""
+    _run_progress_process(
+        args,
+        duration_seconds=duration_seconds,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
+    )
 
-    try:
-        last_progress = 0.0
-        assert process.stdout is not None
-        for line in process.stdout:
-            if should_cancel is not None and should_cancel():
-                process.terminate()
-                raise AudioProcessorError("Processing cancelled")
 
-            key, value = _split_progress_line(line)
-            if key is None:
-                continue
+def assemble_material_to_reference_with_progress(
+    reference_path: Path,
+    material_directory: Path,
+    output_path: Path,
+    options: ProcessOptions,
+    *,
+    on_progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> None:
+    normalized_reference = reference_path.expanduser()
+    if not normalized_reference.exists():
+        raise AudioProcessorError(f"Reference audio does not exist: {normalized_reference}")
 
-            if key in {"out_time_us", "out_time_ms", "out_time"}:
-                current_seconds = _parse_progress_time(key, value, duration_seconds)
-                if current_seconds is not None and duration_seconds > 0:
-                    last_progress = min(max(current_seconds / duration_seconds, last_progress), 1.0)
-                    _notify_progress(on_progress, last_progress, f"{last_progress * 100:.0f}%")
+    normalized_output = output_path.expanduser()
+    if normalized_output.parent != Path("."):
+        normalized_output.parent.mkdir(parents=True, exist_ok=True)
 
-            if key == "progress" and value == "end":
-                last_progress = 1.0
-                _notify_progress(on_progress, last_progress, "Complete")
-
-        return_code = process.wait()
-        if process.stderr is not None:
-            stderr = process.stderr.read().strip()
-    finally:
-        if process.poll() is None:
-            process.kill()
-
-    if return_code != 0:
-        command = subprocess.list2cmdline(args)
-        message = f"Command failed with exit code {return_code}: {command}"
-        if stderr:
-            message = f"{message}\n{stderr}"
-        raise AudioProcessorError(message)
+    material_paths = list_audio_files(material_directory)
+    reference_duration = get_audio_duration_seconds(probe_audio(normalized_reference))
+    args = build_material_assembly_args(
+        normalized_reference,
+        material_paths,
+        normalized_output,
+        ProcessOptions(
+            input_path=normalized_reference,
+            output_path=normalized_output,
+            overwrite=options.overwrite,
+            trim_start=None,
+            duration=None,
+            gain_db=options.gain_db,
+            normalize=options.normalize,
+            highpass_hz=options.highpass_hz,
+            lowpass_hz=options.lowpass_hz,
+            sample_rate=options.sample_rate,
+            channels=options.channels,
+            codec=options.codec,
+        ),
+        progress=True,
+    )
+    _run_progress_process(
+        args,
+        duration_seconds=reference_duration,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
+    )
 
 
 def get_audio_duration_seconds(data: dict[str, Any]) -> float:
@@ -272,6 +371,36 @@ def _build_audio_filters(options: ProcessOptions) -> str:
     return ",".join(filters)
 
 
+def _build_material_filter_graph(
+    material_count: int,
+    tempo: float,
+    options: ProcessOptions,
+    *,
+    target_duration: float | None = None,
+) -> str:
+    if material_count <= 0:
+        raise AudioProcessorError("material_count must be greater than 0")
+    if target_duration is not None and target_duration <= 0:
+        raise AudioProcessorError("target_duration must be greater than 0")
+
+    filters: list[str] = []
+    source_label = "[0:a]"
+    if material_count > 1:
+        concat_inputs = "".join(f"[{index}:a]" for index in range(material_count))
+        filters.append(f"{concat_inputs}concat=n={material_count}:v=0:a=1[cat]")
+        source_label = "[cat]"
+
+    audio_filters = _build_audio_filters(options)
+    stretch_filter = f"rubberband=tempo={tempo:.8f}:pitch=1:formant=preserved:transients=crisp:phase=laminar"
+    post_filters = [stretch_filter]
+    if audio_filters:
+        post_filters.append(audio_filters)
+    if target_duration is not None:
+        post_filters.append(f"apad=whole_dur={target_duration:.6f}")
+    filters.append(f"{source_label}{','.join(post_filters)}[outa]")
+    return ";".join(filters)
+
+
 def _validate_options(options: ProcessOptions) -> None:
     _validate_positive_float(options.highpass_hz, "highpass_hz")
     _validate_positive_float(options.lowpass_hz, "lowpass_hz")
@@ -286,6 +415,20 @@ def _validate_options(options: ProcessOptions) -> None:
 def _validate_positive_float(value: float | None, name: str) -> None:
     if value is not None and value <= 0:
         raise AudioProcessorError(f"{name} must be greater than 0")
+
+
+def _validate_rubberband_tempo(tempo: float) -> None:
+    if tempo < RUBBERBAND_MIN_TEMPO or tempo > RUBBERBAND_MAX_TEMPO:
+        raise AudioProcessorError(
+            "Material/reference duration ratio is outside FFmpeg rubberband limits "
+            f"({RUBBERBAND_MIN_TEMPO:g} to {RUBBERBAND_MAX_TEMPO:g}): {tempo:.4g}"
+        )
+
+
+def _default_audio_codec(output_path: Path) -> str | None:
+    if output_path.suffix.lower() == ".wav":
+        return DAW_WAV_CODEC
+    return None
 
 
 def _format_duration(value: Any) -> str:
@@ -311,6 +454,52 @@ def _open_progress_process(args: Sequence[str]) -> subprocess.Popen[str]:
         )
     except FileNotFoundError as exc:
         raise AudioProcessorError(f"Required tool not found: {args[0]}") from exc
+
+
+def _run_progress_process(
+    args: Sequence[str],
+    *,
+    duration_seconds: float,
+    on_progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> None:
+    process = _open_progress_process(args)
+    stderr = ""
+
+    try:
+        last_progress = 0.0
+        assert process.stdout is not None
+        for line in process.stdout:
+            if should_cancel is not None and should_cancel():
+                process.terminate()
+                raise AudioProcessorError("Processing cancelled")
+
+            key, value = _split_progress_line(line)
+            if key is None:
+                continue
+
+            if key in {"out_time_us", "out_time_ms", "out_time"}:
+                current_seconds = _parse_progress_time(key, value, duration_seconds)
+                if current_seconds is not None and duration_seconds > 0:
+                    last_progress = min(max(current_seconds / duration_seconds, last_progress), 1.0)
+                    _notify_progress(on_progress, last_progress, f"{last_progress * 100:.0f}%")
+
+            if key == "progress" and value == "end":
+                _notify_progress(on_progress, 1.0, "Complete")
+
+        return_code = process.wait()
+        if process.stderr is not None:
+            stderr = process.stderr.read().strip()
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+    if return_code != 0:
+        command = subprocess.list2cmdline([str(arg) for arg in args])
+        message = f"Command failed with exit code {return_code}: {command}"
+        if stderr:
+            message = f"{message}\n{stderr}"
+        raise AudioProcessorError(message)
 
 
 def _split_progress_line(line: str) -> tuple[str | None, str]:

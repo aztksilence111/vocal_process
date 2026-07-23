@@ -9,12 +9,14 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from .batch import QueueItem, create_queue, run_batch_queue
-from .engine import AudioProcessorError, get_environment_report
+from .engine import AudioProcessorError, get_environment_report, list_audio_files
 from .i18n import normalize_language, translate, translate_message, translate_status
 from .settings import ProcessingSettings, load_settings, save_settings
 
 
 AUDIO_PATTERN = "*.aac *.aiff *.alac *.flac *.m4a *.mp3 *.ogg *.opus *.wav *.wma"
+LYRICS_EXTENSIONS = {".txt", ".doc", ".docx", ".lrc", ".srt"}
+LYRICS_PATTERN = "*.txt *.doc *.docx *.lrc *.srt"
 
 
 class AudioProcessorApp(tk.Tk):
@@ -39,10 +41,10 @@ class AudioProcessorApp(tk.Tk):
 
     def _build_variables(self) -> None:
         self.output_directory_var = tk.StringVar()
+        self.material_directory_var = tk.StringVar()
+        self.lyrics_file_var = tk.StringVar()
         self.output_extension_var = tk.StringVar()
         self.overwrite_var = tk.BooleanVar()
-        self.trim_start_var = tk.StringVar()
-        self.duration_var = tk.StringVar()
         self.gain_db_var = tk.StringVar()
         self.normalize_var = tk.BooleanVar()
         self.highpass_var = tk.StringVar()
@@ -70,12 +72,6 @@ class AudioProcessorApp(tk.Tk):
         toolbar = ttk.Frame(parent)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
-        self.add_button = self._button(toolbar, "add_files", self.add_files)
-        self.add_button.pack(side="left")
-        self.remove_button = self._button(toolbar, "remove_selected", self.remove_selected)
-        self.remove_button.pack(side="left", padx=(8, 0))
-        self.clear_button = self._button(toolbar, "clear", self.clear_queue)
-        self.clear_button.pack(side="left", padx=(8, 0))
         self.check_button = self._button(toolbar, "check_tools", self.check_tools)
         self.check_button.pack(side="left", padx=(8, 0))
 
@@ -94,17 +90,45 @@ class AudioProcessorApp(tk.Tk):
         main = ttk.PanedWindow(parent, orient="horizontal")
         main.grid(row=1, column=0, sticky="nsew")
 
-        queue_frame = ttk.Frame(main)
+        source_frame = ttk.Frame(main)
         settings_frame = ttk.Frame(main)
-        main.add(queue_frame, weight=3)
+        main.add(source_frame, weight=3)
         main.add(settings_frame, weight=2)
 
-        self._build_queue(queue_frame)
+        self._build_sources(source_frame)
         self._build_settings(settings_frame)
 
-    def _build_queue(self, parent: ttk.Frame) -> None:
+    def _build_sources(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
+
+        audio_frame = self._labelframe(parent, "original_audio")
+        audio_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        self._build_audio_source(audio_frame)
+
+        material_frame = self._labelframe(parent, "material_set")
+        material_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self._build_material_source(material_frame)
+
+        lyrics_frame = self._labelframe(parent, "lyrics_file")
+        lyrics_frame.grid(row=2, column=0, sticky="ew")
+        self._build_lyrics_source(lyrics_frame)
+
+    def _build_audio_source(self, parent: ttk.LabelFrame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        self.audio_hint_label = ttk.Label(parent)
+        self.audio_hint_label.grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+
+        controls = ttk.Frame(parent)
+        controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.add_button = self._button(controls, "select_original_audio", self.add_files)
+        self.add_button.pack(side="left")
+        self.remove_button = self._button(controls, "remove_selected", self.remove_selected)
+        self.remove_button.pack(side="left", padx=(8, 0))
+        self.clear_button = self._button(controls, "clear", self.clear_queue)
+        self.clear_button.pack(side="left", padx=(8, 0))
 
         columns = ("input", "output", "status", "progress")
         self.queue_table = ttk.Treeview(parent, columns=columns, show="headings", selectmode="extended")
@@ -112,11 +136,39 @@ class AudioProcessorApp(tk.Tk):
         self.queue_table.column("output", width=260, anchor="w")
         self.queue_table.column("status", width=110, anchor="w")
         self.queue_table.column("progress", width=90, anchor="e")
-        self.queue_table.grid(row=0, column=0, sticky="nsew")
+        self.queue_table.grid(row=2, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
 
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.queue_table.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=2, column=1, sticky="ns", padx=(0, 8), pady=(0, 8))
         self.queue_table.configure(yscrollcommand=scrollbar.set)
+
+    def _build_material_source(self, parent: ttk.LabelFrame) -> None:
+        parent.columnconfigure(1, weight=1)
+
+        self.material_hint_label = ttk.Label(parent)
+        self.material_hint_label.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
+        self._label(parent, "material_directory").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Entry(parent, textvariable=self.material_directory_var, state="readonly").grid(
+            row=1, column=1, sticky="ew", pady=(0, 8)
+        )
+        self.material_button = self._button(parent, "select_material_folder", self.choose_material_directory)
+        self.material_button.grid(row=1, column=2, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self.clear_material_button = self._button(parent, "clear_material", self.clear_material_directory)
+        self.clear_material_button.grid(row=1, column=3, sticky="ew", padx=8, pady=(0, 8))
+
+    def _build_lyrics_source(self, parent: ttk.LabelFrame) -> None:
+        parent.columnconfigure(1, weight=1)
+
+        self.lyrics_hint_label = ttk.Label(parent)
+        self.lyrics_hint_label.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
+        self._label(parent, "lyrics_path").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Entry(parent, textvariable=self.lyrics_file_var, state="readonly").grid(
+            row=1, column=1, sticky="ew", pady=(0, 8)
+        )
+        self.lyrics_button = self._button(parent, "select_lyrics_file", self.choose_lyrics_file)
+        self.lyrics_button.grid(row=1, column=2, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self.clear_lyrics_button = self._button(parent, "clear_lyrics", self.clear_lyrics_file)
+        self.clear_lyrics_button.grid(row=1, column=3, sticky="ew", padx=8, pady=(0, 8))
 
     def _build_settings(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -137,14 +189,6 @@ class AudioProcessorApp(tk.Tk):
         ).grid(row=row, column=1, sticky="w", pady=4)
         self.overwrite_check = self._checkbutton(parent, "overwrite", self.overwrite_var)
         self.overwrite_check.grid(row=row, column=2, sticky="w", padx=(8, 0), pady=4)
-
-        row += 1
-        self._label(parent, "trim_start").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(parent, textvariable=self.trim_start_var).grid(row=row, column=1, sticky="ew", pady=4)
-
-        row += 1
-        self._label(parent, "duration").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(parent, textvariable=self.duration_var).grid(row=row, column=1, sticky="ew", pady=4)
 
         row += 1
         self._label(parent, "gain_db").grid(row=row, column=0, sticky="w", pady=4)
@@ -234,6 +278,26 @@ class AudioProcessorApp(tk.Tk):
             self.output_directory_var.set(directory)
             self._update_outputs_from_settings()
 
+    def choose_material_directory(self) -> None:
+        directory = filedialog.askdirectory()
+        if directory:
+            self.material_directory_var.set(directory)
+            self._log(self._t("material_selected", path=directory))
+
+    def clear_material_directory(self) -> None:
+        self.material_directory_var.set("")
+        self._log(self._t("material_cleared"))
+
+    def choose_lyrics_file(self) -> None:
+        file_name = filedialog.askopenfilename(filetypes=self._lyrics_filetypes())
+        if file_name:
+            self.lyrics_file_var.set(file_name)
+            self._log(self._t("lyrics_selected", path=file_name))
+
+    def clear_lyrics_file(self) -> None:
+        self.lyrics_file_var.set("")
+        self._log(self._t("lyrics_cleared"))
+
     def check_tools(self) -> None:
         try:
             report = "\n".join(get_environment_report())
@@ -246,6 +310,7 @@ class AudioProcessorApp(tk.Tk):
     def save_current_settings(self) -> None:
         try:
             self.settings = self._settings_from_vars()
+            self._validate_source_inputs(self.settings, require_material=False)
             path = save_settings(self.settings)
         except ValueError as exc:
             messagebox.showerror(self._t("invalid_settings_title"), str(exc))
@@ -268,6 +333,7 @@ class AudioProcessorApp(tk.Tk):
 
         try:
             self.settings = self._settings_from_vars()
+            self._validate_source_inputs(self.settings, require_material=True)
             save_settings(self.settings)
         except ValueError as exc:
             messagebox.showerror(self._t("invalid_settings_title"), str(exc))
@@ -280,6 +346,7 @@ class AudioProcessorApp(tk.Tk):
         self.item_progress_var.set(0)
         self.queue_progress_var.set(0)
         self._log(self._t("batch_started"))
+        self._log_active_source_paths(self.settings)
 
         self.worker = threading.Thread(target=self._run_batch_worker, daemon=True)
         self.worker.start()
@@ -347,11 +414,13 @@ class AudioProcessorApp(tk.Tk):
     def _settings_from_vars(self) -> ProcessingSettings:
         return ProcessingSettings(
             language=self.language,
+            material_directory=self.material_directory_var.get().strip(),
+            lyrics_file=self.lyrics_file_var.get().strip(),
             output_directory=self.output_directory_var.get().strip(),
             output_extension=self.output_extension_var.get().strip(),
             overwrite=self.overwrite_var.get(),
-            trim_start=self._optional_text(self.trim_start_var),
-            duration=self._optional_text(self.duration_var),
+            trim_start=None,
+            duration=None,
             gain_db=self._optional_float(self.gain_db_var, "gain_db"),
             normalize=self.normalize_var.get(),
             highpass_hz=self._optional_float(self.highpass_var, "highpass_hz"),
@@ -363,11 +432,11 @@ class AudioProcessorApp(tk.Tk):
 
     def _apply_settings_to_vars(self, settings: ProcessingSettings) -> None:
         self.language = normalize_language(settings.language)
+        self.material_directory_var.set(settings.material_directory)
+        self.lyrics_file_var.set(settings.lyrics_file)
         self.output_directory_var.set(settings.output_directory)
         self.output_extension_var.set(settings.output_extension)
         self.overwrite_var.set(settings.overwrite)
-        self.trim_start_var.set(settings.trim_start or "")
-        self.duration_var.set(settings.duration or "")
         self.gain_db_var.set("" if settings.gain_db is None else str(settings.gain_db))
         self.normalize_var.set(settings.normalize)
         self.highpass_var.set("" if settings.highpass_hz is None else str(settings.highpass_hz))
@@ -389,6 +458,15 @@ class AudioProcessorApp(tk.Tk):
             widget.configure(text=self._t(key))
 
         self.language_button.configure(text=self._t("language_menu"))
+        self.audio_hint_label.configure(
+            text=self._t("supported_formats", formats=self._t("audio_format_hint"))
+        )
+        self.material_hint_label.configure(
+            text=self._t("supported_formats", formats=self._t("material_format_hint"))
+        )
+        self.lyrics_hint_label.configure(
+            text=self._t("supported_formats", formats=self._t("lyrics_format_hint"))
+        )
         self.language_menu.delete(0, "end")
         self.language_menu.add_command(label=self._t("language_zh"), command=lambda: self._set_language("zh"))
         self.language_menu.add_command(label=self._t("language_en"), command=lambda: self._set_language("en"))
@@ -514,8 +592,46 @@ class AudioProcessorApp(tk.Tk):
         self.translated_widgets.append((label, key))
         return label
 
+    def _labelframe(self, parent: tk.Widget, key: str) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent)
+        self.translated_widgets.append((frame, key))
+        return frame
+
     def _filetypes(self) -> list[tuple[str, str]]:
         return [(self._t("audio_files"), AUDIO_PATTERN), (self._t("all_files"), "*.*")]
+
+    def _lyrics_filetypes(self) -> list[tuple[str, str]]:
+        return [(self._t("lyrics_file"), LYRICS_PATTERN), (self._t("all_files"), "*.*")]
+
+    def _validate_source_inputs(
+        self,
+        settings: ProcessingSettings,
+        *,
+        require_material: bool,
+    ) -> None:
+        if require_material and not settings.material_directory:
+            raise ValueError(self._t("missing_material_directory"))
+
+        if settings.material_directory:
+            material_path = Path(settings.material_directory).expanduser()
+            if not material_path.is_dir():
+                raise ValueError(self._t("invalid_material_directory", path=material_path))
+            if not list_audio_files(material_path):
+                raise ValueError(self._t("empty_material_directory", path=material_path))
+
+        if settings.lyrics_file:
+            lyrics_path = Path(settings.lyrics_file).expanduser()
+            if not lyrics_path.is_file():
+                raise ValueError(self._t("invalid_lyrics_file", path=lyrics_path))
+            if lyrics_path.suffix.lower() not in LYRICS_EXTENSIONS:
+                raise ValueError(self._t("unsupported_lyrics_format", path=lyrics_path))
+
+    def _log_active_source_paths(self, settings: ProcessingSettings) -> None:
+        if settings.material_directory:
+            self._log(self._t("assembly_mode_active"))
+            self._log(self._t("material_active", path=settings.material_directory))
+        if settings.lyrics_file:
+            self._log(self._t("lyrics_active", path=settings.lyrics_file))
 
     def _t(self, key: str, **values: object) -> str:
         return translate(self.language, key, **values)
@@ -556,4 +672,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

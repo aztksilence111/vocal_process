@@ -16,8 +16,10 @@ APP_NAME = "AudioProcessorMVP"
 @dataclass(frozen=True)
 class ProcessingSettings:
     language: str = DEFAULT_LANGUAGE
+    material_directory: str = ""
+    lyrics_file: str = ""
     output_directory: str = ""
-    output_extension: str = ".mp3"
+    output_extension: str = ".wav"
     overwrite: bool = True
     trim_start: str | None = None
     duration: str | None = None
@@ -61,6 +63,8 @@ class ProcessingSettings:
         defaults = cls()
         return cls(
             language=normalize_language(optional_string(data.get("language"))),
+            material_directory=str(data.get("material_directory") or defaults.material_directory),
+            lyrics_file=str(data.get("lyrics_file") or defaults.lyrics_file),
             output_directory=str(data.get("output_directory") or defaults.output_directory),
             output_extension=normalize_extension(
                 str(data.get("output_extension") or defaults.output_extension),
@@ -79,7 +83,7 @@ class ProcessingSettings:
         )
 
 
-def normalize_extension(value: str, *, fallback: str = ".mp3") -> str:
+def normalize_extension(value: str, *, fallback: str = ".wav") -> str:
     extension = value.strip() if value else fallback
     if not extension:
         extension = fallback

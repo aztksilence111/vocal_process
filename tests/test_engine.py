@@ -9,10 +9,13 @@ from audio_processor.cli import build_parser
 from audio_processor.engine import (
     AudioProcessorError,
     ProcessOptions,
+    _build_material_filter_graph,
     build_process_args,
     get_audio_duration_seconds,
+    list_audio_files,
     summarize_probe,
 )
+from audio_processor.gui import LYRICS_EXTENSIONS
 from audio_processor.i18n import TRANSLATIONS, normalize_language, translate, translate_status
 from audio_processor.settings import ProcessingSettings, load_settings, save_settings
 
@@ -81,6 +84,55 @@ class ProcessCommandTests(unittest.TestCase):
         self.assertIn("pipe:1", args)
         self.assertLess(args.index("-progress"), args.index("-i"))
 
+    def test_wav_output_defaults_to_daw_friendly_pcm(self) -> None:
+        options = ProcessOptions(
+            input_path=Path("input.mp3"),
+            output_path=Path("output.wav"),
+            overwrite=True,
+        )
+
+        args = build_process_args(options)
+
+        self.assertEqual(args[args.index("-codec:a") + 1], "pcm_s24le")
+
+
+class MaterialAssemblyTests(unittest.TestCase):
+    def test_lists_supported_material_audio_files_by_name(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "B.WAV").write_bytes(b"")
+            (root / "a.mp3").write_bytes(b"")
+            (root / "notes.txt").write_text("ignored", encoding="utf-8")
+            (root / "nested").mkdir()
+
+            files = list_audio_files(root)
+
+        self.assertEqual([path.name for path in files], ["a.mp3", "B.WAV"])
+
+    def test_material_filter_stretches_without_loop_or_hard_cut(self) -> None:
+        graph = _build_material_filter_graph(
+            2,
+            1.25,
+            ProcessOptions(input_path=Path("reference.wav"), output_path=Path("output.wav")),
+            target_duration=3.5,
+        )
+
+        self.assertIn("concat=n=2:v=0:a=1", graph)
+        self.assertIn("rubberband=tempo=1.25000000:pitch=1:formant=preserved", graph)
+        self.assertIn("apad=whole_dur=3.500000", graph)
+        self.assertNotIn("stream_loop", graph)
+        self.assertNotIn("atrim", graph)
+
+    def test_single_material_file_uses_same_stretch_chain(self) -> None:
+        graph = _build_material_filter_graph(
+            1,
+            0.5,
+            ProcessOptions(input_path=Path("reference.wav"), output_path=Path("output.wav")),
+        )
+
+        self.assertNotIn("concat=", graph)
+        self.assertTrue(graph.startswith("[0:a]rubberband=tempo=0.50000000"))
+
 
 class ProbeSummaryTests(unittest.TestCase):
     def test_summarizes_probe_data(self) -> None:
@@ -118,9 +170,14 @@ class ProbeSummaryTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_default_output_extension_is_wav(self) -> None:
+        self.assertEqual(ProcessingSettings().output_extension, ".wav")
+
     def test_settings_round_trip(self) -> None:
         settings = ProcessingSettings(
             language="en",
+            material_directory="materials",
+            lyrics_file="lyrics.txt",
             output_directory="out",
             output_extension="wav",
             overwrite=False,
@@ -137,6 +194,8 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(loaded.output_extension, ".wav")
         self.assertEqual(loaded.language, "en")
+        self.assertEqual(loaded.material_directory, "materials")
+        self.assertEqual(loaded.lyrics_file, "lyrics.txt")
         self.assertEqual(loaded.output_directory, "out")
         self.assertFalse(loaded.overwrite)
         self.assertEqual(loaded.gain_db, -2.5)
@@ -178,6 +237,9 @@ class I18nTests(unittest.TestCase):
         self.assertEqual(translate("zh", "add_files"), "添加文件")
         self.assertEqual(translate("en", "add_files"), "Add Files")
         self.assertEqual(translate_status("zh", "Queued"), "排队中")
+
+    def test_supported_lyrics_extensions_are_documented(self) -> None:
+        self.assertEqual(LYRICS_EXTENSIONS, {".txt", ".doc", ".docx", ".lrc", ".srt"})
 
 
 if __name__ == "__main__":

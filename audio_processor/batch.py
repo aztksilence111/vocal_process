@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .engine import AudioProcessorError, process_audio_with_progress
+from .engine import AudioProcessorError, assemble_material_to_reference_with_progress, process_audio_with_progress
 from .settings import ProcessingSettings
 
 
@@ -72,11 +72,23 @@ def run_batch_queue(
             _notify_queue(on_queue_progress, queue_progress, f"{index + 1}/{total}: {message}")
 
         try:
-            process_audio_with_progress(
-                settings.to_process_options(item.input_path, item.output_path),
-                on_progress=progress_callback,
-                should_cancel=should_cancel,
-            )
+            options = settings.to_process_options(item.input_path, item.output_path)
+            if settings.material_directory:
+                process_runner = assemble_material_to_reference_with_progress
+                process_runner(
+                    item.input_path,
+                    Path(settings.material_directory),
+                    item.output_path,
+                    options,
+                    on_progress=progress_callback,
+                    should_cancel=should_cancel,
+                )
+            else:
+                process_audio_with_progress(
+                    options,
+                    on_progress=progress_callback,
+                    should_cancel=should_cancel,
+                )
         except AudioProcessorError as exc:
             if str(exc) == "Processing cancelled":
                 item.status = "Cancelled"
@@ -130,4 +142,3 @@ def _notify_item(callback: ItemCallback | None, index: int, item: QueueItem) -> 
 def _notify_queue(callback: QueueCallback | None, progress: float, message: str) -> None:
     if callback is not None:
         callback(progress, message)
-

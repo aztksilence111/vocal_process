@@ -1,7 +1,7 @@
 # Conversation Log
 
 > Project path: `C:\Users\WIN11\demo`
-> Current working branch: `codex/setup-python-ffmpeg`
+> Current working branch: `codex/material-stretch-assembly`
 
 ## 2026-07-23
 
@@ -219,3 +219,67 @@ vocal_process
 4. 拉取远程 `origin/main` 后确认远程只有一个 `README.md`，内容为 `# vocal_process`。
 5. 使用 `--allow-unrelated-histories` 合并远程初始提交。
 6. README 出现 add/add 冲突；处理方式是保留本地完整说明，并将标题改为 `# vocal_process`。
+
+### User
+
+现在我提出一个修改，所以你需要创建分支。修改内容是改动gui，将上传的文件拆分成不同的区域，也就是原音频、素材集、歌词文件应该分成三个区域进行上传，而不要合并成一个大框。然后在界面上显示支持的格式（例如原音频是.wav、.mp3等，素材集必须是文件夹，歌词是.txt、.doc等）。再实现对应的功能。
+
+### Assistant Notes
+
+处理结果：
+
+1. 已从 `main` 创建新分支：`codex/split-gui-upload-areas`。
+2. GUI 左侧输入区已拆分成三个独立区域：原音频、素材集、歌词文件。
+3. 原音频区域显示支持格式：`.wav`、`.mp3`、`.flac`、`.m4a`、`.ogg`、`.opus`、`.aac`、`.aiff`、`.alac`、`.wma`，并继续生成处理队列。
+4. 素材集区域只允许选择文件夹，并显示“仅支持文件夹”。
+5. 歌词区域支持 `.txt`、`.doc`、`.docx`、`.lrc`、`.srt`，并通过文件选择器过滤。
+6. `ProcessingSettings` 新增 `material_directory` 和 `lyrics_file`，会保存到现有 JSON 配置。
+7. 保存设置和开始批量处理前会校验素材集必须是文件夹、歌词必须是存在且受支持的文件。
+8. 素材集和歌词当前作为 GUI 输入资产被选择、显示、保存、校验和记录日志；音频处理引擎本轮仍只处理原音频队列。
+9. 新增/更新中英文翻译和 README 说明。
+10. 验证通过：`.venv\Scripts\python -m unittest discover`、`.venv\Scripts\python -m compileall -q audio_processor tests`、`.venv\Scripts\audio-processor check`。
+
+### User
+
+帮我解释一下运行和操作逻辑
+
+### Assistant Notes
+
+向用户说明当时 GUI 的三类输入含义、队列处理顺序、设置保存和输出逻辑。
+
+### User
+
+我的要求是将素材集中的各项音频组合起来然后按照原音频处理拼接，你检查一下你的运行逻辑是否对齐我的要求
+
+### Assistant Notes
+
+复查后确认旧逻辑没有完全对齐：此前原音频队列仍是被直接处理的音频源，素材集只是被保存和校验。用户实际要求是原音频作为参考，素材集中的音频才应被组合、拼接并按原音频目标处理输出。
+
+### User
+
+是的，你已经理解我的要求了，继续更改功能，然后匹配gui
+
+### User
+
+请你再阅读一遍目前保存的.md对话记录日志文件，搞清楚我的核心诉求，然后继续。处理素材集中的音频时，应当用拉伸剪辑，而不是循环播放。拉伸的逻辑应当保证除了时长外其余物理属性基本不变，如共振峰、音高等，因为这些属性会严重影响听感，同时损耗音频信息。拼接完了之后再输出成音频文件。我的最终诉求是能够输出成可以导入进我所列举的DAW宿主软件的形式。
+
+### User
+
+我需要纠正，素材音频过长时也不能直接裁切，而是应该同样用拉伸逻辑。我要求的音频处理逻辑始终是不影响单音节字的听感（修改前后不影响听感、发音辨识度）
+
+### Assistant Notes
+
+处理结果：
+
+1. 已在当前修改分支 `codex/material-stretch-assembly` 上继续实现。
+2. 新增素材集扫描逻辑，按文件名顺序收集受支持音频。
+3. 批量队列在选择素材集后不再直接处理原音频本身，而是把原音频作为参考时长，处理素材集拼接结果。
+4. 素材音频先顺序拼接，再用 FFmpeg `rubberband` 整体拉伸/压缩到原音频时长。
+5. 拉伸链路使用 `pitch=1` 和 `formant=preserved`，目标是尽量保持音高、共振峰和单音节发音辨识度。
+6. 没有使用循环播放，也没有使用 `atrim` 或直接按时长裁切素材。
+7. 如果 `rubberband` 产生轻微短缺，只在尾部补静音到目标时长，不裁切素材。
+8. 默认输出改为 `.wav`，WAV 输出自动使用 `pcm_s24le`，便于导入 DAW。
+9. GUI 开始处理时会要求选择素材集；保存配置时允许先保存尚未完整选择的配置。
+10. GUI 素材拼接主流程移除“截取起点”和“持续时间”输入项，避免暗示会对素材直接裁切。
+11. 验证通过：`.venv\Scripts\python -m compileall -q audio_processor tests`、`.venv\Scripts\python -m unittest discover`。
+12. 真实 FFmpeg 验证通过：4 秒原音频 + 两个 1 秒素材输出为 4.000000 秒 WAV，编码为 `pcm_s24le`。

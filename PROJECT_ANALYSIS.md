@@ -215,3 +215,124 @@ Passed:
 3. `.venv\Scripts\python -c "from audio_processor.i18n import translate; print(translate('zh','language_menu')); print(translate('en','language_menu'))"`
 4. `.venv\Scripts\audio-processor check`
 5. `.venv\Scripts\python -m pip wheel . -w .tmp\wheelhouse --no-deps --no-build-isolation`
+
+## 2026-07-24: Split GUI Upload Areas
+
+### Goal
+
+Change the GUI so uploaded inputs are no longer represented as one large combined file area. The interface should clearly separate original audio files, the material set, and the lyrics file into three distinct upload regions, each showing its supported format rules.
+
+### Scope
+
+Implement:
+
+1. Original audio upload region for supported audio files such as `.wav`, `.mp3`, `.flac`, `.m4a`, `.ogg`, `.opus`, `.aac`, `.aiff`, `.alac`, and `.wma`.
+2. Material set upload region that accepts a folder only.
+3. Lyrics upload region for lyric/document files such as `.txt`, `.doc`, `.docx`, `.lrc`, and `.srt`.
+4. Persisted material folder and lyrics file paths in the existing settings JSON.
+5. GUI controls for selecting and clearing each source type.
+6. Runtime validation that the material set is a directory and the lyrics input is a supported file.
+7. Chinese and English GUI text for the new regions and validation messages.
+
+### Non-goals
+
+1. Parsing `.doc` or `.docx` lyrics content in this pass. The GUI should accept and track the file path.
+2. Using the material folder to drive audio processing rules in this pass. The current processing queue still operates on original audio files.
+
+### Implementation Result
+
+Added:
+
+1. Three separate GUI upload regions: original audio, material set, and lyrics file.
+2. Visible supported-format hints for each region.
+3. Material set selection through a folder picker only.
+4. Lyrics selection through a file picker filtered to `.txt`, `.doc`, `.docx`, `.lrc`, and `.srt`.
+5. `material_directory` and `lyrics_file` fields in persisted settings.
+6. Runtime validation for material folder and lyrics file paths before saving settings or starting a batch.
+7. Startup/batch log entries that show active material folder and lyrics file when provided.
+8. Chinese and English translation keys for the new controls, hints, and validation messages.
+
+### Behavior
+
+Original audio files still create the processing queue and are the only inputs passed to FFmpeg. The material set and lyrics file are now first-class GUI inputs: they are selected separately, displayed separately, validated, persisted, and shown in logs, but they are not parsed or consumed by the audio processing engine yet.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m unittest discover`
+2. `.venv\Scripts\python -m compileall -q audio_processor tests`
+3. `.venv\Scripts\python -c "from audio_processor.i18n import TRANSLATIONS; print(len(TRANSLATIONS['zh']), len(TRANSLATIONS['en']))"`
+4. `.venv\Scripts\audio-processor check`
+
+## 2026-07-24: Material Audio Stretch Assembly
+
+### Goal
+
+Correct the core processing model. The original audio is the timing/reference target, while audio clips in the material set should be combined and time-stretched/compressed to match that target. The material set must be consumed by the processing engine, not merely saved as a path.
+
+### Critical Audio Constraint
+
+Material clips must not be looped, hard-cut, or truncated to fit. If the material audio is shorter or longer than the target timing, it should be time-stretched or time-compressed. The stretch operation should preserve pitch and formants as much as possible, because those properties strongly affect listening quality, pronunciation recognition, and the perceived identity of single syllables.
+
+### Technical Direction
+
+Use FFmpeg's `rubberband` filter when available:
+
+1. `tempo` controls duration.
+2. `pitch=1` preserves pitch.
+3. `formant=preserved` preserves formants.
+4. Other quality-oriented options should favor intelligibility over speed.
+
+The current machine's FFmpeg build exposes the `rubberband` filter and supports `formant=preserved`.
+
+### Implementation Scope
+
+1. Scan material folders for supported audio files.
+2. Sort material files deterministically by filename.
+3. Concatenate material clips in order.
+4. Compare material total duration against the original audio duration.
+5. Apply high-quality time-stretch/compression so the assembled material duration matches the original reference duration.
+6. Export a DAW-importable audio file.
+7. Keep GUI behavior aligned: original audio is the reference; material set is the source audio to assemble; output is the stretched assembled material.
+
+### Non-goals
+
+1. Perfect phoneme-level alignment in this pass.
+2. Full lyric parsing/alignment in this pass.
+3. Claiming zero perceptual change; the implementation should minimize audible damage, but extreme stretch ratios will still affect quality.
+
+### Implementation Result
+
+Added:
+
+1. Material folder scanning through the shared supported-audio extension list.
+2. Deterministic material ordering by filename.
+3. Material assembly FFmpeg command generation using `concat` followed by `rubberband`.
+4. One-file material support through the same `rubberband` chain, without a special loop/cut path.
+5. Progress-aware material assembly used by the batch queue whenever a material folder is selected.
+6. GUI start validation that requires a material folder for assembly, while still allowing settings to be saved before every source is selected.
+7. Default `.wav` output and automatic `pcm_s24le` codec for WAV files.
+8. GUI trim start and duration fields removed from the assembly workflow to avoid implying direct material truncation.
+
+### Behavior
+
+For each queued original audio file:
+
+1. The original audio is probed only for reference duration.
+2. Supported audio files in the material set are concatenated in filename order.
+3. The total material duration is compared to the reference duration.
+4. FFmpeg `rubberband` applies `tempo = material_duration / reference_duration`.
+5. `pitch=1` and `formant=preserved` are used to reduce pitch/formant damage.
+6. The graph does not use `stream_loop`, `atrim`, or direct duration truncation.
+7. If `rubberband` returns a slightly short result, `apad=whole_dur=<reference_duration>` pads only the tail to the reference duration.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m compileall -q audio_processor tests`
+2. `.venv\Scripts\python -m unittest discover`
+3. Generated a 4 second reference WAV and two 1 second material WAV files with FFmpeg.
+4. Ran the project assembly engine on those files.
+5. FFprobe confirmed the assembled output is `format_name=wav`, `codec_name=pcm_s24le`, and `duration=4.000000`.
