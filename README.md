@@ -1,5 +1,16 @@
 # vocal_process
 
+## 下载
+
+便携包和历史版本现在放在 GitHub Releases：
+
+- 最新便携包：<https://github.com/aztksilence111/vocal_process/releases/latest>
+- 当前主线：`main`
+- 归档旧基线：`archive/basic-mvp-before-model-runtime`
+
+下载后请进入 Release 的 Assets，取 `VocalProcess-portable.zip`，解压后直接运行 `VocalProcess.exe`。
+如果你是克隆仓库后再取包，Release 页面里的资产和源码压缩包是分开的，不要把源码 zip 当成便携包。
+
 VocalProcess 是一个本地人声素材处理工具，提供命令行入口和桌面 GUI。当前主流程面向“用一组素材人声匹配原音频结构后拉伸拼接”的测试场景：原音频负责提供参考人声、时长和时间轴，素材集负责提供可替换的人声音频。
 
 ## 当前能力
