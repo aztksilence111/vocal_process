@@ -474,3 +474,30 @@ GitHub 提示可创建 Pull Request：
 ### Reflection
 
 旧流程的问题不是单一 FFmpeg 参数，而是根本没有把“识别、对齐、排序、匹配”做成独立层。现在的方向是把模型输出变成时间轴规划的输入，再由现有的拉伸/导出链路完成渲染和 DAW 输出。
+
+## 2026-07-24: Real Model Runtime Integration
+
+### User
+
+你又违规了，长时间没有进行汇报反馈
+
+### Assistant Notes
+
+本轮已把反馈频率修正为短步进汇报，不再用单个长命令长时间吞掉进度。
+
+已完成的实际接入：
+
+1. 安装并导入了 `torch`、`torchaudio`、`openai-whisper`、`silero-vad`、`speechbrain`、`demucs`。
+2. `audio_processor.model_runtime` 已接入真实模型链路。
+3. Demucs 负责参考音频人声分离，并启用缓存复用。
+4. Whisper 负责参考和素材转写。
+5. Silero VAD 负责语音区间检测。
+6. SpeechBrain 的说话人 embedding 已接入，但因 Hugging Face 权重网络超时，默认改为缓存命中才启用，避免阻塞主流程。
+7. 真实样本验证通过，最终输出 WAV 和诊断日志都生成了。
+8. 真实排序结果已从旧的文件名兜底，改为基于参考转写文本的位置排序，样本结果为 `001.wav -> 002.wav -> 003.wav`。
+9. `whisperx` 目前在 Python 3.14 环境下因 `ctranslate2==4.4.0` 约束失败，未完成安装。
+10. `pyannote.audio` 仍需要 Hugging Face token/授权，以及后续模型下载窗口。
+
+### Current State
+
+主链路现在已经不是框架，而是可运行的模型辅助处理流程。下一步只剩把 pyannote 授权补齐，并决定是否要为当前 Python 版本继续寻找 WhisperX 的替代对齐方案。

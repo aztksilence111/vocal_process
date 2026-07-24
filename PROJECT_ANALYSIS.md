@@ -542,4 +542,10 @@ Passed:
 
 ### Notes
 
-The project still needs actual inference wiring for the model backends. The present change is the architecture and diagnostics layer that makes that work testable and traceable.
+The project now has real inference wiring for the core backends: Demucs, Whisper, Silero VAD, and a guarded SpeechBrain speaker-embedding path. The remaining blockers are external:
+
+1. `pyannote.audio` requires Hugging Face authorization/token and has not been installed yet.
+2. `whisperx` is currently blocked in this Python 3.14 environment because its published dependency pin expects `ctranslate2==4.4.0`, which is not available for this runtime.
+3. SpeechBrain embedding is intentionally cache-gated so user runs do not hang on first-time Hugging Face downloads.
+
+The present change is now a working model-assisted pipeline, not just a placeholder architecture.

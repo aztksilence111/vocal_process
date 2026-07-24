@@ -39,6 +39,9 @@ class MaterialAnalysis:
     speaker_label: str | None = None
     embedding_ref: str | None = None
     duration_seconds: float | None = None
+    speaker_embedding: tuple[float, ...] | None = None
+    vad_coverage: float | None = None
+    analysis_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,9 @@ class MaterialOrderDecision:
     reference_text: str
     material_text: str
     reason: str
+    transcript_score: float = 0.0
+    speaker_score: float = 0.0
+    vad_score: float = 0.0
 
 
 OPEN_SOURCE_MODEL_CANDIDATES: tuple[ModelCandidate, ...] = (
@@ -170,6 +176,8 @@ def backend_availability() -> dict[str, bool]:
 def order_materials_for_reference(
     reference_segments: Sequence[VoiceSegment],
     materials: Sequence[MaterialAnalysis],
+    *,
+    reference_embedding: tuple[float, ...] | None = None,
 ) -> list[MaterialOrderDecision]:
     if not materials:
         return []
@@ -179,6 +187,13 @@ def order_materials_for_reference(
     if not usable_reference or not usable_materials:
         return _filename_order_decisions(materials, reason="filename_fallback")
 
+    if len(usable_reference) < len(usable_materials):
+        return _order_materials_by_reference_text(
+            " ".join(segment.text for segment in usable_reference),
+            materials,
+            reference_embedding=reference_embedding,
+        )
+
     remaining = list(materials)
     decisions: list[MaterialOrderDecision] = []
     for reference_segment in usable_reference:
@@ -187,11 +202,20 @@ def order_materials_for_reference(
 
         best_index = 0
         best_score = -1.0
+        best_transcript_score = 0.0
+        best_speaker_score = 0.0
+        best_vad_score = 0.0
         for index, material in enumerate(remaining):
-            score = text_similarity(reference_segment.text, material.transcript)
+            transcript_score = text_similarity(reference_segment.text, material.transcript)
+            speaker_score = _speaker_similarity(reference_segment, material, reference_embedding=reference_embedding)
+            vad_score = material.vad_coverage or 0.0
+            score = (0.6 * transcript_score) + (0.3 * speaker_score) + (0.1 * vad_score)
             if score > best_score:
                 best_index = index
                 best_score = score
+                best_transcript_score = transcript_score
+                best_speaker_score = speaker_score
+                best_vad_score = vad_score
 
         selected = remaining.pop(best_index)
         decisions.append(
@@ -202,6 +226,9 @@ def order_materials_for_reference(
                 reference_text=reference_segment.text,
                 material_text=selected.transcript,
                 reason="transcript_similarity",
+                transcript_score=best_transcript_score,
+                speaker_score=best_speaker_score,
+                vad_score=best_vad_score,
             )
         )
 
@@ -231,6 +258,79 @@ def text_similarity(left: str, right: str) -> float:
     return overlap / union if union else 0.0
 
 
+def _order_materials_by_reference_text(
+    reference_text: str,
+    materials: Sequence[MaterialAnalysis],
+    *,
+    reference_embedding: tuple[float, ...] | None,
+) -> list[MaterialOrderDecision]:
+    scored: list[tuple[int, float, str, MaterialOrderDecision]] = []
+    for material in materials:
+        transcript_score = text_similarity(reference_text, material.transcript)
+        speaker_score = _speaker_similarity(
+            VoiceSegment(0.0, 0.0, reference_text),
+            material,
+            reference_embedding=reference_embedding,
+        )
+        vad_score = material.vad_coverage or 0.0
+        score = (0.6 * transcript_score) + (0.3 * speaker_score) + (0.1 * vad_score)
+        position = _text_position(reference_text, material.transcript)
+        fallback_position = 10**9
+        scored.append(
+            (
+                position if position is not None else fallback_position,
+                -score,
+                material.path.name.lower(),
+                MaterialOrderDecision(
+                    rank=0,
+                    material_path=material.path,
+                    score=max(score, 0.0),
+                    reference_text=reference_text,
+                    material_text=material.transcript,
+                    reason="reference_text_position" if position is not None else "unpositioned_transcript_similarity",
+                    transcript_score=transcript_score,
+                    speaker_score=speaker_score,
+                    vad_score=vad_score,
+                ),
+            )
+        )
+
+    decisions: list[MaterialOrderDecision] = []
+    for rank, (_, _, _, decision) in enumerate(sorted(scored, key=lambda item: item[:3]), start=1):
+        decisions.append(
+            MaterialOrderDecision(
+                rank=rank,
+                material_path=decision.material_path,
+                score=decision.score,
+                reference_text=decision.reference_text,
+                material_text=decision.material_text,
+                reason=decision.reason,
+                transcript_score=decision.transcript_score,
+                speaker_score=decision.speaker_score,
+                vad_score=decision.vad_score,
+            )
+        )
+    return decisions
+
+
+def _text_position(reference_text: str, material_text: str) -> int | None:
+    reference = _compact_text(reference_text)
+    material = _compact_text(material_text)
+    if not reference or not material:
+        return None
+
+    exact = reference.find(material)
+    if exact >= 0:
+        return exact
+
+    positions = [
+        reference.find(unit)
+        for unit in _text_units(material_text)
+        if unit and reference.find(unit) >= 0
+    ]
+    return min(positions) if positions else None
+
+
 def _filename_order_decisions(
     materials: Sequence[MaterialAnalysis],
     *,
@@ -252,7 +352,7 @@ def _filename_order_decisions(
 
 
 def _text_features(text: str) -> set[str]:
-    units = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", text.lower())
+    units = _text_units(text)
     if not units:
         return set()
 
@@ -261,3 +361,51 @@ def _text_features(text: str) -> set[str]:
     if len(compact) > 1:
         features.update(compact[index : index + 2] for index in range(len(compact) - 1))
     return features
+
+
+def _text_units(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", text.lower())
+
+
+def _compact_text(text: str) -> str:
+    return "".join(_text_units(text))
+
+
+def _speaker_similarity(
+    reference_segment: VoiceSegment,
+    material: MaterialAnalysis,
+    *,
+    reference_embedding: tuple[float, ...] | None = None,
+) -> float:
+    if material.speaker_embedding is None:
+        return 0.0
+
+    reference_hint = reference_segment.speaker_id
+    if reference_hint is not None and material.speaker_label is not None and reference_hint == material.speaker_label:
+        return 1.0
+
+    if reference_embedding is None:
+        if reference_segment.confidence is not None and reference_segment.confidence <= 0:
+            return 0.0
+        # The runtime layer can replace this placeholder with a true cosine score when
+        # embedding vectors are available. Until then, a weak positive weight keeps the
+        # scorer deterministic without overclaiming identity matching.
+        return 0.5
+
+    if reference_segment.confidence is not None and reference_segment.confidence <= 0:
+        return 0.0
+
+    return _cosine_similarity(reference_embedding, material.speaker_embedding)
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+
+    dot_product = sum(float(a) * float(b) for a, b in zip(left, right))
+    left_norm = sum(float(a) * float(a) for a in left) ** 0.5
+    right_norm = sum(float(b) * float(b) for b in right) ** 0.5
+    if left_norm <= 0 or right_norm <= 0:
+        return 0.0
+    score = dot_product / (left_norm * right_norm)
+    return max(min(score, 1.0), -1.0)

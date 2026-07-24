@@ -483,6 +483,19 @@ class ModelAssistTests(unittest.TestCase):
         self.assertEqual([decision.material_path.name for decision in decisions], ["001.wav", "002.wav"])
         self.assertTrue(all(decision.reason == "transcript_similarity" for decision in decisions))
 
+    def test_orders_materials_by_reference_text_position(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 4.0, "hello world this is a test for vocal process")],
+            [
+                MaterialAnalysis(Path("003.wav"), transcript="for vocal process"),
+                MaterialAnalysis(Path("001.wav"), transcript="hello world"),
+                MaterialAnalysis(Path("002.wav"), transcript="this is a test"),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["001.wav", "002.wav", "003.wav"])
+        self.assertTrue(all(decision.reason == "reference_text_position" for decision in decisions))
+
 
 if __name__ == "__main__":
     unittest.main()

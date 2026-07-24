@@ -110,6 +110,7 @@ def export_daw_timeline_with_progress(
     project_path: Path,
     options: ProcessOptions,
     *,
+    material_paths: Sequence[Path] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> DawExportResult:
@@ -125,8 +126,8 @@ def export_daw_timeline_with_progress(
     project_directory.mkdir(parents=True, exist_ok=True)
     audio_directory.mkdir(parents=True, exist_ok=True)
 
-    material_paths = list_audio_files(material_directory)
-    plan = plan_daw_timeline(reference_path, material_paths, audio_directory)
+    ordered_material_paths = list(material_paths) if material_paths is not None else list_audio_files(material_directory)
+    plan = plan_daw_timeline(reference_path, ordered_material_paths, audio_directory)
 
     rendered_clips: list[DawTimelineClip] = []
     total_steps = len(plan.clips) + 1

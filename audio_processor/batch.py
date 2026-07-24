@@ -14,6 +14,7 @@ from .engine import (
     probe_audio,
     process_audio_with_progress,
 )
+from .model_runtime import build_model_ordering
 from .settings import ProcessingSettings
 
 
@@ -95,12 +96,26 @@ def run_batch_queue(
             _log_input_diagnostics(diagnostics, item.input_path, settings)
             options = settings.to_process_options(item.input_path, item.output_path)
             if settings.material_directory:
+                ordering = build_model_ordering(
+                    item.input_path,
+                    Path(settings.material_directory),
+                    lyrics_file=Path(settings.lyrics_file) if settings.lyrics_file else None,
+                    work_dir=diagnostics.path.parent / "model_analysis_cache",
+                    on_progress=progress_callback,
+                )
+                ordered_material_paths = list(ordering.ordered_paths)
+                diagnostics.event(
+                    "model.ordering.completed",
+                    "Model-assisted material ordering completed",
+                    report=ordering.analysis_report,
+                )
                 if settings.daw_timeline_export:
                     export_daw_timeline_with_progress(
                         item.input_path,
                         Path(settings.material_directory),
                         item.output_path,
                         options,
+                        material_paths=ordered_material_paths,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                     )
@@ -110,6 +125,7 @@ def run_batch_queue(
                         Path(settings.material_directory),
                         item.output_path,
                         options,
+                        material_paths=ordered_material_paths,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                     )
@@ -188,9 +204,9 @@ def _notify_queue(callback: QueueCallback | None, progress: float, message: str)
 
 def _processing_mode(settings: ProcessingSettings) -> str:
     if settings.material_directory and settings.daw_timeline_export:
-        return "daw_timeline_export"
+        return "model_assisted_daw_timeline_export"
     if settings.material_directory:
-        return "material_stretch_assembly"
+        return "model_assisted_material_stretch_assembly"
     return "direct_audio_processing"
 
 

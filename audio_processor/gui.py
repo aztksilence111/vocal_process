@@ -200,7 +200,6 @@ class AudioProcessorApp(tk.Tk):
         self.daw_timeline_export_check.configure(command=self._update_outputs_from_settings)
         self.daw_timeline_export_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
 
-        row += 1
         self._label(parent, "gain_db").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(parent, textvariable=self.gain_db_var).grid(row=row, column=1, sticky="ew", pady=4)
         self.normalize_check = self._checkbutton(parent, "normalize", self.normalize_var)
@@ -643,6 +642,7 @@ class AudioProcessorApp(tk.Tk):
     def _log_active_source_paths(self, settings: ProcessingSettings) -> None:
         if settings.material_directory:
             self._log(self._t("assembly_mode_active"))
+            self._log(self._t("model_assisted_ordering_active"))
             if settings.daw_timeline_export:
                 self._log(self._t("daw_timeline_mode_active"))
             self._log(self._t("material_active", path=settings.material_directory))

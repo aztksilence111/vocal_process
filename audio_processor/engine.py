@@ -380,6 +380,7 @@ def assemble_material_to_reference_with_progress(
     output_path: Path,
     options: ProcessOptions,
     *,
+    material_paths: Sequence[Path] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> None:
@@ -391,11 +392,11 @@ def assemble_material_to_reference_with_progress(
     if normalized_output.parent != Path("."):
         normalized_output.parent.mkdir(parents=True, exist_ok=True)
 
-    material_paths = list_audio_files(material_directory)
+    ordered_material_paths = list(material_paths) if material_paths is not None else list_audio_files(material_directory)
     reference_duration = get_audio_duration_seconds(probe_audio(normalized_reference))
     args = build_material_assembly_args(
         normalized_reference,
-        material_paths,
+        ordered_material_paths,
         normalized_output,
         ProcessOptions(
             input_path=normalized_reference,
