@@ -546,3 +546,12 @@ Passed:
 - Final zip SHA256: `35DBB2AFBD2A79A0D1CF72C8441E4CA19BDF93B87B9A4399470FEC7C2507A68D`
 - Actual portable model smoke test: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1 -PortableRoot dist\VocalProcess-portable\VocalProcess -WorkRoot .tmp\portable-model-smoke-final`
 - Actual portable result: `reference.wav`, `reference.diagnostics.jsonl`, and Demucs vocals/no_vocals cache were generated in `.tmp\portable-model-smoke-final\out`
+
+## 2026-07-24: Mainline Release Distribution
+
+- Archive branch created: `archive/basic-mvp-before-model-runtime`
+- Main updated to latest working commit: `fd28599`
+- Release published: `v2026.07.24-portable`
+- Release URL: `https://github.com/aztksilence111/vocal_process/releases/tag/v2026.07.24-portable`
+- Release asset: `VocalProcess-portable.zip`
+- Release asset SHA256: `35DBB2AFBD2A79A0D1CF72C8441E4CA19BDF93B87B9A4399470FEC7C2507A68D`
