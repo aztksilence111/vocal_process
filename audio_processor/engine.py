@@ -270,6 +270,40 @@ def build_material_assembly_args(
     return args
 
 
+def build_material_clip_args(
+    input_path: Path,
+    output_path: Path,
+    tempo: float,
+    options: ProcessOptions,
+    *,
+    target_duration: float | None = None,
+    progress: bool = False,
+) -> list[str]:
+    _validate_options(options)
+    _validate_rubberband_tempo(tempo)
+
+    args = ["ffmpeg", "-hide_banner"]
+    if progress:
+        args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+
+    args.append("-y" if options.overwrite else "-n")
+    args.extend(["-i", str(input_path)])
+    args.extend(["-af", _build_material_clip_filter(tempo, options, target_duration=target_duration)])
+
+    if options.sample_rate is not None:
+        args.extend(["-ar", str(options.sample_rate)])
+
+    if options.channels is not None:
+        args.extend(["-ac", str(options.channels)])
+
+    codec = options.codec or _default_audio_codec(output_path)
+    if codec:
+        args.extend(["-codec:a", codec])
+
+    args.append(str(output_path))
+    return args
+
+
 def process_audio(options: ProcessOptions) -> None:
     run_command(build_process_args(_normalize_options(options)))
 
@@ -286,6 +320,55 @@ def process_audio_with_progress(
     _run_progress_process(
         args,
         duration_seconds=duration_seconds,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
+    )
+
+
+def process_material_clip_with_progress(
+    input_path: Path,
+    output_path: Path,
+    tempo: float,
+    options: ProcessOptions,
+    *,
+    target_duration: float | None = None,
+    on_progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> None:
+    normalized_input = input_path.expanduser()
+    if not normalized_input.exists():
+        raise AudioProcessorError(f"Input file does not exist: {normalized_input}")
+
+    normalized_output = output_path.expanduser()
+    if normalized_output.parent != Path("."):
+        normalized_output.parent.mkdir(parents=True, exist_ok=True)
+
+    input_duration = get_audio_duration_seconds(probe_audio(normalized_input))
+    expected_duration = target_duration or (input_duration / tempo if tempo > 0 else input_duration)
+    args = build_material_clip_args(
+        normalized_input,
+        normalized_output,
+        tempo,
+        ProcessOptions(
+            input_path=normalized_input,
+            output_path=normalized_output,
+            overwrite=options.overwrite,
+            trim_start=None,
+            duration=None,
+            gain_db=options.gain_db,
+            normalize=options.normalize,
+            highpass_hz=options.highpass_hz,
+            lowpass_hz=options.lowpass_hz,
+            sample_rate=options.sample_rate,
+            channels=options.channels,
+            codec=options.codec,
+        ),
+        target_duration=target_duration,
+        progress=True,
+    )
+    _run_progress_process(
+        args,
+        duration_seconds=expected_duration,
         on_progress=on_progress,
         should_cancel=should_cancel,
     )
@@ -424,6 +507,26 @@ def _build_material_filter_graph(
         post_filters.append(f"apad=whole_dur={target_duration:.6f}")
     filters.append(f"{source_label}{','.join(post_filters)}[outa]")
     return ";".join(filters)
+
+
+def _build_material_clip_filter(
+    tempo: float,
+    options: ProcessOptions,
+    *,
+    target_duration: float | None = None,
+) -> str:
+    if target_duration is not None and target_duration <= 0:
+        raise AudioProcessorError("target_duration must be greater than 0")
+
+    audio_filters = _build_audio_filters(options)
+    filters = [
+        f"rubberband=tempo={tempo:.8f}:pitch=1:formant=preserved:transients=crisp:phase=laminar"
+    ]
+    if audio_filters:
+        filters.append(audio_filters)
+    if target_duration is not None:
+        filters.append(f"apad=whole_dur={target_duration:.6f}")
+    return ",".join(filters)
 
 
 def _validate_options(options: ProcessOptions) -> None:

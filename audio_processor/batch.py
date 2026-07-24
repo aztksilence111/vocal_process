@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from .daw import export_daw_timeline_with_progress
 from .engine import AudioProcessorError, assemble_material_to_reference_with_progress, process_audio_with_progress
 from .settings import ProcessingSettings
 
@@ -74,15 +75,24 @@ def run_batch_queue(
         try:
             options = settings.to_process_options(item.input_path, item.output_path)
             if settings.material_directory:
-                process_runner = assemble_material_to_reference_with_progress
-                process_runner(
-                    item.input_path,
-                    Path(settings.material_directory),
-                    item.output_path,
-                    options,
-                    on_progress=progress_callback,
-                    should_cancel=should_cancel,
-                )
+                if settings.daw_timeline_export:
+                    export_daw_timeline_with_progress(
+                        item.input_path,
+                        Path(settings.material_directory),
+                        item.output_path,
+                        options,
+                        on_progress=progress_callback,
+                        should_cancel=should_cancel,
+                    )
+                else:
+                    assemble_material_to_reference_with_progress(
+                        item.input_path,
+                        Path(settings.material_directory),
+                        item.output_path,
+                        options,
+                        on_progress=progress_callback,
+                        should_cancel=should_cancel,
+                    )
             else:
                 process_audio_with_progress(
                     options,

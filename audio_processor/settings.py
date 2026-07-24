@@ -18,6 +18,7 @@ class ProcessingSettings:
     language: str = DEFAULT_LANGUAGE
     material_directory: str = ""
     lyrics_file: str = ""
+    daw_timeline_export: bool = False
     output_directory: str = ""
     output_extension: str = ".wav"
     overwrite: bool = True
@@ -32,6 +33,11 @@ class ProcessingSettings:
     codec: str | None = None
 
     def output_path_for(self, input_path: Path) -> Path:
+        if self.daw_timeline_export and self.material_directory:
+            output_dir = Path(self.output_directory).expanduser() if self.output_directory else input_path.parent
+            project_dir = output_dir / f"{input_path.stem}_daw"
+            return project_dir / f"{input_path.stem}.rpp"
+
         extension = normalize_extension(self.output_extension, fallback=input_path.suffix)
         output_dir = Path(self.output_directory).expanduser() if self.output_directory else input_path.parent
         output_path = output_dir / f"{input_path.stem}{extension}"
@@ -65,6 +71,7 @@ class ProcessingSettings:
             language=normalize_language(optional_string(data.get("language"))),
             material_directory=str(data.get("material_directory") or defaults.material_directory),
             lyrics_file=str(data.get("lyrics_file") or defaults.lyrics_file),
+            daw_timeline_export=bool(data.get("daw_timeline_export", defaults.daw_timeline_export)),
             output_directory=str(data.get("output_directory") or defaults.output_directory),
             output_extension=normalize_extension(
                 str(data.get("output_extension") or defaults.output_extension),

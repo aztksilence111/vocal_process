@@ -56,6 +56,12 @@ python -m audio_processor process input.wav clip.wav --trim-start 00:00:10 --dur
 python -m audio_processor process input.wav cleaned.wav --highpass-hz 80 --lowpass-hz 12000 --overwrite
 ```
 
+导出 DAW 时间轴工程：
+
+```powershell
+python -m audio_processor export-daw reference.wav materials reference_daw\reference.rpp --overwrite
+```
+
 ## 图形界面
 
 图形界面支持：
@@ -69,7 +75,8 @@ python -m audio_processor process input.wav cleaned.wav --highpass-hz 80 --lowpa
 7. 顺序处理原音频队列
 8. 显示当前文件进度、总进度、状态和日志
 9. 保存并重新加载配置
-10. 使用语言按钮在中文和英文之间切换，语言偏好会随配置保存
+10. 可选择导出 DAW 时间轴工程，让每个拉伸后的素材片段在宿主中仍然是独立 item
+11. 使用语言按钮在中文和英文之间切换，语言偏好会随配置保存
 
 ## 素材拼接处理逻辑
 
@@ -82,6 +89,31 @@ python -m audio_processor process input.wav cleaned.wav --highpass-hz 80 --lowpa
 5. 不循环播放素材，也不因素材过长直接裁切素材。
 6. 如果拉伸算法产生毫秒级短缺，只在尾部补静音到目标时长，不裁切素材内容。
 7. 默认输出 `.wav`，WAV 输出默认使用 `pcm_s24le`，便于导入 DAW 宿主软件。
+
+## DAW 时间轴导出
+
+启用“导出 DAW 时间轴工程”后，项目不会只输出一个扁平化 WAV，而是输出一个工程文件夹：
+
+```text
+reference_daw\
+  reference.rpp
+  timeline.json
+  timeline.csv
+  audio\
+    0001_clip.wav
+    0002_clip.wav
+```
+
+导出逻辑：
+
+1. 原音频仍然只作为参考时长。
+2. 素材集中的每个音频文件会按文件名排序。
+3. 每个素材文件会分别用同一个全局 `rubberband` 比例拉伸或压缩。
+4. 每个拉伸结果都会保存为独立 WAV 文件。
+5. `timeline.json` 和 `timeline.csv` 记录每个片段的源文件、输出文件、开始时间和目标时长。
+6. `reference.rpp` 是 REAPER 工程文件，包含参考音频轨和独立素材片段轨。
+
+这一步解决的是“导入 DAW 后仍可单独编辑各个素材片段”。VST3 桥接属于后续插件/宿主集成层，需要单独的 C++/SDK 构建链路，不和当前 Python GUI 便携版混在同一层实现。
 
 ## 安装
 

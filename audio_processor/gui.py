@@ -43,6 +43,7 @@ class AudioProcessorApp(tk.Tk):
         self.output_directory_var = tk.StringVar()
         self.material_directory_var = tk.StringVar()
         self.lyrics_file_var = tk.StringVar()
+        self.daw_timeline_export_var = tk.BooleanVar()
         self.output_extension_var = tk.StringVar()
         self.overwrite_var = tk.BooleanVar()
         self.gain_db_var = tk.StringVar()
@@ -191,6 +192,15 @@ class AudioProcessorApp(tk.Tk):
         self.overwrite_check.grid(row=row, column=2, sticky="w", padx=(8, 0), pady=4)
 
         row += 1
+        self.daw_timeline_export_check = self._checkbutton(
+            parent,
+            "daw_timeline_export",
+            self.daw_timeline_export_var,
+        )
+        self.daw_timeline_export_check.configure(command=self._update_outputs_from_settings)
+        self.daw_timeline_export_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+
+        row += 1
         self._label(parent, "gain_db").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(parent, textvariable=self.gain_db_var).grid(row=row, column=1, sticky="ew", pady=4)
         self.normalize_check = self._checkbutton(parent, "normalize", self.normalize_var)
@@ -282,10 +292,12 @@ class AudioProcessorApp(tk.Tk):
         directory = filedialog.askdirectory()
         if directory:
             self.material_directory_var.set(directory)
+            self._update_outputs_from_settings()
             self._log(self._t("material_selected", path=directory))
 
     def clear_material_directory(self) -> None:
         self.material_directory_var.set("")
+        self._update_outputs_from_settings()
         self._log(self._t("material_cleared"))
 
     def choose_lyrics_file(self) -> None:
@@ -416,6 +428,7 @@ class AudioProcessorApp(tk.Tk):
             language=self.language,
             material_directory=self.material_directory_var.get().strip(),
             lyrics_file=self.lyrics_file_var.get().strip(),
+            daw_timeline_export=self.daw_timeline_export_var.get(),
             output_directory=self.output_directory_var.get().strip(),
             output_extension=self.output_extension_var.get().strip(),
             overwrite=self.overwrite_var.get(),
@@ -434,6 +447,7 @@ class AudioProcessorApp(tk.Tk):
         self.language = normalize_language(settings.language)
         self.material_directory_var.set(settings.material_directory)
         self.lyrics_file_var.set(settings.lyrics_file)
+        self.daw_timeline_export_var.set(settings.daw_timeline_export)
         self.output_directory_var.set(settings.output_directory)
         self.output_extension_var.set(settings.output_extension)
         self.overwrite_var.set(settings.overwrite)
@@ -629,6 +643,8 @@ class AudioProcessorApp(tk.Tk):
     def _log_active_source_paths(self, settings: ProcessingSettings) -> None:
         if settings.material_directory:
             self._log(self._t("assembly_mode_active"))
+            if settings.daw_timeline_export:
+                self._log(self._t("daw_timeline_mode_active"))
             self._log(self._t("material_active", path=settings.material_directory))
         if settings.lyrics_file:
             self._log(self._t("lyrics_active", path=settings.lyrics_file))

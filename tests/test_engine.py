@@ -8,10 +8,18 @@ from unittest.mock import patch
 
 from audio_processor.batch import create_queue
 from audio_processor.cli import build_parser
+from audio_processor.daw import (
+    DawExportResult,
+    DawTimelineClip,
+    DawTimelinePlan,
+    plan_daw_timeline,
+    render_reaper_project,
+)
 from audio_processor.engine import (
     AudioProcessorError,
     ProcessOptions,
     _build_material_filter_graph,
+    build_material_clip_args,
     build_process_args,
     get_audio_duration_seconds,
     list_audio_files,
@@ -137,6 +145,89 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertNotIn("concat=", graph)
         self.assertTrue(graph.startswith("[0:a]rubberband=tempo=0.50000000"))
 
+    def test_material_clip_command_stretches_without_loop_or_hard_cut(self) -> None:
+        args = build_material_clip_args(
+            Path("clip.wav"),
+            Path("clip_stretched.wav"),
+            1.5,
+            ProcessOptions(input_path=Path("clip.wav"), output_path=Path("clip_stretched.wav")),
+            target_duration=2.0,
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertIn("rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
+        self.assertIn("apad=whole_dur=2.000000", filters)
+        self.assertNotIn("atrim", filters)
+        self.assertNotIn("stream_loop", args)
+
+
+class DawTimelineTests(unittest.TestCase):
+    def test_plans_separate_daw_clips_on_reference_timeline(self) -> None:
+        reference = Path("reference.wav")
+        materials = [Path("001.wav"), Path("002.wav")]
+
+        with patch(
+            "audio_processor.daw.probe_audio",
+            side_effect=[
+                {"format": {"duration": "4.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "3.0"}, "streams": []},
+            ],
+        ):
+            plan = plan_daw_timeline(reference, materials, Path("project") / "audio")
+
+        self.assertEqual(plan.reference_duration_seconds, 4.0)
+        self.assertEqual(plan.material_duration_seconds, 4.0)
+        self.assertEqual(plan.tempo, 1.0)
+        self.assertEqual([clip.start_seconds for clip in plan.clips], [0.0, 1.0])
+        self.assertEqual([clip.target_duration_seconds for clip in plan.clips], [1.0, 3.0])
+        self.assertEqual([clip.rendered_path.name for clip in plan.clips], ["0001_001.wav", "0002_002.wav"])
+
+    def test_reaper_project_references_separate_rendered_clips(self) -> None:
+        result = DawExportResult(
+            project_path=Path("song_daw") / "song.rpp",
+            manifest_path=Path("song_daw") / "timeline.json",
+            csv_path=Path("song_daw") / "timeline.csv",
+            audio_directory=Path("song_daw") / "audio",
+            clips=[
+                DawTimelineClip(
+                    index=1,
+                    source_path=Path("materials") / "a.wav",
+                    rendered_path=Path("song_daw") / "audio" / "0001_a.wav",
+                    start_seconds=0.0,
+                    source_duration_seconds=1.0,
+                    target_duration_seconds=1.5,
+                    actual_duration_seconds=1.5,
+                ),
+                DawTimelineClip(
+                    index=2,
+                    source_path=Path("materials") / "b.wav",
+                    rendered_path=Path("song_daw") / "audio" / "0002_b.wav",
+                    start_seconds=1.5,
+                    source_duration_seconds=1.0,
+                    target_duration_seconds=2.5,
+                    actual_duration_seconds=2.5,
+                ),
+            ],
+        )
+        plan = DawTimelinePlan(
+            reference_path=Path("reference.wav"),
+            reference_duration_seconds=4.0,
+            material_duration_seconds=2.0,
+            tempo=0.5,
+            clips=result.clips,
+        )
+
+        project = render_reaper_project(result, plan)
+
+        self.assertIn('NAME "VocalProcess Stretched Clips"', project)
+        self.assertIn("POSITION 0.000000", project)
+        self.assertIn("POSITION 1.500000", project)
+        self.assertIn("LENGTH 2.500000", project)
+        self.assertIn('FILE "audio/0001_a.wav"', project)
+        self.assertIn('FILE "audio/0002_b.wav"', project)
+
 
 class ToolResolutionTests(unittest.TestCase):
     def test_resolve_tool_prefers_portable_bin(self) -> None:
@@ -219,6 +310,7 @@ class SettingsTests(unittest.TestCase):
             language="en",
             material_directory="materials",
             lyrics_file="lyrics.txt",
+            daw_timeline_export=True,
             output_directory="out",
             output_extension="wav",
             overwrite=False,
@@ -237,6 +329,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(loaded.language, "en")
         self.assertEqual(loaded.material_directory, "materials")
         self.assertEqual(loaded.lyrics_file, "lyrics.txt")
+        self.assertTrue(loaded.daw_timeline_export)
         self.assertEqual(loaded.output_directory, "out")
         self.assertFalse(loaded.overwrite)
         self.assertEqual(loaded.gain_db, -2.5)
@@ -256,12 +349,27 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.output_path_for(Path("song.mp3")), Path("song_processed.mp3"))
 
+    def test_daw_timeline_output_path_is_project_file(self) -> None:
+        settings = ProcessingSettings(
+            material_directory="materials",
+            daw_timeline_export=True,
+            output_directory="out",
+        )
+
+        self.assertEqual(settings.output_path_for(Path("song.wav")), Path("out") / "song_daw" / "song.rpp")
+
 
 class CliTests(unittest.TestCase):
     def test_gui_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["gui"])
 
         self.assertEqual(args.command, "gui")
+
+    def test_export_daw_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(["export-daw", "reference.wav", "materials", "song.rpp"])
+
+        self.assertEqual(args.command, "export-daw")
+        self.assertEqual(args.reference, Path("reference.wav"))
 
 
 class I18nTests(unittest.TestCase):

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .daw import export_daw_timeline_with_progress
 from .engine import (
     AudioProcessorError,
     ProcessOptions,
@@ -57,6 +58,30 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument("--channels", type=int, help="output channel count")
     process_parser.add_argument("--codec", help="FFmpeg audio codec name")
 
+    daw_parser = subparsers.add_parser(
+        "export-daw",
+        help="export stretched material clips and a DAW timeline project",
+    )
+    daw_parser.add_argument("reference", type=Path, help="reference/original audio file")
+    daw_parser.add_argument("material_directory", type=Path, help="folder containing material audio")
+    daw_parser.add_argument("project", type=Path, help="target REAPER .rpp project path")
+    daw_parser.add_argument(
+        "-y",
+        "--overwrite",
+        action="store_true",
+        help="overwrite generated clip and project files if they already exist",
+    )
+    daw_parser.add_argument("--gain-db", type=float, help="gain adjustment in dB")
+    daw_parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="apply EBU R128 loudness normalization to each clip",
+    )
+    daw_parser.add_argument("--highpass-hz", type=float, help="high-pass cutoff")
+    daw_parser.add_argument("--lowpass-hz", type=float, help="low-pass cutoff")
+    daw_parser.add_argument("--sample-rate", type=int, help="output sample rate")
+    daw_parser.add_argument("--channels", type=int, help="output channel count")
+
     return parser
 
 
@@ -102,6 +127,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             print(f"Wrote {args.output}")
+            return 0
+
+        if args.command == "export-daw":
+            result = export_daw_timeline_with_progress(
+                args.reference,
+                args.material_directory,
+                args.project,
+                ProcessOptions(
+                    input_path=args.reference,
+                    output_path=args.project,
+                    overwrite=args.overwrite,
+                    gain_db=args.gain_db,
+                    normalize=args.normalize,
+                    highpass_hz=args.highpass_hz,
+                    lowpass_hz=args.lowpass_hz,
+                    sample_rate=args.sample_rate,
+                    channels=args.channels,
+                    codec=None,
+                ),
+            )
+            print(f"Wrote {result.project_path}")
+            print(f"Wrote {result.manifest_path}")
+            print(f"Wrote {result.csv_path}")
             return 0
 
         parser.error("unknown command")
