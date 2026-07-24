@@ -37,7 +37,7 @@ JSONL is used so a failed run can still leave useful partial evidence. Each line
 
 ## Open Source Model Candidates
 
-The model layer should be optional and staged, because these dependencies can be large and may require GPU, PyTorch, ONNX Runtime, or model-account setup.
+The model layer is now part of the core material assembly flow. Some backends are still staged because they can require GPU, ONNX Runtime, model-account setup, or Hugging Face authorization.
 
 | Stage | Candidate | GitHub | Purpose |
 | --- | --- | --- | --- |
@@ -81,24 +81,27 @@ Implemented now:
 3. Open-source model candidate registry.
 4. Optional backend availability checks.
 5. Transcript-based material ordering helper.
-6. CLI entry:
+6. Real local runtime integration for Demucs, OpenAI Whisper, Silero VAD through torch hub, and cache-gated SpeechBrain speaker embeddings.
+7. GUI and CLI environment checks report the local model runtime and cache state.
+8. Batch material assembly requires model-assisted ordering when a material folder is selected.
+9. DAW timeline export receives the model-ordered material path list instead of raw filename order.
+10. CLI entry:
 
 ```powershell
 python -m audio_processor models
 python -m audio_processor models --json
 ```
 
-Not implemented yet:
+Not default yet:
 
-1. Installing or bundling the large model dependencies.
-2. Running Demucs, WhisperX, pyannote, Silero VAD, or SpeechBrain inference.
-3. GUI controls for selecting a model backend.
-4. Model-generated DAW timeline decisions.
+1. WhisperX word-level alignment, because the current Python 3.14 environment is blocked by published dependency pins.
+2. pyannote.audio diarization, because the pretrained pipeline needs Hugging Face token authorization and model terms acceptance.
+3. SpeechBrain first-run downloads, unless `VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD=1` is explicitly set; cached models are used when present.
 
 ## Next Development Steps
 
-1. Add an `analyze` command that writes `analysis.json` from optional installed model backends.
-2. Add a GUI analysis step that can run before rendering.
-3. Extend the DAW timeline planner to use `analysis.json` instead of filename order.
-4. Keep the old filename order only as an explicit fallback mode.
-5. Package model backends separately from the small portable GUI unless a target test machine and dependency budget are confirmed.
+1. Add an `analyze` command that writes `analysis.json` for inspecting model output before rendering.
+2. Add targeted diagnostics for weak transcripts, empty VAD, and extreme stretch ratios.
+3. Improve ordering with word-level alignment when a compatible WhisperX or alternative aligner is available.
+4. Add pyannote diarization after Hugging Face authorization is provided.
+5. Keep refining the portable package smoke test so it verifies both startup and a small model-assisted processing path.

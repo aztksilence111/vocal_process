@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from audio_processor import model_runtime
 from audio_processor.batch import create_queue, run_batch_queue
 from audio_processor.cli import build_parser
 from audio_processor.diagnostics import DiagnosticLogger, diagnostic_log_path
@@ -495,6 +496,23 @@ class ModelAssistTests(unittest.TestCase):
 
         self.assertEqual([decision.material_path.name for decision in decisions], ["001.wav", "002.wav", "003.wav"])
         self.assertTrue(all(decision.reason == "reference_text_position" for decision in decisions))
+
+
+class ModelRuntimeTests(unittest.TestCase):
+    def test_model_cache_root_falls_back_when_candidate_is_not_creatable(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blocked = root / "blocked"
+            blocked.write_text("not a directory", encoding="utf-8")
+            fallback = root / "fallback-cache"
+
+            with patch(
+                "audio_processor.model_runtime._model_cache_candidates",
+                return_value=[blocked / "models", fallback],
+            ):
+                cache_root = model_runtime._model_cache_root()
+
+        self.assertEqual(cache_root, fallback)
 
 
 if __name__ == "__main__":

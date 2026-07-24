@@ -501,3 +501,35 @@ GitHub 提示可创建 Pull Request：
 ### Current State
 
 主链路现在已经不是框架，而是可运行的模型辅助处理流程。下一步只剩把 pyannote 授权补齐，并决定是否要为当前 Python 版本继续寻找 WhisperX 的替代对齐方案。
+## 2026-07-24: Portable Zip Synced With Local Model Runtime
+
+### User
+
+Requested that the portable zip in `dist` be updated and smoke-tested first, with no size optimization for now, then git upload and conversation logging.
+
+### Assistant Notes
+
+This round focused on making the portable build self-contained for the local pretrained model flow:
+
+1. `scripts/build_portable.ps1` now copies the bundled `site-packages` runtime into the frozen app `_internal` folder with `robocopy`, so the lazy model imports can resolve inside the portable package.
+2. The same build script now copies `.tmp\model-cache` into `VocalProcess\models`, so Whisper, Silero VAD, and other cached assets travel with the zip.
+3. `audio_processor.model_runtime` now falls back safely across model cache locations instead of trying to create `%AppData%` first and failing in restricted environments.
+4. `scripts/smoke_portable.ps1` now accepts `-ReuseExtract`, which lets the assistant reuse an already extracted portable tree and finish the startup check without re-unzipping the 753 MB archive every time.
+5. `README.md`, `packaging/README_PORTABLE.txt`, and `docs/MODEL_ASSISTED_VOCAL_PIPELINE.md` were refreshed to match the current local-model-first behavior.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m unittest discover` with 35 tests.
+2. `.venv\Scripts\python -m compileall -q audio_processor tests packaging`.
+3. `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1 -ReuseExtract`.
+4. `ffmpeg.exe` and `ffprobe.exe` checks from the extracted portable package.
+5. The extracted portable tree contains `VocalProcess.exe`, `bin`, `licenses`, `models`, and `_internal`.
+
+### Build Result
+
+- Portable zip: `dist\VocalProcess-portable.zip`
+- Size: `753,289,753` bytes
+- SHA256: `7F1E9ED10374A01139AD2717A3596B12408467F7EA9BDC365A3ECAB00B451820`
+- Build marker inside zip: branch `codex/local-pretrained-portable-sync`, commit `54c6e71`, source state `working tree included uncommitted changes`

@@ -4,6 +4,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -348,6 +349,23 @@ def backend_availability() -> dict[str, bool]:
     }
 
 
+def get_model_runtime_report() -> list[str]:
+    cache_root = _model_cache_root()
+    availability = backend_availability()
+    lines = [
+        "Model runtime: local pretrained models",
+        f"Model cache: {cache_root}",
+        "Online inference billing: not used",
+    ]
+    for name in ("Demucs", "OpenAI Whisper", "Silero VAD", "SpeechBrain", "WhisperX", "pyannote.audio"):
+        status = "available" if availability.get(name) else "not installed"
+        lines.append(f"{name}: {status}")
+    lines.append(f"Whisper model cached: {_whisper_model_cached()}")
+    lines.append(f"Silero VAD cached: {_silero_model_cached()}")
+    lines.append(f"SpeechBrain cached: {_speechbrain_model_cached(cache_root / 'speechbrain' / 'ecapa')}")
+    return lines
+
+
 def plan_reference_text_segments(
     reference_transcript: str,
     *,
@@ -520,6 +538,7 @@ def _maybe_separate_vocals(path: Path, *, work_dir: Path | None = None, notes: l
         notes.append("demucs unavailable; using original reference audio")
         return path
 
+    os.environ.setdefault("TORCH_HOME", str(_model_cache_root() / "torch"))
     work_root = _prepare_work_root(work_dir)
     separated_root = work_root / "demucs"
     separated_root.mkdir(parents=True, exist_ok=True)
@@ -704,12 +723,24 @@ def _detect_vad_segments_with_torch_hub(path: Path) -> tuple[tuple[float, float]
     try:
         import torch  # type: ignore
 
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            source="github",
-            trust_repo=True,
-        )
+        model_root = _model_cache_root() / "torch" / "hub"
+        os.environ.setdefault("TORCH_HOME", str(_model_cache_root() / "torch"))
+        torch.hub.set_dir(str(model_root))
+        local_repo = model_root / "snakers4_silero-vad_master"
+        if local_repo.exists():
+            model, utils = torch.hub.load(
+                repo_or_dir=str(local_repo),
+                model="silero_vad",
+                source="local",
+                trust_repo=True,
+            )
+        else:
+            model, utils = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                source="github",
+                trust_repo=True,
+            )
         get_speech_timestamps, _, read_audio, _, _ = utils
         wav = read_audio(str(path))
         timestamps = get_speech_timestamps(wav, model, return_seconds=True)
@@ -817,10 +848,49 @@ def _prepare_work_root(work_dir: Path | None) -> Path:
 
 
 def _model_cache_root() -> Path:
+    for candidate in _model_cache_candidates():
+        root = _ensure_model_cache_root(candidate)
+        if root is not None:
+            return root
+
+    fallback = Path(tempfile.gettempdir()) / "vocal_process_models"
+    root = _ensure_model_cache_root(fallback)
+    if root is not None:
+        return root
+    return fallback
+
+
+def _model_cache_candidates() -> list[Path]:
     configured = os.environ.get("VOCAL_PROCESS_MODEL_CACHE")
-    root = Path(configured).expanduser() if configured else get_config_dir() / "models"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    if configured:
+        return [Path(configured).expanduser()]
+
+    if getattr(sys, "frozen", False):
+        portable_root = Path(sys.executable).resolve().parent / "models"
+        return [portable_root, get_config_dir() / "models"]
+
+    project_cache = Path(__file__).resolve().parents[1] / ".tmp" / "model-cache"
+    if project_cache.exists():
+        return [project_cache, get_config_dir() / "models"]
+    return [get_config_dir() / "models", project_cache]
+
+
+def _ensure_model_cache_root(path: Path) -> Path | None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return path
+
+
+def _whisper_model_cached() -> bool:
+    model_name = DEFAULT_ASR_MODEL
+    return (_model_cache_root() / "whisper" / f"{model_name}.pt").exists()
+
+
+def _silero_model_cached() -> bool:
+    root = _model_cache_root() / "torch" / "hub"
+    return (root / "snakers4_silero-vad_master").exists() or any((root / "checkpoints").glob("*.th"))
 
 
 def _maybe_module_available(module_name: str) -> bool:

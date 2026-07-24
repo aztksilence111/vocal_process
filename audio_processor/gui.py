@@ -11,6 +11,7 @@ from typing import Any
 from .batch import QueueItem, create_queue, run_batch_queue
 from .engine import AudioProcessorError, get_environment_report, list_audio_files
 from .i18n import normalize_language, translate, translate_message, translate_status
+from .model_runtime import get_model_runtime_report
 from .settings import ProcessingSettings, load_settings, save_settings
 
 
@@ -311,7 +312,7 @@ class AudioProcessorApp(tk.Tk):
 
     def check_tools(self) -> None:
         try:
-            report = "\n".join(get_environment_report())
+            report = "\n".join([*get_environment_report(), "", *get_model_runtime_report()])
         except AudioProcessorError as exc:
             messagebox.showerror(self._t("tool_check_failed_title"), str(exc))
             return

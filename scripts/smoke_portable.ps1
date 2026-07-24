@@ -2,7 +2,8 @@ param(
     [string]$AppName = "VocalProcess",
     [string]$ZipPath = "",
     [string]$ExtractRoot = "",
-    [int]$TimeoutSeconds = 5
+    [int]$TimeoutSeconds = 5,
+    [switch]$ReuseExtract
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,12 +35,17 @@ if (-not (Test-Path -LiteralPath $ZipPath)) {
 }
 
 Assert-ProjectChildPath $ExtractRoot "Smoke-test extraction directory"
-if (Test-Path -LiteralPath $ExtractRoot) {
-    Remove-Item -LiteralPath $ExtractRoot -Recurse -Force
-}
+if (-not $ReuseExtract) {
+    if (Test-Path -LiteralPath $ExtractRoot) {
+        Remove-Item -LiteralPath $ExtractRoot -Recurse -Force
+    }
 
-New-Item -ItemType Directory -Force -Path $ExtractRoot | Out-Null
-Expand-Archive -LiteralPath $ZipPath -DestinationPath $ExtractRoot -Force
+    New-Item -ItemType Directory -Force -Path $ExtractRoot | Out-Null
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $ExtractRoot -Force
+}
+elseif (-not (Test-Path -LiteralPath $ExtractRoot)) {
+    throw "ReuseExtract was requested, but the extraction directory does not exist: $ExtractRoot"
+}
 
 $AppRoot = Join-Path $ExtractRoot $AppName
 $ExePath = Join-Path $AppRoot "$AppName.exe"

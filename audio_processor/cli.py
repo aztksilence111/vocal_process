@@ -16,6 +16,7 @@ from .engine import (
     summarize_probe,
 )
 from .model_assist import backend_availability, build_model_assisted_pipeline_plan, list_model_candidates
+from .model_runtime import get_model_runtime_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,6 +104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "check":
             for line in get_environment_report():
+                print(line)
+            for line in get_model_runtime_report():
                 print(line)
             return 0
 

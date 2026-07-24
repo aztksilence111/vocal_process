@@ -549,3 +549,27 @@ The project now has real inference wiring for the core backends: Demucs, Whisper
 3. SpeechBrain embedding is intentionally cache-gated so user runs do not hang on first-time Hugging Face downloads.
 
 The present change is now a working model-assisted pipeline, not just a placeholder architecture.
+## 2026-07-24: Portable Zip Synced With Local Model Runtime
+
+The current user request was to sync and smoke-test the portable zip first, with no size optimization yet, then prepare git upload and record the outcome.
+
+Completed work:
+
+1. The portable build now includes the lazy model runtime packages by copying `.venv\Lib\site-packages` into the frozen app `_internal` folder.
+2. The portable build now bundles `.tmp\model-cache` into `VocalProcess\models` so Whisper and Silero caches travel with the package.
+3. `audio_processor.model_runtime` now falls back through portable, project-local, config, and temp cache roots instead of trying `%AppData%` first.
+4. `scripts/smoke_portable.ps1` now supports `-ReuseExtract` so the assistant can finish the startup check without re-extracting a large zip.
+
+Verified results:
+
+1. `.venv\Scripts\python -m unittest discover` passed with 35 tests.
+2. `.venv\Scripts\python -m compileall -q audio_processor tests packaging` passed.
+3. `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1 -ReuseExtract` passed.
+4. `dist\VocalProcess-portable.zip` exists and contains the bundled runtime, models, and build marker.
+
+Build artifact:
+
+- Zip: `dist\VocalProcess-portable.zip`
+- SHA256: `7F1E9ED10374A01139AD2717A3596B12408467F7EA9BDC365A3ECAB00B451820`
+- Size: `753,289,753` bytes
+- Build marker branch: `codex/local-pretrained-portable-sync`

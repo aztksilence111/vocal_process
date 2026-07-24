@@ -1,16 +1,31 @@
 # vocal_process
 
-这是一个基于 Python 和 FFmpeg 的本地音频处理 MVP。当前版本提供命令行入口和桌面图形界面，用于检查环境、批量队列处理、读取音频元数据、处理和转码音频文件。
+VocalProcess 是一个本地人声素材处理工具，提供命令行入口和桌面 GUI。当前主流程面向“用一组素材人声匹配原音频结构后拉伸拼接”的测试场景：原音频负责提供参考人声、时长和时间轴，素材集负责提供可替换的人声音频。
+
+## 当前能力
+
+1. GUI 批量处理原音频、素材集、歌词文件和输出目录。
+2. 使用本地预训练模型辅助分析，不使用在线推理计费。
+3. Demucs 用于原音频人声分离。
+4. OpenAI Whisper 用于原音频和素材音频转写。
+5. Silero VAD 用于检测素材中的人声区域。
+6. SpeechBrain 说话人特征接口已接入；默认只在模型缓存命中时启用，避免用户首次运行时长时间等待 Hugging Face 下载。
+7. 生成结构化 `.diagnostics.jsonl`，用于定位无报错失败、模型转写失败、FFprobe 元数据失败等问题。
+8. 输出普通 WAV，或导出 REAPER `.rpp`、`timeline.json`、`timeline.csv` 和独立素材片段 WAV，方便在 DAW 中继续编辑每个素材 item。
 
 ## 环境要求
 
-1. Python 3.14 或更新的稳定版
-2. FFmpeg 和 FFprobe 可从 PATH 直接调用
+源码运行建议：
 
-本机已通过 Chocolatey 安装并验证：
+1. Python 3.11 或更新版本。
+2. FFmpeg 和 FFprobe 可从 PATH 调用，或使用便携包内置版本。
+3. 已安装项目依赖：`torch`、`torchaudio`、`openai-whisper`、`demucs`、`speechbrain`。
 
-1. Python 3.14.6
-2. FFmpeg 8.1.2
+本机已验证：
+
+1. Python 3.14.6。
+2. FFmpeg 8.1.2。
+3. CPU 版 PyTorch、Whisper、Demucs、SpeechBrain。
 
 ## 常用命令
 
@@ -20,7 +35,7 @@
 python -m audio_processor gui
 ```
 
-检查运行环境：
+检查运行环境和模型缓存：
 
 ```powershell
 python -m audio_processor check
@@ -30,30 +45,13 @@ python -m audio_processor check
 
 ```powershell
 python -m audio_processor probe input.mp3
-```
-
-输出完整 FFprobe JSON：
-
-```powershell
 python -m audio_processor probe input.mp3 --json
 ```
 
-处理并转码音频：
+处理或转码单个音频：
 
 ```powershell
 python -m audio_processor process input.wav output.mp3 --normalize --gain-db -3 --sample-rate 44100 --channels 2 --overwrite
-```
-
-截取片段：
-
-```powershell
-python -m audio_processor process input.wav clip.wav --trim-start 00:00:10 --duration 30 --overwrite
-```
-
-基础滤波：
-
-```powershell
-python -m audio_processor process input.wav cleaned.wav --highpass-hz 80 --lowpass-hz 12000 --overwrite
 ```
 
 导出 DAW 时间轴工程：
@@ -62,125 +60,48 @@ python -m audio_processor process input.wav cleaned.wav --highpass-hz 80 --lowpa
 python -m audio_processor export-daw reference.wav materials reference_daw\reference.rpp --overwrite
 ```
 
-查看开源模型辅助管线计划：
+查看模型候选和状态：
 
 ```powershell
 python -m audio_processor models
 python -m audio_processor models --json
 ```
 
-## 图形界面
+## GUI 流程
 
-图形界面支持：
+1. 选择原音频。
+2. 选择素材集文件夹。
+3. 可选选择歌词文件。
+4. 选择输出目录和输出格式。
+5. 选择是否导出 DAW 时间轴工程。
+6. 点击“开始批量处理”。
 
-1. 分区上传原音频、素材集和歌词文件
-2. 原音频支持 `.wav`、`.mp3`、`.flac`、`.m4a`、`.ogg`、`.opus`、`.aac`、`.aiff`、`.alac`、`.wma`
-3. 素材集必须选择文件夹
-4. 歌词文件支持 `.txt`、`.doc`、`.docx`、`.lrc`、`.srt`
-5. 设置统一输出目录和输出扩展名
-6. 设置覆盖、增益、响度标准化、高通、低通、采样率、声道数和编码器
-7. 顺序处理原音频队列
-8. 显示当前文件进度、总进度、状态和日志
-9. 保存并重新加载配置
-10. 可选择导出 DAW 时间轴工程，让每个拉伸后的素材片段在宿主中仍然是独立 item
-11. 使用语言按钮在中文和英文之间切换，语言偏好会随配置保存
-
-## 素材拼接处理逻辑
-
-图形界面的当前主流程是：
-
-1. 原音频作为参考音频，用来提供目标时长。
-2. 素材集文件夹中的受支持音频文件会按文件名排序后顺序拼接。
-3. 拼接后的素材音频会用 FFmpeg `rubberband` 做整体拉伸或压缩，使它匹配原音频时长。
-4. 处理链路使用 `pitch=1` 和 `formant=preserved`，尽量保持音高、共振峰和单音节发音辨识度。
-5. 不循环播放素材，也不因素材过长直接裁切素材。
-6. 如果拉伸算法产生毫秒级短缺，只在尾部补静音到目标时长，不裁切素材内容。
-7. 默认输出 `.wav`，WAV 输出默认使用 `pcm_s24le`，便于导入 DAW 宿主软件。
-
-重要限制：当前素材拼接主流程仍不能真正识别歌词、音素、音色或歌唱顺序。它只能保证按既定顺序做拉伸拼接。要让输出和原曲人声结构相关，需要接入人声分离、VAD、ASR/对齐和音色相似度模型。后续模型辅助方案见 [Model Assisted Vocal Pipeline](docs/MODEL_ASSISTED_VOCAL_PIPELINE.md)。
+当选择素材集后，模型辅助排序是核心流程，不提供关闭按钮。处理链路会先分析原音频和素材人声，再把排序结果交给现有的拉伸拼接或 DAW 时间轴导出模块。
 
 ## 诊断日志
 
-每个批处理任务都会生成结构化诊断日志：
+每个批处理任务都会生成结构化 JSONL 日志：
 
-1. 普通 WAV 输出：`<输出文件名>.diagnostics.jsonl`
-2. DAW 时间轴工程：工程文件夹内 `diagnostics.jsonl`
+1. 普通 WAV 输出：`<输出文件名>.diagnostics.jsonl`。
+2. DAW 时间轴工程：工程文件夹内的 `diagnostics.jsonl`。
 
-日志会记录处理模式、输入路径、设置快照、参考音频元数据、素材清单与时长、歌词文件路径、完成状态和失败异常。人工测试失败时，应优先收集这个 JSONL 文件。
+日志会记录处理模式、输入路径、设置快照、参考音频元数据、素材清单、模型排序结果、完成状态和异常堆栈。人工测试失败时，应优先收集这个文件。
 
-## DAW 时间轴导出
+## 便携版
 
-启用“导出 DAW 时间轴工程”后，项目不会只输出一个扁平化 WAV，而是输出一个工程文件夹：
-
-```text
-reference_daw\
-  reference.rpp
-  timeline.json
-  timeline.csv
-  audio\
-    0001_clip.wav
-    0002_clip.wav
-```
-
-导出逻辑：
-
-1. 原音频仍然只作为参考时长。
-2. 素材集中的每个音频文件会按文件名排序。
-3. 每个素材文件会分别用同一个全局 `rubberband` 比例拉伸或压缩。
-4. 每个拉伸结果都会保存为独立 WAV 文件。
-5. `timeline.json` 和 `timeline.csv` 记录每个片段的源文件、输出文件、开始时间和目标时长。
-6. `reference.rpp` 是 REAPER 工程文件，包含参考音频轨和独立素材片段轨。
-
-这一步解决的是“导入 DAW 后仍可单独编辑各个素材片段”。VST3 桥接属于后续插件/宿主集成层，需要单独的 C++/SDK 构建链路，不和当前 Python GUI 便携版混在同一层实现。
-
-## 模型辅助方向
-
-项目已经新增模型辅助架构入口，但尚未默认安装大模型依赖。当前候选方向：
-
-1. Demucs：原曲人声分离
-2. Silero VAD 或 pyannote.audio：人声区间检测
-3. WhisperX 或 Whisper：转写和时间对齐
-4. SpeechBrain 或 pyannote.audio：说话人/音色相似度
-5. VocalProcess 内部规划器：根据模型输出排序素材并生成可编辑 DAW 时间轴
-
-## 安装
-
-建议先创建虚拟环境：
-
-```powershell
-python -m venv .venv
-.venv\Scripts\python -m pip install setuptools -i https://pypi.org/simple
-.venv\Scripts\python -m pip install -e . --no-build-isolation
-```
-
-安装后可用命令：
-
-```powershell
-.venv\Scripts\audio-processor check
-.venv\Scripts\audio-processor probe input.mp3
-.venv\Scripts\audio-processor process input.wav output.mp3 --overwrite
-.venv\Scripts\audio-processor-gui
-```
-
-构建 wheel 包：
-
-```powershell
-.venv\Scripts\python -m pip wheel . -w dist --no-deps --no-build-isolation
-```
-
-构建 Windows 便携版 ZIP：
+构建 Windows 便携 ZIP：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1
 ```
 
-便携版输出位置：
+输出位置：
 
 ```text
 dist\VocalProcess-portable.zip
 ```
 
-便携版会内置 GUI 可执行文件、`ffmpeg.exe`、`ffprobe.exe` 和第三方许可证说明。普通用户解压后双击 `VocalProcess.exe` 即可使用，不需要单独安装 Python 或 FFmpeg。
+默认构建会收集模型运行依赖，并把 `.tmp\model-cache` 复制到便携包的 `models` 文件夹。便携运行时会优先读取 `VocalProcess\models`，从而使用本地预训练模型缓存。
 
 便携版自动冒烟测试：
 
@@ -188,10 +109,35 @@ dist\VocalProcess-portable.zip
 powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1
 ```
 
-该脚本会从 ZIP 解压便携包，检查 `VocalProcess.exe`、内置 `ffmpeg.exe`、内置 `ffprobe.exe`，并隐藏启动 GUI 5 秒确认程序不会启动即崩溃。
+冒烟测试会解压 ZIP，检查 `VocalProcess.exe`、内置 `ffmpeg.exe`、内置 `ffprobe.exe`，并隐藏启动 GUI 以确认程序不会启动即崩溃。
+
+## DAW 时间轴导出
+
+启用 DAW 时间轴导出后，输出目录类似：
+
+```text
+reference_daw\
+  reference.rpp
+  timeline.json
+  timeline.csv
+  diagnostics.jsonl
+  audio\
+    0001_clip.wav
+    0002_clip.wav
+```
+
+`reference.rpp` 是 REAPER 工程文件，包含参考音频轨和独立素材片段轨；`timeline.json` 和 `timeline.csv` 记录每个素材片段的源文件、输出文件、开始时间、目标时长和排序依据。
+
+## 已知限制
+
+1. 当前默认 ASR 模型是 Whisper `base`，在复杂歌曲、混响、伴奏很强或非清晰人声素材上仍可能转写不准。
+2. WhisperX 在当前 Python 3.14 环境中受依赖版本限制，未作为默认后端启用。
+3. pyannote.audio 需要 Hugging Face 授权 token 和模型条款确认，当前仅保留可选接入路径。
+4. 首次完整模型推理在 CPU 上可能较慢；便携包内置缓存可以减少下载等待，但不能消除推理耗时。
 
 ## 测试
 
 ```powershell
 .venv\Scripts\python -m unittest discover
+.venv\Scripts\python -m compileall -q audio_processor tests packaging
 ```
