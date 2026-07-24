@@ -20,8 +20,11 @@ VocalProcess Portable
 - 默认 WAV 输出使用 pcm_s24le，适合导入常见 DAW 宿主软件。
 - 当前版本会将素材集音频按文件名顺序拼接，然后整体拉伸/压缩到原音频时长。
 - 素材不会循环播放，也不会因为过长被直接裁切。
+- 当前版本尚不能真正识别歌词、音素、音色或歌唱顺序；智能排序需要后续接入人声分离、VAD、ASR/对齐和音色相似度模型。
+- 每次处理都会在输出旁边生成 .diagnostics.jsonl 诊断日志。普通 WAV 输出对应 <输出文件名>.diagnostics.jsonl；DAW 工程输出对应工程文件夹中的 diagnostics.jsonl。
 
 Troubleshooting:
 
 - If the app cannot find FFmpeg, make sure bin\ffmpeg.exe and bin\ffprobe.exe still exist beside VocalProcess.exe.
 - If Windows SmartScreen warns about the app, it is because this local build is not code-signed.
+- If processing fails or the output is not meaningful, send the .diagnostics.jsonl file together with the original audio, material folder description, and screenshots of the selected settings.

@@ -450,3 +450,27 @@ GitHub 提示可创建 Pull Request：
 6. 已创建本地提交：`Fix portable FFprobe diagnostics and smoke test`。
 7. 已重新构建便携 ZIP，让 `BUILD_INFO.txt` 指向最终提交。
 8. 已按固定流程优先运行自动冒烟测试，结果通过。
+## 2026-07-24: Structured Diagnostics and Model Assisted Pipeline
+
+### User
+
+我先给你反馈用户人工测试问题。你搭建的原人声识别后素材人声拉伸拼接功能完全失效，出现了好几次无报错失败，唯一成功的一次输出结果很不理想，几乎与原曲人声或素材人声都没有关系。因此我的要求是，首先建立有效且高效的报错原因日志编写方法，然后在github上寻找开源模型架构来弥补人声识别和排序拼接功能，不要仅仅靠python和ffmpeg完成需求，你理解我的要求了吗？现在我要求你暂时保存vst3的开发进度（切记不要丢失），对我提到的内容进行总结反思反馈，然后继续完成项目。
+
+### Assistant Notes
+
+当前工作分支已切到 `codex/model-assisted-diagnostics`，同时确认 `7feab06` 的 DAW/VST3 时间轴导出进度已经保存，不会丢失。
+
+本轮新增内容：
+
+1. 结构化 JSONL 诊断日志模块 `audio_processor/diagnostics.py`。
+2. 批处理层为每个任务记录独立日志，包含模式、设置、参考音频、素材列表、歌词文件和异常信息。
+3. `audio_processor.model_assist` 中加入 Demucs、Silero VAD、pyannote.audio、WhisperX、Whisper、SpeechBrain 的候选清单和接入计划。
+4. CLI 新增 `models` 子命令，可输出模型计划与候选后端状态。
+5. `docs/MODEL_ASSISTED_VOCAL_PIPELINE.md` 记录失败原因、诊断方式和模型流水线方案。
+6. README 和便携版说明已补充当前能力边界与诊断日志位置。
+7. 单元测试通过 33 项。
+8. 真实端到端小样验证通过，输出文件和诊断日志都已实际生成。
+
+### Reflection
+
+旧流程的问题不是单一 FFmpeg 参数，而是根本没有把“识别、对齐、排序、匹配”做成独立层。现在的方向是把模型输出变成时间轴规划的输入，再由现有的拉伸/导出链路完成渲染和 DAW 输出。

@@ -504,3 +504,42 @@ Passed:
 2. ZIP extraction and `BUILD_INFO.txt` readback.
 3. `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1`.
 4. `.venv\Scripts\python -m unittest discover`.
+## 2026-07-24: Structured Diagnostics and Model Assisted Vocal Pipeline
+
+### Goal
+
+Address the user-reported failure where material vocal stretch assembly often finished without useful results and sometimes failed silently. The new work should first make failures diagnosable, then prepare the architecture for open-source model-assisted vocal recognition and ordering.
+
+### Technical Direction
+
+1. Add per-run JSONL diagnostics so every batch item writes an auditable trail.
+2. Record the processing mode, settings snapshot, reference metadata, material metadata, and exception details.
+3. Add a model-assist layer that can represent Demucs, Silero VAD, pyannote.audio, WhisperX, Whisper, and SpeechBrain as optional backends.
+4. Keep the current portable package small by making the model backends optional and not bundled by default.
+5. Expose the architecture through CLI and documentation before wiring heavy inference into the GUI.
+
+### Implementation Result
+
+Added:
+
+1. `audio_processor/diagnostics.py` for JSONL event logging.
+2. Batch-level logging in `audio_processor/batch.py`.
+3. `audio_processor/model_assist.py` for candidate models, backend availability checks, transcript-based ordering helpers, and pipeline planning.
+4. `audio_processor cli models` for inspection and JSON export.
+5. `docs/MODEL_ASSISTED_VOCAL_PIPELINE.md` for root-cause analysis and future architecture.
+6. README and portable-user docs updated with the current limitation and log location.
+
+### Verification
+
+Passed:
+
+1. `python -m unittest discover` with 33 tests.
+2. `python -m compileall -q audio_processor tests packaging`.
+3. Real end-to-end batch run on generated reference and material WAV files.
+4. The run produced `reference.diagnostics.jsonl` with stages `batch.item.started`, `inputs.reference`, `inputs.materials`, and `batch.item.completed`.
+5. `python -m audio_processor models` listed the candidate open-source backends.
+6. `python -m audio_processor models --json` printed the pipeline plan as JSON.
+
+### Notes
+
+The project still needs actual inference wiring for the model backends. The present change is the architecture and diagnostics layer that makes that work testable and traceable.

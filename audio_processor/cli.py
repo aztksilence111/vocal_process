@@ -15,6 +15,7 @@ from .engine import (
     process_audio,
     summarize_probe,
 )
+from .model_assist import backend_availability, build_model_assisted_pipeline_plan, list_model_candidates
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +27,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("check", help="verify Python, FFmpeg, and FFprobe")
     subparsers.add_parser("gui", help="open the desktop batch processor")
+
+    models_parser = subparsers.add_parser(
+        "models",
+        help="show open-source model candidates for vocal analysis and ordering",
+    )
+    models_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print the model-assisted pipeline plan as JSON",
+    )
 
     probe_parser = subparsers.add_parser("probe", help="show audio metadata")
     probe_parser.add_argument("input", type=Path, help="audio file to inspect")
@@ -99,6 +110,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .gui import main as gui_main
 
             return gui_main()
+
+        if args.command == "models":
+            if args.json:
+                print(json.dumps(build_model_assisted_pipeline_plan(), ensure_ascii=False, indent=2))
+            else:
+                availability = backend_availability()
+                for candidate in list_model_candidates():
+                    status = "available" if availability[candidate["name"]] else "not installed"
+                    print(f"{candidate['name']} [{candidate['pipeline_stage']}]: {status}")
+                    print(f"  {candidate['role']}")
+                    print(f"  {candidate['repository_url']}")
+            return 0
 
         if args.command == "probe":
             data = probe_audio(args.input)

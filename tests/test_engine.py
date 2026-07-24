@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from audio_processor.batch import create_queue
+from audio_processor.batch import create_queue, run_batch_queue
 from audio_processor.cli import build_parser
+from audio_processor.diagnostics import DiagnosticLogger, diagnostic_log_path
 from audio_processor.daw import (
     DawExportResult,
     DawTimelineClip,
@@ -29,6 +31,14 @@ from audio_processor.engine import (
 )
 from audio_processor.gui import LYRICS_EXTENSIONS
 from audio_processor.i18n import TRANSLATIONS, normalize_language, translate, translate_status
+from audio_processor.model_assist import (
+    MaterialAnalysis,
+    VoiceSegment,
+    build_model_assisted_pipeline_plan,
+    list_model_candidates,
+    order_materials_for_reference,
+    text_similarity,
+)
 from audio_processor.settings import ProcessingSettings, load_settings, save_settings
 
 
@@ -359,6 +369,49 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.output_path_for(Path("song.wav")), Path("out") / "song_daw" / "song.rpp")
 
 
+class DiagnosticsTests(unittest.TestCase):
+    def test_diagnostic_logger_writes_jsonl_events(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "run.diagnostics.jsonl"
+            diagnostics = DiagnosticLogger(log_path)
+
+            diagnostics.event("test.stage", "Collected metadata", input_path=Path("song.wav"))
+
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["stage"], "test.stage")
+        self.assertEqual(records[0]["fields"]["input_path"], "song.wav")
+
+    def test_batch_failure_records_diagnostics_log(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "reference.wav"
+            input_path.write_bytes(b"placeholder")
+            item = create_queue([input_path], ProcessingSettings())[0]
+
+            probe_data = {
+                "streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}],
+                "format": {"duration": "1.0", "format_name": "wav"},
+            }
+            with patch("audio_processor.batch.probe_audio", return_value=probe_data):
+                with patch(
+                    "audio_processor.batch.process_audio_with_progress",
+                    side_effect=AudioProcessorError("render failed"),
+                ):
+                    summary = run_batch_queue([item], ProcessingSettings())
+
+            log_path = diagnostic_log_path(item.output_path)
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(item.status, "Failed")
+        self.assertIn("Diagnostics:", item.message)
+        self.assertIn("batch.item.started", [record["stage"] for record in records])
+        self.assertIn("inputs.reference", [record["stage"] for record in records])
+        self.assertIn("batch.item.failed", [record["stage"] for record in records])
+
+
 class CliTests(unittest.TestCase):
     def test_gui_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["gui"])
@@ -370,6 +423,12 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.command, "export-daw")
         self.assertEqual(args.reference, Path("reference.wav"))
+
+    def test_models_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(["models", "--json"])
+
+        self.assertEqual(args.command, "models")
+        self.assertTrue(args.json)
 
 
 class I18nTests(unittest.TestCase):
@@ -389,6 +448,40 @@ class I18nTests(unittest.TestCase):
 
     def test_supported_lyrics_extensions_are_documented(self) -> None:
         self.assertEqual(LYRICS_EXTENSIONS, {".txt", ".doc", ".docx", ".lrc", ".srt"})
+
+
+class ModelAssistTests(unittest.TestCase):
+    def test_model_candidates_cover_required_pipeline_stages(self) -> None:
+        stages = {candidate["pipeline_stage"] for candidate in list_model_candidates()}
+
+        self.assertIn("source_separation", stages)
+        self.assertIn("voice_activity_detection", stages)
+        self.assertIn("asr_alignment", stages)
+        self.assertIn("speaker_similarity", stages)
+
+    def test_pipeline_plan_is_serializable(self) -> None:
+        plan = build_model_assisted_pipeline_plan()
+
+        self.assertEqual(plan["format"], "vocal_process_model_pipeline_plan_v1")
+        json.dumps(plan, ensure_ascii=False)
+
+    def test_text_similarity_supports_chinese_without_spaces(self) -> None:
+        self.assertGreater(text_similarity("我爱你", "我爱你"), text_similarity("我爱你", "天气很好"))
+
+    def test_orders_materials_by_transcript_similarity(self) -> None:
+        decisions = order_materials_for_reference(
+            [
+                VoiceSegment(0.0, 1.0, "hello world"),
+                VoiceSegment(1.0, 2.0, "good night"),
+            ],
+            [
+                MaterialAnalysis(Path("002.wav"), transcript="good night"),
+                MaterialAnalysis(Path("001.wav"), transcript="hello world"),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["001.wav", "002.wav"])
+        self.assertTrue(all(decision.reason == "transcript_similarity" for decision in decisions))
 
 
 if __name__ == "__main__":

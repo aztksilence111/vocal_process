@@ -62,6 +62,13 @@ python -m audio_processor process input.wav cleaned.wav --highpass-hz 80 --lowpa
 python -m audio_processor export-daw reference.wav materials reference_daw\reference.rpp --overwrite
 ```
 
+查看开源模型辅助管线计划：
+
+```powershell
+python -m audio_processor models
+python -m audio_processor models --json
+```
+
 ## 图形界面
 
 图形界面支持：
@@ -90,6 +97,17 @@ python -m audio_processor export-daw reference.wav materials reference_daw\refer
 6. 如果拉伸算法产生毫秒级短缺，只在尾部补静音到目标时长，不裁切素材内容。
 7. 默认输出 `.wav`，WAV 输出默认使用 `pcm_s24le`，便于导入 DAW 宿主软件。
 
+重要限制：当前素材拼接主流程仍不能真正识别歌词、音素、音色或歌唱顺序。它只能保证按既定顺序做拉伸拼接。要让输出和原曲人声结构相关，需要接入人声分离、VAD、ASR/对齐和音色相似度模型。后续模型辅助方案见 [Model Assisted Vocal Pipeline](docs/MODEL_ASSISTED_VOCAL_PIPELINE.md)。
+
+## 诊断日志
+
+每个批处理任务都会生成结构化诊断日志：
+
+1. 普通 WAV 输出：`<输出文件名>.diagnostics.jsonl`
+2. DAW 时间轴工程：工程文件夹内 `diagnostics.jsonl`
+
+日志会记录处理模式、输入路径、设置快照、参考音频元数据、素材清单与时长、歌词文件路径、完成状态和失败异常。人工测试失败时，应优先收集这个 JSONL 文件。
+
 ## DAW 时间轴导出
 
 启用“导出 DAW 时间轴工程”后，项目不会只输出一个扁平化 WAV，而是输出一个工程文件夹：
@@ -114,6 +132,16 @@ reference_daw\
 6. `reference.rpp` 是 REAPER 工程文件，包含参考音频轨和独立素材片段轨。
 
 这一步解决的是“导入 DAW 后仍可单独编辑各个素材片段”。VST3 桥接属于后续插件/宿主集成层，需要单独的 C++/SDK 构建链路，不和当前 Python GUI 便携版混在同一层实现。
+
+## 模型辅助方向
+
+项目已经新增模型辅助架构入口，但尚未默认安装大模型依赖。当前候选方向：
+
+1. Demucs：原曲人声分离
+2. Silero VAD 或 pyannote.audio：人声区间检测
+3. WhisperX 或 Whisper：转写和时间对齐
+4. SpeechBrain 或 pyannote.audio：说话人/音色相似度
+5. VocalProcess 内部规划器：根据模型输出排序素材并生成可编辑 DAW 时间轴
 
 ## 安装
 
