@@ -1,0 +1,10 @@
+Third-party notices
+
+This portable package includes FFmpeg command-line binaries:
+
+- ffmpeg.exe
+- ffprobe.exe
+
+The FFmpeg binaries installed on this build machine are licensed under the GNU General Public License version 3. The portable package copies the upstream FFmpeg LICENSE and README files into the licenses folder.
+
+FFmpeg project: https://ffmpeg.org/

@@ -57,9 +57,10 @@ CancelCallback = Callable[[], bool]
 
 
 def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    command_args = _resolve_command_args(args)
     try:
         return subprocess.run(
-            [str(arg) for arg in args],
+            [str(arg) for arg in command_args],
             check=True,
             text=True,
             stdout=subprocess.PIPE if capture else None,
@@ -69,7 +70,7 @@ def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.Com
         raise AudioProcessorError(f"Required tool not found: {args[0]}") from exc
     except subprocess.CalledProcessError as exc:
         output = (exc.stderr or exc.stdout or "").strip()
-        command = subprocess.list2cmdline([str(arg) for arg in args])
+        command = subprocess.list2cmdline([str(arg) for arg in command_args])
         message = f"Command failed with exit code {exc.returncode}: {command}"
         if output:
             message = f"{message}\n{output}"
@@ -77,17 +78,22 @@ def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.Com
 
 
 def resolve_tool(name: str) -> str:
+    for path in _candidate_tool_paths(name):
+        if path.is_file():
+            return str(path)
+
     path = shutil.which(name)
     if path is None:
         raise AudioProcessorError(
-            f"{name} is not available on PATH. Install FFmpeg and reopen the terminal."
+            f"{name} is not available beside the application or on PATH. "
+            "Install FFmpeg or use the portable package."
         )
     return path
 
 
 def get_tool_info(name: str) -> ToolInfo:
     path = resolve_tool(name)
-    result = run_command([name, "-version"], capture=True)
+    result = run_command([path, "-version"], capture=True)
     version_line = result.stdout.splitlines()[0] if result.stdout else "unknown version"
     return ToolInfo(name=name, path=path, version_line=version_line)
 
@@ -134,7 +140,26 @@ def probe_audio(input_path: Path) -> dict[str, Any]:
         ],
         capture=True,
     )
-    return json.loads(result.stdout)
+    output = result.stdout
+    if output is None or not output.strip():
+        details = (result.stderr or "").strip()
+        message = f"FFprobe returned no JSON metadata for: {path}"
+        if details:
+            message = f"{message}\n{details}"
+        raise AudioProcessorError(message)
+
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as exc:
+        preview = output.strip().splitlines()[0][:200]
+        raise AudioProcessorError(
+            f"FFprobe returned invalid JSON metadata for: {path}\n{preview}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise AudioProcessorError(f"FFprobe returned unexpected JSON metadata for: {path}")
+
+    return data
 
 
 def summarize_probe(data: dict[str, Any]) -> list[tuple[str, str]]:
@@ -431,6 +456,60 @@ def _default_audio_codec(output_path: Path) -> str | None:
     return None
 
 
+def _resolve_command_args(args: Sequence[str]) -> list[str]:
+    resolved_args = [str(arg) for arg in args]
+    if not resolved_args:
+        return resolved_args
+
+    command = Path(resolved_args[0])
+    tool_name = _normal_tool_name(command.name)
+    if tool_name in {"ffmpeg", "ffprobe"} and command.parent == Path("."):
+        resolved_args[0] = resolve_tool(tool_name)
+
+    return resolved_args
+
+
+def _candidate_tool_paths(name: str) -> list[Path]:
+    executable_name = _tool_executable_name(name)
+    candidates: list[Path] = []
+    for root in _runtime_tool_roots():
+        candidates.append(root / executable_name)
+        candidates.append(root / "bin" / executable_name)
+    return candidates
+
+
+def _runtime_tool_roots() -> list[Path]:
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        roots.append(Path(str(bundle_root)).resolve())
+
+    roots.append(Path(__file__).resolve().parent)
+    roots.append(Path.cwd())
+
+    unique_roots: list[Path] = []
+    for root in roots:
+        if root not in unique_roots:
+            unique_roots.append(root)
+    return unique_roots
+
+
+def _tool_executable_name(name: str) -> str:
+    if sys.platform.startswith("win") and not name.lower().endswith(".exe"):
+        return f"{name}.exe"
+    return name
+
+
+def _normal_tool_name(name: str) -> str:
+    normalized = name.lower()
+    if normalized.endswith(".exe"):
+        return normalized[:-4]
+    return normalized
+
+
 def _format_duration(value: Any) -> str:
     try:
         seconds = float(value)
@@ -445,9 +524,10 @@ def _format_duration(value: Any) -> str:
 
 
 def _open_progress_process(args: Sequence[str]) -> subprocess.Popen[str]:
+    command_args = _resolve_command_args(args)
     try:
         return subprocess.Popen(
-            [str(arg) for arg in args],
+            [str(arg) for arg in command_args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

@@ -283,3 +283,170 @@ vocal_process
 10. GUI 素材拼接主流程移除“截取起点”和“持续时间”输入项，避免暗示会对素材直接裁切。
 11. 验证通过：`.venv\Scripts\python -m compileall -q audio_processor tests`、`.venv\Scripts\python -m unittest discover`。
 12. 真实 FFmpeg 验证通过：4 秒原音频 + 两个 1 秒素材输出为 4.000000 秒 WAV，编码为 `pcm_s24le`。
+
+### User
+
+git提交修改
+
+### Assistant Notes
+
+已在 `codex/material-stretch-assembly` 创建提交：
+
+`4f08ee2 Implement material stretch assembly workflow`
+
+提交后工作区干净。
+
+### User
+
+如果我关闭当前会话框，下次如何继续项目。
+
+### Assistant Notes
+
+向用户说明下次进入项目目录、确认分支、运行测试和启动 GUI 的方法，并提示当前分支为 `codex/material-stretch-assembly`，最近提交为 `4f08ee2`。
+
+### User
+
+远程备份一下
+
+### Assistant Notes
+
+已推送远程分支：
+
+`codex/material-stretch-assembly -> origin/codex/material-stretch-assembly`
+
+GitHub 提示可创建 Pull Request：
+
+`https://github.com/aztksilence111/vocal_process/pull/new/codex/material-stretch-assembly`
+
+### User
+
+如果需要进行人工测试，如何进行
+
+### Assistant Notes
+
+向用户说明源码环境下的人工测试流程：检查环境、启动 GUI、准备原音频/素材集/歌词文件、通过 GUI 处理、用 FFprobe 检查 WAV 输出。
+
+### User
+
+我需要的是如下测试场景：用户没有准备环境，并且核心需求是用界面操作正常完成操作，如何进行。可以直接将该项目压缩包发送后使用吗
+
+### Assistant Notes
+
+向用户说明当前源码压缩包不能直接给无环境用户使用；普通用户需要便携版 ZIP 或安装包。建议下一步用 PyInstaller 打包 GUI，并把 FFmpeg/FFprobe 一起放入发布包。
+
+### User
+
+帮我先做一版便携版压缩包
+
+### Assistant Notes
+
+处理结果：
+
+1. 已从 `codex/material-stretch-assembly` 创建新分支：`codex/build-portable-package`。
+2. 已安装 PyInstaller 到项目虚拟环境。
+3. 引擎工具查找逻辑已改为优先识别程序目录或 `bin` 子目录里的 `ffmpeg.exe` 和 `ffprobe.exe`，找不到再回退到 PATH。
+4. 已新增 `packaging/vocal_process_gui.py` 作为 PyInstaller GUI 入口。
+5. 已新增 `scripts/build_portable.ps1`，用于构建 `dist\VocalProcess-portable.zip`。
+6. 已新增便携版用户说明和第三方组件说明。
+7. 已从 Chocolatey 的真实 FFmpeg 安装目录复制 `ffmpeg.exe`、`ffprobe.exe`，没有使用 shim。
+8. 已附带 FFmpeg `LICENSE` 和 `README.txt` 到便携包 `licenses` 目录。
+9. 已生成便携版压缩包：`dist\VocalProcess-portable.zip`，约 87 MB。
+10. 验证通过：19 个单元测试、编译、包内 FFmpeg/FFprobe 版本检查、GUI EXE 启动冒烟测试、ZIP 解压结构测试。
+11. 仍需后续在 Windows Sandbox 或无 Python/FFmpeg 的干净 Windows 环境中做最终用户场景测试。
+
+### User
+
+你写好对话记录.md文件了吗
+
+### Assistant Notes
+
+确认 `CONVERSATION_LOG.md` 已存在，并已记录到便携版压缩包生成与验证结果。
+
+### User
+
+请先阅读 CONVERSATION_LOG.md 和 PROJECT_ANALYSIS.md，继续 vocal_process 项目。当前分支是 codex/material_stretch-assemply，最近提交是 4f08ee2。另外，已经让两名用户通过便捷压缩包测试，均产生报错 the JSON obeject must be str, bytes or bytearray, not NonrType。分析报错产生原因，须展现过程（即时完成汇报反馈），然后解决问题。
+
+### Assistant Notes
+
+处理过程与判断：
+
+1. 已重新阅读 `CONVERSATION_LOG.md` 和 `PROJECT_ANALYSIS.md`，确认核心需求仍是：原音频作为时长参考，素材集音频按文件名顺序拼接后用 `rubberband` 拉伸/压缩到原音频时长，输出 DAW 可导入 WAV。
+2. 实际当前分支为 `codex/build-portable-package`，不是用户文字中的 `codex/material_stretch-assemply`；不过 `HEAD` 确认为 `4f08ee2`，与用户所说最近提交一致。
+3. 排查所有 JSON 解析位置后确认：配置读取的 `json.loads(config_path.read_text(...))` 输入一定是字符串；高风险点是 `audio_processor.engine.probe_audio()` 中直接 `json.loads(result.stdout)`。
+4. `probe_audio()` 的调用链为 GUI 开始批处理 -> `run_batch_queue()` -> `assemble_material_to_reference_with_progress()` -> `probe_audio()` 读取原音频和素材音频时长。因此用户在便携版 GUI 中开始处理后，如果 `ffprobe` 返回空输出或未捕获输出，就可能出现 `json.loads(None)` 的底层 TypeError。
+5. 本机源码路径和包内 `bin\ffprobe.exe` 对最小测试音频均能正常返回 JSON；这说明不是素材拼接滤镜本身损坏，而是缺少对 FFprobe 空/异常 JSON 输出的防御，导致底层异常直接暴露给用户。
+
+修复结果：
+
+1. `probe_audio()` 已改为先检查 `result.stdout`，当输出为 `None` 或空字符串时抛出明确的 `AudioProcessorError: FFprobe returned no JSON metadata...`。
+2. 当 FFprobe 输出不是合法 JSON 时，改为抛出明确的 `AudioProcessorError: FFprobe returned invalid JSON metadata...`，并附带首行预览。
+3. 当 FFprobe JSON 顶层不是对象时，也会抛出明确错误。
+4. 新增单元测试覆盖 `stdout=None` 和无效 JSON 两种路径，避免再次出现 `the JSON object must be str, bytes or bytearray, not NoneType` 这类底层异常。
+5. 已重新构建 `dist\VocalProcess-portable.zip`。
+
+验证结果：
+
+1. `.venv\Scripts\python -m unittest discover` 通过，当前 21 个测试全部 OK。
+2. `.venv\Scripts\python -m compileall -q audio_processor tests packaging` 通过。
+3. 真实 FFmpeg 素材拼接验证通过：生成参考音频和两个素材音频后，输出 WAV 为 `pcm_s24le`，时长为 `3.000000`。
+4. 便携包内 `bin\ffmpeg.exe` 和 `bin\ffprobe.exe` 均可运行，并包含 `--enable-librubberband`。
+5. `dist\VocalProcess-portable.zip` 解压结构检查通过。
+6. 本轮隐藏启动 GUI EXE 的自动冒烟测试被当前沙箱拒绝访问，未得到应用进程退出码；需要用户手动双击或在非沙箱环境做最终确认。
+
+### User
+
+你刚刚产生了红字报错，是什么原因，进行修复。
+
+### Assistant Notes
+
+原因与处理：
+
+1. 该红字不是 PyInstaller 构建失败；构建命令退出码为 0，并已生成便携 ZIP。
+2. 原因是 PyInstaller 默认把大量 INFO/WARNING 日志写到 stderr，而当前工具界面把 stderr 显示为红色。
+3. `build\pyinstaller\VocalProcess\warn-VocalProcess.txt` 中列出的主要是 Windows 上正常缺失的可选/跨平台模块，例如 `posix`、`fcntl`、`pwd`，不代表应用运行缺依赖。
+4. 已修改 `scripts/build_portable.ps1`：捕获 PyInstaller 输出，成功时只打印最终 ZIP 路径，失败时再打印详细错误。
+5. 已给构建脚本的旧包删除逻辑增加项目根目录保护，避免异常 `AppName` 参数导致删除项目外路径。
+6. 重新执行构建后输出已干净，只显示 `Portable package created:` 和 ZIP 路径。
+7. 最终验证通过：21 个单元测试、编译检查、ZIP 解压结构检查。
+
+### User
+
+我希望你最好能够进行即时反馈，不要超过三分钟不汇报任何内容
+
+### Assistant Notes
+
+已确认后续工作中会保持更短间隔的即时反馈。另对用户提到的灰色命令输出中文乱码做了说明：项目文件本身是 UTF-8，乱码主要来自 PowerShell/工具输出编码不一致；后续读取中文文件时显式设置 UTF-8 输出。
+
+### User
+
+你确定 dist 下的便携 zip 已经修改好了吗？我授权你进行每次的自动冒烟测试，如何让我给你提供权限。我希望每次都由你首先进行这个测试。
+
+### Assistant Notes
+
+处理结果：
+
+1. 已确认 `dist\VocalProcess-portable.zip` 为重新构建后的新包。
+2. 已给便携包加入 `BUILD_INFO.txt`，以后 ZIP 内会记录构建时间、Git 分支、Git 提交和源码状态，便于确认测试包来源。
+3. 当前 ZIP 内 `BUILD_INFO.txt` 显示：构建时间 `2026-07-24 12:52:46 +08:00`，分支 `codex/fix-portable-json-probe`，提交 `4f08ee2`，并包含当前未提交改动。
+4. 新增 `scripts/smoke_portable.ps1`，用于标准自动冒烟测试：解压 ZIP、检查 `VocalProcess.exe`、检查内置 `ffmpeg.exe`/`ffprobe.exe`、隐藏启动 GUI 5 秒、确认未启动即崩溃后关闭。
+5. 已运行 `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1`，结果通过。
+6. 用户已授权并保存命令前缀：`powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1`。
+7. 后续每次生成或修改便携包后，应首先由助手运行该冒烟测试，再让用户或外部测试者试用。
+8. 最终 ZIP 路径：`C:\Users\WIN11\demo\dist\VocalProcess-portable.zip`；SHA256：`246BBD9B0BF762AEC3A48822E6A028470FFB8C7CAF326637270F03B47850B31A`。
+
+### User
+
+现在你按照计划继续项目。记得及时汇报，间隔不大于三分钟
+
+### Assistant Notes
+
+继续推进结果：
+
+1. 已按固定流程先运行验证：`.venv\Scripts\python -m unittest discover` 通过，21 个测试 OK。
+2. 已运行编译检查：`.venv\Scripts\python -m compileall -q audio_processor tests packaging` 通过。
+3. 已优先运行便携包自动冒烟测试：`powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1` 通过。
+4. 已检查 Git 暂存范围，确认只包含源码、测试、README、项目记录、`packaging/` 和 `scripts/`，没有 `dist/`、`.tmp/` 或 `__pycache__/`。
+5. 已补充真实端到端处理验证：用内置 FFmpeg 生成 4 秒参考音频和两个 1.25 秒素材，运行素材拼接/拉伸流程，包内 FFprobe 确认输出为 `wav`、`pcm_s24le`、`4.000000` 秒。
+6. 已创建本地提交：`Fix portable FFprobe diagnostics and smoke test`。
+7. 已重新构建便携 ZIP，让 `BUILD_INFO.txt` 指向最终提交。
+8. 已按固定流程优先运行自动冒烟测试，结果通过。

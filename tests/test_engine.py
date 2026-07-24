@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from audio_processor.batch import create_queue
 from audio_processor.cli import build_parser
@@ -13,6 +15,8 @@ from audio_processor.engine import (
     build_process_args,
     get_audio_duration_seconds,
     list_audio_files,
+    probe_audio,
+    resolve_tool,
     summarize_probe,
 )
 from audio_processor.gui import LYRICS_EXTENSIONS
@@ -134,6 +138,19 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertTrue(graph.startswith("[0:a]rubberband=tempo=0.50000000"))
 
 
+class ToolResolutionTests(unittest.TestCase):
+    def test_resolve_tool_prefers_portable_bin(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            portable_tool = root / "bin" / "ffmpeg.exe"
+            portable_tool.parent.mkdir()
+            portable_tool.write_bytes(b"")
+
+            with patch("audio_processor.engine._runtime_tool_roots", return_value=[root]):
+                with patch("shutil.which", return_value=None):
+                    self.assertEqual(resolve_tool("ffmpeg"), str(portable_tool))
+
+
 class ProbeSummaryTests(unittest.TestCase):
     def test_summarizes_probe_data(self) -> None:
         data = {
@@ -167,6 +184,30 @@ class ProbeSummaryTests(unittest.TestCase):
             get_audio_duration_seconds({"streams": [], "format": {"duration": "2.5"}}),
             2.5,
         )
+
+    def test_probe_audio_rejects_missing_json_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.wav"
+            path.write_bytes(b"placeholder")
+
+            with patch(
+                "audio_processor.engine.run_command",
+                return_value=SimpleNamespace(stdout=None, stderr=""),
+            ):
+                with self.assertRaisesRegex(AudioProcessorError, "no JSON metadata"):
+                    probe_audio(path)
+
+    def test_probe_audio_wraps_invalid_json_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.wav"
+            path.write_bytes(b"placeholder")
+
+            with patch(
+                "audio_processor.engine.run_command",
+                return_value=SimpleNamespace(stdout="not json", stderr=""),
+            ):
+                with self.assertRaisesRegex(AudioProcessorError, "invalid JSON metadata"):
+                    probe_audio(path)
 
 
 class SettingsTests(unittest.TestCase):

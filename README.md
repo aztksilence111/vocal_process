@@ -108,6 +108,28 @@ python -m venv .venv
 .venv\Scripts\python -m pip wheel . -w dist --no-deps --no-build-isolation
 ```
 
+构建 Windows 便携版 ZIP：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1
+```
+
+便携版输出位置：
+
+```text
+dist\VocalProcess-portable.zip
+```
+
+便携版会内置 GUI 可执行文件、`ffmpeg.exe`、`ffprobe.exe` 和第三方许可证说明。普通用户解压后双击 `VocalProcess.exe` 即可使用，不需要单独安装 Python 或 FFmpeg。
+
+便携版自动冒烟测试：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1
+```
+
+该脚本会从 ZIP 解压便携包，检查 `VocalProcess.exe`、内置 `ffmpeg.exe`、内置 `ffprobe.exe`，并隐藏启动 GUI 5 秒确认程序不会启动即崩溃。
+
 ## 测试
 
 ```powershell

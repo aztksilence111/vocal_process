@@ -336,3 +336,171 @@ Passed:
 3. Generated a 4 second reference WAV and two 1 second material WAV files with FFmpeg.
 4. Ran the project assembly engine on those files.
 5. FFprobe confirmed the assembled output is `format_name=wav`, `codec_name=pcm_s24le`, and `duration=4.000000`.
+
+## 2026-07-24: Portable Windows Package
+
+### Goal
+
+Create a first portable Windows ZIP for users who do not have Python or FFmpeg installed. The expected user workflow is unzip, open the GUI executable, select source files/folders, and process audio without command-line setup.
+
+### Technical Direction
+
+1. Use PyInstaller to build a windowed GUI executable.
+2. Ship the real FFmpeg and FFprobe binaries beside the app, not Chocolatey shim executables.
+3. Update runtime tool resolution so bundled `bin\ffmpeg.exe` and `bin\ffprobe.exe` are preferred over system PATH.
+4. Include FFmpeg license and README files in the portable package.
+5. Keep the package as a folder inside a ZIP so all required files stay together.
+
+### Implementation Result
+
+Added:
+
+1. `packaging/vocal_process_gui.py` as a stable PyInstaller GUI entry point.
+2. `scripts/build_portable.ps1` to rebuild `dist\VocalProcess-portable.zip`.
+3. `packaging/README_PORTABLE.txt` for end users.
+4. `packaging/THIRD_PARTY_NOTICES.txt` for bundled FFmpeg notices.
+5. Engine runtime lookup for bundled tools in the executable directory or `bin` subdirectory.
+6. Test coverage proving bundled `bin\ffmpeg.exe` is preferred when PATH is unavailable.
+
+### Package Layout
+
+The generated ZIP contains:
+
+1. `VocalProcess\VocalProcess.exe`
+2. `VocalProcess\bin\ffmpeg.exe`
+3. `VocalProcess\bin\ffprobe.exe`
+4. `VocalProcess\licenses\FFmpeg-LICENSE.txt`
+5. `VocalProcess\licenses\FFmpeg-README.txt`
+6. `VocalProcess\README_PORTABLE.txt`
+7. `VocalProcess\THIRD_PARTY_NOTICES.txt`
+8. PyInstaller `_internal` runtime files.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m compileall -q audio_processor tests packaging`
+2. `.venv\Scripts\python -m unittest discover`
+3. `powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1`
+4. Package created at `dist\VocalProcess-portable.zip`, size about 87 MB.
+5. Bundled `bin\ffmpeg.exe -version` and `bin\ffprobe.exe -version` both run and include `--enable-librubberband`.
+6. `VocalProcess.exe` smoke-tested by starting the GUI process for five seconds; it did not exit or crash.
+7. ZIP extraction smoke test passed into `.tmp\portable-extract-test`.
+
+### Remaining Test Gap
+
+The package still needs a clean-machine test in Windows Sandbox or another Windows account with no Python/FFmpeg installed. The current machine has development tools installed, so this pass verifies package structure and executable startup, not a fully isolated end-user machine.
+
+## 2026-07-24: Portable FFprobe JSON Error Hardening
+
+### Goal
+
+Fix the portable GUI error reported by two users:
+
+`the JSON object must be str, bytes or bytearray, not NoneType`
+
+The fix should preserve the material stretch assembly workflow and make failures actionable for GUI users.
+
+### Investigation
+
+There are two JSON parsing paths in the project:
+
+1. Settings loading in `audio_processor/settings.py`.
+2. FFprobe metadata parsing in `audio_processor/engine.py`.
+
+The settings path reads text from disk before calling `json.loads()`, so it cannot normally pass `None` to `json.loads()`. The FFprobe path called `json.loads(result.stdout)` directly. If FFprobe returned success but produced no captured stdout, or if the packaged/windowed runtime yielded an empty captured output for a specific user input, the raw Python `TypeError` would escape to the GUI.
+
+The relevant runtime path is:
+
+1. GUI starts batch processing.
+2. `run_batch_queue()` chooses material assembly when a material folder is selected.
+3. `assemble_material_to_reference_with_progress()` probes the reference and material files for duration.
+4. `probe_audio()` invokes FFprobe and parses JSON.
+
+Local reproduction with generated WAV files and the bundled `bin\ffprobe.exe` returned valid JSON, so the immediate defect is not the stretch/concat graph. The defect is missing boundary validation around FFprobe JSON output.
+
+### Implementation Result
+
+Changed:
+
+1. `probe_audio()` now rejects `None` or empty FFprobe stdout with `AudioProcessorError`.
+2. Invalid JSON output is wrapped as `AudioProcessorError` with a short preview of the returned text.
+3. Unexpected non-object JSON output is rejected.
+4. Tests now cover both `stdout=None` and invalid JSON.
+
+This does not make unreadable/corrupt user audio magically processable, but it prevents the unhelpful low-level `json.loads(None)` error from reaching users. The GUI will now show a clearer FFprobe metadata error identifying the file path.
+
+### Build Output Cleanup
+
+PyInstaller writes ordinary INFO/WARNING diagnostics to stderr, which the Codex terminal renders as red text. The build itself was successful. The build script now captures PyInstaller output and only prints it when PyInstaller exits with a non-zero code. Successful builds show only the generated ZIP path.
+
+The build script also validates deletion targets before removing old portable output, so generated paths must stay under the project root even when the optional app name parameter is changed.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m unittest discover` with 21 tests.
+2. `.venv\Scripts\python -m compileall -q audio_processor tests packaging`.
+3. Generated reference/material WAV files and assembled output through the real FFmpeg workflow.
+4. Bundled `bin\ffprobe.exe` confirmed output `format_name=wav`, `codec_name=pcm_s24le`, and `duration=3.000000` for the assembled result.
+5. `powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1` rebuilt `dist\VocalProcess-portable.zip` with clean success output.
+6. ZIP extraction structure check passed.
+7. Bundled FFmpeg and FFprobe version checks passed and include `--enable-librubberband`.
+8. Final post-script-change verification repeated unit tests, compile checks, portable rebuild, and ZIP extraction.
+9. `scripts/smoke_portable.ps1` was added as the standard portable smoke test and passed after user approval.
+
+### Remaining Test Gap
+
+The hidden GUI EXE smoke test now passes through `scripts/smoke_portable.ps1`. A clean-machine test is still useful: run the rebuilt ZIP in Windows Sandbox or another Windows account with no Python/FFmpeg installed, using the same original audio and material set that triggered the user report.
+
+## 2026-07-24: Standard Portable Smoke Test
+
+### Goal
+
+Make the portable package verification repeatable and auditable. Every future portable build should be smoke-tested by the assistant before the ZIP is handed to users.
+
+### Implementation Result
+
+Added `scripts/smoke_portable.ps1`.
+
+The script:
+
+1. Verifies `dist\VocalProcess-portable.zip` exists.
+2. Extracts it into `.tmp\portable-smoke-test`.
+3. Checks for `VocalProcess.exe`.
+4. Checks bundled `bin\ffmpeg.exe`.
+5. Checks bundled `bin\ffprobe.exe`.
+6. Starts `VocalProcess.exe` hidden for a short runtime.
+7. Fails if the GUI executable exits immediately.
+8. Closes or kills the process after the smoke-test window.
+
+The script validates its extraction directory before deleting old smoke-test output, so the cleanup target must stay under the project root.
+
+### Permission Flow
+
+Launching a GUI executable requires escalated permission in the Codex sandbox. The user approved and saved this command prefix:
+
+`powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1`
+
+Future portable-package work should run this script first after every rebuild.
+
+### Build Auditing
+
+The portable build now includes `BUILD_INFO.txt` in the ZIP. It records:
+
+1. Build time.
+2. Git branch.
+3. Git commit.
+4. Whether the build included uncommitted working-tree changes.
+
+The current confirmed ZIP includes a build marker from branch `codex/fix-portable-json-probe`, commit `4f08ee2`, with uncommitted working-tree changes included. Final confirmed build time: `2026-07-24 12:52:46 +08:00`. Final confirmed SHA256: `246BBD9B0BF762AEC3A48822E6A028470FFB8C7CAF326637270F03B47850B31A`.
+
+### Verification
+
+Passed:
+
+1. `powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1`.
+2. ZIP extraction and `BUILD_INFO.txt` readback.
+3. `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1`.
+4. `.venv\Scripts\python -m unittest discover`.
