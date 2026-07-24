@@ -539,3 +539,10 @@ Passed:
 - Final zip build marker: branch `codex/local-pretrained-portable-sync`, commit `30a66f3`, source state `working tree clean`
 - Final zip SHA256: `9A52C2FFA215E32E87E064F27FB124B12CC5683EE98D2A97568ADD417829A88D`
 - Final smoke test: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1 -ReuseExtract -ExtractRoot dist\VocalProcess-portable`
+## 2026-07-24: Final Portable Batch Verification
+
+- Current source commit: `fa1935d`
+- Final zip build marker: branch `codex/local-pretrained-portable-sync`, commit `fa1935d`, source state `working tree clean`
+- Final zip SHA256: `35DBB2AFBD2A79A0D1CF72C8441E4CA19BDF93B87B9A4399470FEC7C2507A68D`
+- Actual portable model smoke test: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1 -PortableRoot dist\VocalProcess-portable\VocalProcess -WorkRoot .tmp\portable-model-smoke-final`
+- Actual portable result: `reference.wav`, `reference.diagnostics.jsonl`, and Demucs vocals/no_vocals cache were generated in `.tmp\portable-model-smoke-final\out`

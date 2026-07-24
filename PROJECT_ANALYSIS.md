@@ -583,3 +583,20 @@ Final artifact:
 - Zip: `dist\VocalProcess-portable.zip`
 - SHA256: `9A52C2FFA215E32E87E064F27FB124B12CC5683EE98D2A97568ADD417829A88D`
 - Smoke test: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1 -ReuseExtract -ExtractRoot dist\VocalProcess-portable`
+## 2026-07-24: Final Portable Batch Verification
+
+The portable EXE now supports a headless `batch` command through the same wrapper that opens the GUI when no arguments are given. This allowed a real portable model-assisted run, not just a startup smoke test.
+
+Verified portable result:
+
+1. `VocalProcess.exe check` works from the portable package.
+2. `VocalProcess.exe batch ...` produced `reference.wav` and `reference.diagnostics.jsonl`.
+3. Diagnostics recorded `model.ordering.completed`, `batch.item.completed`, and Demucs vocal separation cache paths.
+4. The portable smoke helper `scripts/smoke_portable_model.ps1` now creates TTS fixtures, runs the portable batch command, and checks the generated output.
+
+Final artifact:
+
+- Commit: `fa1935d`
+- Zip: `dist\VocalProcess-portable.zip`
+- SHA256: `35DBB2AFBD2A79A0D1CF72C8441E4CA19BDF93B87B9A4399470FEC7C2507A68D`
+- Smoke command: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1 -PortableRoot dist\VocalProcess-portable\VocalProcess -WorkRoot .tmp\portable-model-smoke-final`
