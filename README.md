@@ -12,6 +12,7 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 6. SpeechBrain 说话人特征接口已接入；默认只在模型缓存命中时启用，避免用户首次运行时长时间等待 Hugging Face 下载。
 7. 生成结构化 `.diagnostics.jsonl`，用于定位无报错失败、模型转写失败、FFprobe 元数据失败等问题。
 8. 输出普通 WAV，或导出 REAPER `.rpp`、`timeline.json`、`timeline.csv` 和独立素材片段 WAV，方便在 DAW 中继续编辑每个素材 item。
+9. 提供 `batch` 命令，便于在便携包里直接跑一条真实模型辅助输出。
 
 ## 环境要求
 
@@ -65,6 +66,12 @@ python -m audio_processor export-daw reference.wav materials reference_daw\refer
 ```powershell
 python -m audio_processor models
 python -m audio_processor models --json
+```
+
+便携版真实模型烟测：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1
 ```
 
 ## GUI 流程

@@ -431,6 +431,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.command, "models")
         self.assertTrue(args.json)
 
+    def test_batch_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "batch",
+                "reference.wav",
+                "out.wav",
+                "--material-directory",
+                "materials",
+                "--lyrics-file",
+                "lyrics.txt",
+                "--overwrite",
+            ]
+        )
+
+        self.assertEqual(args.command, "batch")
+        self.assertEqual(args.reference, Path("reference.wav"))
+        self.assertEqual(args.output, Path("out.wav"))
+        self.assertEqual(args.material_directory, Path("materials"))
+        self.assertEqual(args.lyrics_file, Path("lyrics.txt"))
+        self.assertTrue(args.overwrite)
+
 
 class I18nTests(unittest.TestCase):
     def test_translation_key_sets_match(self) -> None:

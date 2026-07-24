@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .batch import QueueItem, run_batch_queue
 from .daw import export_daw_timeline_with_progress
 from .engine import (
     AudioProcessorError,
@@ -17,6 +18,7 @@ from .engine import (
 )
 from .model_assist import backend_availability, build_model_assisted_pipeline_plan, list_model_candidates
 from .model_runtime import get_model_runtime_report
+from .settings import ProcessingSettings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +71,42 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument("--sample-rate", type=int, help="output sample rate")
     process_parser.add_argument("--channels", type=int, help="output channel count")
     process_parser.add_argument("--codec", help="FFmpeg audio codec name")
+
+    batch_parser = subparsers.add_parser(
+        "batch",
+        help="run the GUI batch workflow headlessly for portable smoke tests",
+    )
+    batch_parser.add_argument("reference", type=Path, help="reference/original audio file")
+    batch_parser.add_argument("output", type=Path, help="target WAV or REAPER .rpp path")
+    batch_parser.add_argument(
+        "--material-directory",
+        type=Path,
+        required=True,
+        help="folder containing material audio",
+    )
+    batch_parser.add_argument("--lyrics-file", type=Path, help="optional lyrics text, LRC, SRT, or DOCX file")
+    batch_parser.add_argument(
+        "--daw-timeline-export",
+        action="store_true",
+        help="write a DAW timeline project instead of a flat WAV",
+    )
+    batch_parser.add_argument(
+        "-y",
+        "--overwrite",
+        action="store_true",
+        help="overwrite generated output files",
+    )
+    batch_parser.add_argument("--gain-db", type=float, help="gain adjustment in dB")
+    batch_parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="apply EBU R128 loudness normalization",
+    )
+    batch_parser.add_argument("--highpass-hz", type=float, help="high-pass cutoff")
+    batch_parser.add_argument("--lowpass-hz", type=float, help="low-pass cutoff")
+    batch_parser.add_argument("--sample-rate", type=int, help="output sample rate")
+    batch_parser.add_argument("--channels", type=int, help="output channel count")
+    batch_parser.add_argument("--codec", help="FFmpeg audio codec name")
 
     daw_parser = subparsers.add_parser(
         "export-daw",
@@ -153,6 +191,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             print(f"Wrote {args.output}")
+            return 0
+
+        if args.command == "batch":
+            settings = ProcessingSettings(
+                material_directory=str(args.material_directory),
+                lyrics_file=str(args.lyrics_file or ""),
+                daw_timeline_export=args.daw_timeline_export,
+                output_directory=str(args.output.parent),
+                output_extension=args.output.suffix,
+                overwrite=args.overwrite,
+                gain_db=args.gain_db,
+                normalize=args.normalize,
+                highpass_hz=args.highpass_hz,
+                lowpass_hz=args.lowpass_hz,
+                sample_rate=args.sample_rate,
+                channels=args.channels,
+                codec=args.codec,
+            )
+            item = QueueItem(input_path=args.reference, output_path=args.output)
+
+            def on_queue_progress(progress: float, message: str) -> None:
+                print(f"{progress:.3f} {message}")
+
+            summary = run_batch_queue([item], settings, on_queue_progress=on_queue_progress)
+            if summary.failed or summary.cancelled:
+                print(f"error: {item.message}", file=sys.stderr)
+                return 1
+            print(f"Wrote {item.output_path}")
+            print(item.message)
             return 0
 
         if args.command == "export-daw":

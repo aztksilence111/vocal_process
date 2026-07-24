@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import os
 import shutil
 import subprocess
@@ -563,7 +565,8 @@ def _maybe_separate_vocals(path: Path, *, work_dir: Path | None = None, notes: l
         str(path),
     ]
     try:
-        demucs.separate.main(cmd)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            demucs.separate.main(cmd)
     except SystemExit as exc:
         if getattr(exc, "code", 0) not in (0, None):
             notes.append(f"demucs exited with code {exc.code}")
