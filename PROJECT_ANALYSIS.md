@@ -573,3 +573,13 @@ Build artifact:
 - SHA256: `7F1E9ED10374A01139AD2717A3596B12408467F7EA9BDC365A3ECAB00B451820`
 - Size: `753,289,753` bytes
 - Build marker branch: `codex/local-pretrained-portable-sync`
+## 2026-07-24: Final Artifact Refresh After Commit
+
+The final portable zip was rebuilt after the local commit so the build marker now matches the committed source.
+
+Final artifact:
+
+- Commit: `30a66f3`
+- Zip: `dist\VocalProcess-portable.zip`
+- SHA256: `9A52C2FFA215E32E87E064F27FB124B12CC5683EE98D2A97568ADD417829A88D`
+- Smoke test: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1 -ReuseExtract -ExtractRoot dist\VocalProcess-portable`

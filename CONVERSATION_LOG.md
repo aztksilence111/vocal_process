@@ -533,3 +533,9 @@ Passed:
 - Size: `753,289,753` bytes
 - SHA256: `7F1E9ED10374A01139AD2717A3596B12408467F7EA9BDC365A3ECAB00B451820`
 - Build marker inside zip: branch `codex/local-pretrained-portable-sync`, commit `54c6e71`, source state `working tree included uncommitted changes`
+## 2026-07-24: Final Artifact Refresh After Commit
+
+- Current source commit: `30a66f3`
+- Final zip build marker: branch `codex/local-pretrained-portable-sync`, commit `30a66f3`, source state `working tree clean`
+- Final zip SHA256: `9A52C2FFA215E32E87E064F27FB124B12CC5683EE98D2A97568ADD417829A88D`
+- Final smoke test: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable.ps1 -ReuseExtract -ExtractRoot dist\VocalProcess-portable`
