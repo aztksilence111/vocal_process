@@ -555,3 +555,84 @@ Passed:
 - Release URL: `https://github.com/aztksilence111/vocal_process/releases/tag/v2026.07.24-portable`
 - Release asset: `VocalProcess-portable.zip`
 - Release asset SHA256: `35DBB2AFBD2A79A0D1CF72C8441E4CA19BDF93B87B9A4399470FEC7C2507A68D`
+
+## 2026-07-25: FFprobe Red Error Fix and Runtime Stability Pass
+
+### User
+
+Reported red diagnostics errors from manual testing:
+
+- `FFprobe returned no JSON metadata for ...wav`
+- Required a long-term fix, better diagnostics, optional lyrics behavior, material-set cache, CPU/GPU option, runtime timer, window resizing, and continued VST3 task tracking.
+
+### Root Cause
+
+The failure happened in `_log_input_diagnostics()` before model ordering. Diagnostics probed every material file with FFprobe JSON mode. If FFprobe returned empty stdout for a WAV, diagnostics raised an error and stopped the batch before the actual render pipeline could continue.
+
+### Completed
+
+1. Added WAV/FFmpeg-stderr metadata fallback in `probe_audio()`.
+2. Changed input diagnostics so metadata failures are warning records, not batch-stopping errors.
+3. Added elapsed runtime fields to GUI queue rows and diagnostics events.
+4. Added real `compute_device` support through model ordering, Demucs, WhisperX, Whisper, Silero VAD, torch-hub Silero, and SpeechBrain.
+5. Added material folder cache file `.vocalprocess_material_cache.json`.
+6. Added filename pronunciation text to material matching so filename labels can correct weak ASR output.
+7. Made lyrics clearly optional in GUI hints and run logs.
+8. Added GUI window resizing and saved window-size selection.
+9. Added CLI `batch --compute-device`.
+10. Restored normal UTF-8 Chinese translation text in `i18n.py`.
+11. Kept VST3/DAW bridge work on the project task list after this stability release.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m unittest discover` with 41 tests.
+2. Source batch smoke without lyrics produced `.tmp\local-model-smoke-current\out\reference.wav`.
+3. Second source batch smoke reused `.tmp\local-model-smoke-current\materials\.vocalprocess_material_cache.json`.
+4. Output WAV probed correctly with FFprobe: `pcm_s24le`, `22050 Hz`, mono, about `5.19s`.
+
+## 2026-07-25: Per-Clip Stretch Planning and VST3 Bridge Helper
+
+### User
+
+Requested continued fixing, stronger recognition/order planning, better preservation of material syllable intelligibility after stretching, explicit use of manual-trial diagnostics, and continued VST3 bridge development.
+
+### Assistant Notes
+
+Completed in branch `codex/continue-runtime-stability-release`:
+
+1. Strengthened material ordering scores by splitting transcript similarity, filename hint similarity, duration similarity, speaker score, and VAD score.
+2. Removed the old placeholder speaker similarity that gave a positive score when no real embedding was available.
+3. Tuned short-text scoring so one-character/one-syllable material clips can use filename hints and duration closeness when ASR is weak.
+4. Added model-ordering report fields for `filename_score`, `duration_score`, and per-material `target_duration_seconds`.
+5. Changed flat WAV material assembly from "concat all material then stretch once" to "stretch each material clip independently, then concat".
+6. Kept Rubber Band settings focused on intelligibility: `pitch=1`, `formant=preserved`, `transients=crisp`, and `phase=laminar`; no loop, hard trim, or `atrim` path was introduced.
+7. Added `render.stretch_plan` diagnostics, recording source duration, target duration, Rubber Band tempo, and moderate/extreme stretch warnings for every material clip.
+8. Updated DAW timeline export so REAPER `.rpp`, `timeline.json`, and `timeline.csv` use the same per-clip stretch plan and include per-clip tempo/quality warnings.
+9. Added `audio_processor.vst3_bridge`, a JSON request/response helper protocol for future native VST3 or DAW host integration.
+10. Added CLI support: `audio-processor vst3-bridge --template` and `audio-processor vst3-bridge request.json --response response.json`.
+11. Updated docs and portable README notes for per-clip stretch diagnostics and the VST3 bridge helper.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m unittest discover` with 48 tests.
+2. `.venv\Scripts\python -m compileall -q audio_processor tests packaging`.
+3. Source model-assisted batch smoke using `.tmp\local-model-smoke-current` completed successfully.
+4. Diagnostics now include `model.ordering.completed` with split scores and `render.stretch_plan`.
+5. FFprobe confirmed the generated WAV is `pcm_s24le`, `22050 Hz`, mono, about `5.19s`.
+6. `.venv\Scripts\python -m audio_processor.cli vst3-bridge --template` printed a valid bridge request template.
+7. Rebuilt `dist\VocalProcess-portable.zip`; SHA256 before final commit rebuild was `E1A9154E95E5792B536E506B7507E65FAD09C47409F62ECEB8D4D58E7EABA22E`.
+8. Portable GUI smoke passed with `scripts\smoke_portable.ps1 -ReuseExtract`.
+9. Initial portable model smoke exposed a script/runtime verification issue: because `VocalProcess.exe` is a windowed app, `& VocalProcess.exe batch ...` did not reliably wait for process exit or return an exit code.
+10. `scripts\smoke_portable_model.ps1` was fixed to validate Tcl/Tk data folders, start the windowed EXE with `Start-Process -PassThru -WindowStyle Hidden`, wait for exit, enforce a timeout, and check the process exit code.
+11. Portable model smoke then passed with `.tmp\portable-model-smoke-current\out\reference.wav`.
+
+### Remaining
+
+1. Rebuild `dist\VocalProcess-portable.zip` from the current source.
+2. Run the approved portable smoke test first.
+3. Commit, push, and refresh release artifact after portable verification passes.
+4. Continue native VST3 prototype work after the JSON bridge helper is validated by manual DAW-side workflow tests.

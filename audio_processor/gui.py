@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -12,7 +13,15 @@ from .batch import QueueItem, create_queue, run_batch_queue
 from .engine import AudioProcessorError, get_environment_report, list_audio_files
 from .i18n import normalize_language, translate, translate_message, translate_status
 from .model_runtime import get_model_runtime_report
-from .settings import ProcessingSettings, load_settings, save_settings
+from .settings import (
+    COMPUTE_DEVICE_OPTIONS,
+    WINDOW_GEOMETRY_OPTIONS,
+    ProcessingSettings,
+    load_settings,
+    normalize_compute_device,
+    normalize_window_geometry,
+    save_settings,
+)
 
 
 AUDIO_PATTERN = "*.aac *.aiff *.alac *.flac *.m4a *.mp3 *.ogg *.opus *.wav *.wma"
@@ -29,11 +38,15 @@ class AudioProcessorApp(tk.Tk):
         self.queue_items: list[QueueItem] = []
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.run_started_at: float | None = None
+        self.elapsed_timer_id: str | None = None
         self.cancel_requested = threading.Event()
         self.translated_widgets: list[tuple[tk.Widget, str]] = []
         self.status_state: tuple[str, dict[str, Any]] = ("key", {"key": "ready", "values": {}})
 
-        self.minsize(980, 680)
+        self.resizable(True, True)
+        self.minsize(800, 560)
+        self.geometry(self.settings.window_geometry)
         self._build_variables()
         self._build_ui()
         self._apply_settings_to_vars(self.settings)
@@ -45,6 +58,8 @@ class AudioProcessorApp(tk.Tk):
         self.material_directory_var = tk.StringVar()
         self.lyrics_file_var = tk.StringVar()
         self.daw_timeline_export_var = tk.BooleanVar()
+        self.compute_device_var = tk.StringVar(value="auto")
+        self.window_geometry_var = tk.StringVar(value="980x680")
         self.output_extension_var = tk.StringVar()
         self.overwrite_var = tk.BooleanVar()
         self.gain_db_var = tk.StringVar()
@@ -55,6 +70,7 @@ class AudioProcessorApp(tk.Tk):
         self.channels_var = tk.StringVar()
         self.codec_var = tk.StringVar()
         self.status_var = tk.StringVar(value=self._t("ready"))
+        self.elapsed_var = tk.StringVar(value=self._t("elapsed_value", elapsed="00:00"))
         self.item_progress_var = tk.DoubleVar(value=0)
         self.queue_progress_var = tk.DoubleVar(value=0)
 
@@ -132,12 +148,13 @@ class AudioProcessorApp(tk.Tk):
         self.clear_button = self._button(controls, "clear", self.clear_queue)
         self.clear_button.pack(side="left", padx=(8, 0))
 
-        columns = ("input", "output", "status", "progress")
+        columns = ("input", "output", "status", "progress", "elapsed")
         self.queue_table = ttk.Treeview(parent, columns=columns, show="headings", selectmode="extended")
         self.queue_table.column("input", width=260, anchor="w")
         self.queue_table.column("output", width=260, anchor="w")
         self.queue_table.column("status", width=110, anchor="w")
         self.queue_table.column("progress", width=90, anchor="e")
+        self.queue_table.column("elapsed", width=90, anchor="e")
         self.queue_table.grid(row=2, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
 
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.queue_table.yview)
@@ -201,6 +218,28 @@ class AudioProcessorApp(tk.Tk):
         self.daw_timeline_export_check.configure(command=self._update_outputs_from_settings)
         self.daw_timeline_export_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
 
+        row += 1
+        self._label(parent, "compute_device").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Combobox(
+            parent,
+            textvariable=self.compute_device_var,
+            values=list(COMPUTE_DEVICE_OPTIONS),
+            state="readonly",
+            width=12,
+        ).grid(row=row, column=1, sticky="w", pady=4)
+
+        row += 1
+        self._label(parent, "window_geometry").grid(row=row, column=0, sticky="w", pady=4)
+        window_box = ttk.Combobox(
+            parent,
+            textvariable=self.window_geometry_var,
+            values=list(WINDOW_GEOMETRY_OPTIONS),
+            width=12,
+        )
+        window_box.grid(row=row, column=1, sticky="w", pady=4)
+        window_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_window_geometry_from_var())
+
+        row += 1
         self._label(parent, "gain_db").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(parent, textvariable=self.gain_db_var).grid(row=row, column=1, sticky="ew", pady=4)
         self.normalize_check = self._checkbutton(parent, "normalize", self.normalize_var)
@@ -246,6 +285,9 @@ class AudioProcessorApp(tk.Tk):
         status.columnconfigure(1, weight=1)
 
         ttk.Label(status, textvariable=self.status_var).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(status, textvariable=self.elapsed_var).grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=(6, 0)
+        )
         ttk.Progressbar(status, variable=self.item_progress_var, maximum=100).grid(
             row=0, column=1, sticky="ew"
         )
@@ -280,6 +322,7 @@ class AudioProcessorApp(tk.Tk):
         self._refresh_queue_table()
         self.item_progress_var.set(0)
         self.queue_progress_var.set(0)
+        self.elapsed_var.set(self._t("elapsed_value", elapsed="00:00"))
         self._set_status_key("ready")
 
     def choose_output_directory(self) -> None:
@@ -312,7 +355,9 @@ class AudioProcessorApp(tk.Tk):
 
     def check_tools(self) -> None:
         try:
-            report = "\n".join([*get_environment_report(), "", *get_model_runtime_report()])
+            report = "\n".join(
+                [*get_environment_report(), "", *get_model_runtime_report(self.compute_device_var.get())]
+            )
         except AudioProcessorError as exc:
             messagebox.showerror(self._t("tool_check_failed_title"), str(exc))
             return
@@ -327,6 +372,7 @@ class AudioProcessorApp(tk.Tk):
         except ValueError as exc:
             messagebox.showerror(self._t("invalid_settings_title"), str(exc))
             return
+        self._apply_window_geometry_from_var()
         self._update_outputs_from_settings()
         self._log(self._t("settings_saved", path=path))
 
@@ -334,6 +380,7 @@ class AudioProcessorApp(tk.Tk):
         self.settings = load_settings()
         self.language = normalize_language(self.settings.language)
         self._apply_settings_to_vars(self.settings)
+        self.geometry(self.settings.window_geometry)
         self._update_outputs_from_settings()
         self._apply_language()
         self._log(self._t("settings_reloaded"))
@@ -357,11 +404,14 @@ class AudioProcessorApp(tk.Tk):
         self._set_status_key("processing")
         self.item_progress_var.set(0)
         self.queue_progress_var.set(0)
+        self.run_started_at = time.monotonic()
+        self.elapsed_var.set(self._t("elapsed_value", elapsed="00:00"))
         self._log(self._t("batch_started"))
         self._log_active_source_paths(self.settings)
 
         self.worker = threading.Thread(target=self._run_batch_worker, daemon=True)
         self.worker.start()
+        self._schedule_elapsed_timer()
 
     def cancel_batch(self) -> None:
         self.cancel_requested.set()
@@ -406,6 +456,7 @@ class AudioProcessorApp(tk.Tk):
             elif event == "done":
                 summary = payload
                 self._set_running_state(False)
+                self._stop_elapsed_timer()
                 self._set_status_key(
                     "summary",
                     completed=summary.completed,
@@ -417,6 +468,7 @@ class AudioProcessorApp(tk.Tk):
 
             elif event == "error":
                 self._set_running_state(False)
+                self._stop_elapsed_timer()
                 self._set_status_key("failed")
                 messagebox.showerror(self._t("batch_failed_title"), str(payload))
                 self._log(self._t("batch_failed_log", error=payload))
@@ -429,6 +481,8 @@ class AudioProcessorApp(tk.Tk):
             material_directory=self.material_directory_var.get().strip(),
             lyrics_file=self.lyrics_file_var.get().strip(),
             daw_timeline_export=self.daw_timeline_export_var.get(),
+            compute_device=normalize_compute_device(self.compute_device_var.get()),
+            window_geometry=normalize_window_geometry(self.window_geometry_var.get()),
             output_directory=self.output_directory_var.get().strip(),
             output_extension=self.output_extension_var.get().strip(),
             overwrite=self.overwrite_var.get(),
@@ -448,6 +502,8 @@ class AudioProcessorApp(tk.Tk):
         self.material_directory_var.set(settings.material_directory)
         self.lyrics_file_var.set(settings.lyrics_file)
         self.daw_timeline_export_var.set(settings.daw_timeline_export)
+        self.compute_device_var.set(settings.compute_device)
+        self.window_geometry_var.set(settings.window_geometry)
         self.output_directory_var.set(settings.output_directory)
         self.output_extension_var.set(settings.output_extension)
         self.overwrite_var.set(settings.overwrite)
@@ -489,6 +545,7 @@ class AudioProcessorApp(tk.Tk):
         self.queue_table.heading("output", text=self._t("output"))
         self.queue_table.heading("status", text=self._t("status"))
         self.queue_table.heading("progress", text=self._t("progress"))
+        self.queue_table.heading("elapsed", text=self._t("elapsed"))
         self._render_status_state()
         self._refresh_queue_table()
 
@@ -520,12 +577,13 @@ class AudioProcessorApp(tk.Tk):
         else:
             self._refresh_queue_table()
 
-    def _row_values(self, item: QueueItem) -> tuple[str, str, str, str]:
+    def _row_values(self, item: QueueItem) -> tuple[str, str, str, str, str]:
         return (
             str(item.input_path),
             str(item.output_path),
             self._status_text(item.status),
             f"{item.progress * 100:.0f}%",
+            _format_elapsed(item.elapsed_seconds),
         )
 
     def _set_running_state(self, running: bool) -> None:
@@ -564,6 +622,33 @@ class AudioProcessorApp(tk.Tk):
             return
 
         self.status_var.set(self._t(str(payload["key"]), **payload["values"]))
+
+    def _schedule_elapsed_timer(self) -> None:
+        if self.run_started_at is None:
+            return
+        self.elapsed_var.set(
+            self._t("elapsed_value", elapsed=_format_elapsed(time.monotonic() - self.run_started_at))
+        )
+        if self.worker is not None and self.worker.is_alive():
+            self.elapsed_timer_id = self.after(1000, self._schedule_elapsed_timer)
+
+    def _stop_elapsed_timer(self) -> None:
+        if self.elapsed_timer_id is not None:
+            try:
+                self.after_cancel(self.elapsed_timer_id)
+            except tk.TclError:
+                pass
+            self.elapsed_timer_id = None
+        if self.run_started_at is not None:
+            self.elapsed_var.set(
+                self._t("elapsed_value", elapsed=_format_elapsed(time.monotonic() - self.run_started_at))
+            )
+            self.run_started_at = None
+
+    def _apply_window_geometry_from_var(self) -> None:
+        geometry = normalize_window_geometry(self.window_geometry_var.get())
+        self.window_geometry_var.set(geometry)
+        self.geometry(geometry)
 
     def _queue_message(self, message: str) -> str:
         match = re.match(r"^(\d+)/(\d+): (.+)$", message)
@@ -623,6 +708,9 @@ class AudioProcessorApp(tk.Tk):
         *,
         require_material: bool,
     ) -> None:
+        if settings.compute_device not in COMPUTE_DEVICE_OPTIONS:
+            raise ValueError(self._t("invalid_compute_device"))
+
         if require_material and not settings.material_directory:
             raise ValueError(self._t("missing_material_directory"))
 
@@ -644,11 +732,15 @@ class AudioProcessorApp(tk.Tk):
         if settings.material_directory:
             self._log(self._t("assembly_mode_active"))
             self._log(self._t("model_assisted_ordering_active"))
+            self._log(self._t("material_cache_enabled"))
+            self._log(self._t("compute_device_active", device=settings.compute_device))
             if settings.daw_timeline_export:
                 self._log(self._t("daw_timeline_mode_active"))
             self._log(self._t("material_active", path=settings.material_directory))
         if settings.lyrics_file:
             self._log(self._t("lyrics_active", path=settings.lyrics_file))
+        elif settings.material_directory:
+            self._log(self._t("lyrics_optional_active"))
 
     def _t(self, key: str, **values: object) -> str:
         return translate(self.language, key, **values)
@@ -685,6 +777,15 @@ def main() -> int:
     app = AudioProcessorApp()
     app.mainloop()
     return 0
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = int(max(seconds, 0.0))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, whole_seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}"
+    return f"{minutes:02d}:{whole_seconds:02d}"
 
 
 if __name__ == "__main__":

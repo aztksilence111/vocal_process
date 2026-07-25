@@ -30,12 +30,12 @@ Output shape:
 
 Behavior:
 
-1. Material clips are sorted by filename.
-2. A global tempo ratio is computed as material total duration divided by reference duration.
-3. Each source material clip is time-stretched individually with the same ratio.
-4. Pitch and formants are preserved through FFmpeg `rubberband` options.
-5. Each stretched clip is rendered as its own DAW-friendly WAV file.
-6. `timeline.json` and `timeline.csv` preserve start time, target duration, source path, and rendered path.
+1. Material clips are ordered by the model-assisted planner when the batch workflow is used.
+2. Filename order remains only a fallback when recognition and filename text provide no usable signal.
+3. Each source material clip receives its own target duration instead of relying only on one global ratio.
+4. Each clip is time-stretched individually with FFmpeg `rubberband` before timeline placement.
+5. Pitch and formants are preserved through `pitch=1` and `formant=preserved`.
+6. `timeline.json` and `timeline.csv` preserve start time, target duration, per-clip tempo, quality warning, source path, and rendered path.
 7. The generated REAPER `.rpp` places each rendered clip as a separate item on the timeline.
 
 This phase solves the immediate editing requirement: after import, each material clip remains individually movable, trimmable, replaceable, and editable in the DAW.
@@ -74,6 +74,14 @@ Possible bridge model:
 3. Helper process uses the current Python/FFmpeg engine.
 4. Generated WAV clips and timeline metadata are returned to the user or written beside the DAW project.
 
+Current bridge progress:
+
+1. `audio_processor.vst3_bridge` defines a JSON request/response protocol for a future native VST3 plug-in or host script.
+2. `audio-processor vst3-bridge --template` prints a request template.
+3. `audio-processor vst3-bridge request.json --response response.json` runs the same offline batch renderer through a file-based bridge helper.
+4. The bridge defaults `.rpp` requests to DAW timeline export and returns output and diagnostics paths.
+5. This is intentionally offline and non-real-time; the future native VST3 side should call it as a helper process rather than running Python or FFmpeg inside the audio callback.
+
 Risks:
 
 1. VST3 requires MSVC/CMake and SDK setup on Windows.
@@ -86,4 +94,4 @@ Risks:
 1. Test the generated `.rpp` in REAPER.
 2. Ask target DAW users which hosts must be supported first.
 3. Add project exporters for confirmed hosts only.
-4. Define the VST3 bridge protocol after the timeline manifest stabilizes.
+4. Build a minimal native VST3 prototype that calls the JSON bridge helper.

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import unittest
+import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from audio_processor import model_runtime
-from audio_processor.batch import create_queue, run_batch_queue
+from audio_processor.batch import BatchSummary, create_queue, run_batch_queue
 from audio_processor.cli import build_parser
 from audio_processor.diagnostics import DiagnosticLogger, diagnostic_log_path
 from audio_processor.daw import (
@@ -22,10 +23,12 @@ from audio_processor.engine import (
     AudioProcessorError,
     ProcessOptions,
     _build_material_filter_graph,
+    build_material_assembly_args,
     build_material_clip_args,
     build_process_args,
     get_audio_duration_seconds,
     list_audio_files,
+    plan_material_stretch_clips,
     probe_audio,
     resolve_tool,
     summarize_probe,
@@ -41,6 +44,23 @@ from audio_processor.model_assist import (
     text_similarity,
 )
 from audio_processor.settings import ProcessingSettings, load_settings, save_settings
+from audio_processor.vst3_bridge import (
+    BRIDGE_REQUEST_FORMAT,
+    BRIDGE_RESPONSE_FORMAT,
+    bridge_request_template,
+    run_bridge_request,
+)
+
+
+def _write_test_wave(path: Path, *, duration_seconds: float = 1.0, sample_rate: int = 8000) -> None:
+    n_channels = 1
+    sample_width = 2
+    n_frames = int(duration_seconds * sample_rate)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(n_channels)
+        handle.setsampwidth(sample_width)
+        handle.setframerate(sample_rate)
+        handle.writeframes(b"\x00\x00" * n_frames)
 
 
 class ProcessCommandTests(unittest.TestCase):
@@ -172,6 +192,46 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertNotIn("atrim", filters)
         self.assertNotIn("stream_loop", args)
 
+    def test_material_assembly_uses_per_clip_stretch_plan(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "4.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "3.0"}, "streams": []},
+            ],
+        ):
+            args = build_material_assembly_args(
+                Path("reference.wav"),
+                [Path("a.wav"), Path("b.wav")],
+                Path("out.wav"),
+                ProcessOptions(input_path=Path("reference.wav"), output_path=Path("out.wav"), overwrite=True),
+                material_target_durations=[2.0, 2.0],
+            )
+
+        filters = args[args.index("-filter_complex") + 1]
+        self.assertIn("[0:a]rubberband=tempo=0.50000000:pitch=1:formant=preserved", filters)
+        self.assertIn("[1:a]rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
+        self.assertIn("[clip0][clip1]concat=n=2:v=0:a=1[outa]", filters)
+        self.assertNotIn("atrim", filters)
+        self.assertNotIn("stream_loop", filters)
+
+    def test_material_stretch_plan_flags_extreme_ratios(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "10.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+            ],
+        ):
+            clips = plan_material_stretch_clips(
+                Path("reference.wav"),
+                [Path("short.wav")],
+            )
+
+        self.assertEqual(clips[0].target_duration_seconds, 10.0)
+        self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
+
 
 class DawTimelineTests(unittest.TestCase):
     def test_plans_separate_daw_clips_on_reference_timeline(self) -> None:
@@ -179,7 +239,7 @@ class DawTimelineTests(unittest.TestCase):
         materials = [Path("001.wav"), Path("002.wav")]
 
         with patch(
-            "audio_processor.daw.probe_audio",
+            "audio_processor.engine.probe_audio",
             side_effect=[
                 {"format": {"duration": "4.0"}, "streams": []},
                 {"format": {"duration": "1.0"}, "streams": []},
@@ -193,7 +253,27 @@ class DawTimelineTests(unittest.TestCase):
         self.assertEqual(plan.tempo, 1.0)
         self.assertEqual([clip.start_seconds for clip in plan.clips], [0.0, 1.0])
         self.assertEqual([clip.target_duration_seconds for clip in plan.clips], [1.0, 3.0])
+        self.assertEqual([clip.tempo for clip in plan.clips], [1.0, 1.0])
         self.assertEqual([clip.rendered_path.name for clip in plan.clips], ["0001_001.wav", "0002_002.wav"])
+
+    def test_plans_daw_clips_from_model_target_durations(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "4.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "3.0"}, "streams": []},
+            ],
+        ):
+            plan = plan_daw_timeline(
+                Path("reference.wav"),
+                [Path("001.wav"), Path("002.wav")],
+                Path("project") / "audio",
+                target_durations=[2.0, 2.0],
+            )
+
+        self.assertEqual([clip.target_duration_seconds for clip in plan.clips], [2.0, 2.0])
+        self.assertEqual([clip.tempo for clip in plan.clips], [0.5, 1.5])
 
     def test_reaper_project_references_separate_rendered_clips(self) -> None:
         result = DawExportResult(
@@ -298,6 +378,20 @@ class ProbeSummaryTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(AudioProcessorError, "no JSON metadata"):
                     probe_audio(path)
+
+    def test_probe_audio_falls_back_to_python_wave_when_ffprobe_json_is_empty(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "input.wav"
+            _write_test_wave(path)
+
+            with patch(
+                "audio_processor.engine.run_command",
+                return_value=SimpleNamespace(stdout="", stderr=""),
+            ):
+                data = probe_audio(path)
+
+        self.assertEqual(data["probe_fallback"], "python_wave")
+        self.assertGreater(get_audio_duration_seconds(data), 0)
 
     def test_probe_audio_wraps_invalid_json_output(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -411,6 +505,45 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("batch.item.started", [record["stage"] for record in records])
         self.assertIn("inputs.reference", [record["stage"] for record in records])
         self.assertIn("batch.item.failed", [record["stage"] for record in records])
+        failure = next(record for record in records if record["stage"] == "batch.item.failed")
+        self.assertIn("elapsed_seconds", failure["fields"])
+
+    def test_input_diagnostics_do_not_abort_when_material_probe_fails(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "reference.wav"
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            material_path = material_dir / "bad.wav"
+            input_path.write_bytes(b"placeholder")
+            material_path.write_bytes(b"placeholder")
+            settings = ProcessingSettings(material_directory=str(material_dir), overwrite=True)
+            item = create_queue([input_path], settings)[0]
+
+            probe_data = {
+                "streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}],
+                "format": {"duration": "1.0", "format_name": "wav"},
+            }
+
+            def fake_probe(path: Path) -> dict[str, object]:
+                if Path(path) == material_path:
+                    raise AudioProcessorError("metadata failed")
+                return probe_data
+
+            with patch("audio_processor.batch.probe_audio", side_effect=fake_probe):
+                with patch(
+                    "audio_processor.batch.build_model_ordering",
+                    side_effect=AudioProcessorError("model failed"),
+                ):
+                    summary = run_batch_queue([item], settings)
+
+            log_path = diagnostic_log_path(item.output_path)
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(summary.failed, 1)
+        materials_record = next(record for record in records if record["stage"] == "inputs.materials")
+        self.assertEqual(materials_record["fields"]["metadata_failure_count"], 1)
+        self.assertIn("batch.item.failed", [record["stage"] for record in records])
 
 
 class CliTests(unittest.TestCase):
@@ -451,6 +584,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.material_directory, Path("materials"))
         self.assertEqual(args.lyrics_file, Path("lyrics.txt"))
         self.assertTrue(args.overwrite)
+
+    def test_batch_subcommand_accepts_compute_device(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "batch",
+                "reference.wav",
+                "out.wav",
+                "--material-directory",
+                "materials",
+                "--compute-device",
+                "cpu",
+            ]
+        )
+
+        self.assertEqual(args.compute_device, "cpu")
+
+    def test_vst3_bridge_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(["vst3-bridge", "request.json", "--response", "response.json"])
+
+        self.assertEqual(args.command, "vst3-bridge")
+        self.assertEqual(args.request, Path("request.json"))
+        self.assertEqual(args.response, Path("response.json"))
 
 
 class I18nTests(unittest.TestCase):
@@ -516,7 +671,32 @@ class ModelAssistTests(unittest.TestCase):
         )
 
         self.assertEqual([decision.material_path.name for decision in decisions], ["001.wav", "002.wav", "003.wav"])
-        self.assertTrue(all(decision.reason == "reference_text_position" for decision in decisions))
+        self.assertEqual([decision.reason for decision in decisions], ["reference_text_position"] * 3)
+
+    def test_orders_materials_by_filename_when_transcript_is_missing(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 4.0, "alpha beta gamma")],
+            [
+                MaterialAnalysis(Path("002_alpha.wav"), transcript="", filename_text="alpha"),
+                MaterialAnalysis(Path("001_beta.wav"), transcript="", filename_text="beta"),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["002_alpha.wav", "001_beta.wav"])
+        self.assertEqual([decision.material_text for decision in decisions], ["alpha", "beta"])
+
+    def test_short_reference_scores_filename_and_duration_separately(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 0.5, "ha")],
+            [
+                MaterialAnalysis(Path("wrong_long.wav"), transcript="zz", filename_text="zz", duration_seconds=3.0),
+                MaterialAnalysis(Path("right_short.wav"), transcript="", filename_text="ha", duration_seconds=0.45),
+            ],
+        )
+
+        self.assertEqual(decisions[0].material_path.name, "right_short.wav")
+        self.assertGreater(decisions[0].filename_score, 0)
+        self.assertGreater(decisions[0].duration_score, 0.8)
 
 
 class ModelRuntimeTests(unittest.TestCase):
@@ -534,6 +714,85 @@ class ModelRuntimeTests(unittest.TestCase):
                 cache_root = model_runtime._model_cache_root()
 
         self.assertEqual(cache_root, fallback)
+
+    def test_model_cache_snapshot_reuses_matching_cache(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            material_path = material_dir / "001.wav"
+            _write_test_wave(material_path)
+            cache_path = material_dir / ".vocalprocess_material_cache.json"
+            snapshot = model_runtime._material_snapshot([material_path])
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "format": "vocal_process_material_cache_v1",
+                        "asr_model": model_runtime.DEFAULT_ASR_MODEL,
+                        "snapshot": snapshot,
+                        "materials": [
+                            {
+                                "path": str(material_path),
+                                "duration_seconds": 1.0,
+                                "transcript": "alpha",
+                                "filename_text": "001",
+                                "segments": [],
+                                "vad_segments": [],
+                                "speaker_embedding": None,
+                                "backend": "cache",
+                                "notes": [],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("audio_processor.model_runtime._transcribe_audio") as transcribe_mock:
+                with patch("audio_processor.model_runtime._detect_vad_segments") as vad_mock:
+                    with patch("audio_processor.model_runtime._speaker_embedding") as speaker_mock:
+                        library = model_runtime.analyze_material_library(material_dir)
+
+        self.assertEqual(library.materials[0].transcript, "alpha")
+        transcribe_mock.assert_not_called()
+        vad_mock.assert_not_called()
+        speaker_mock.assert_not_called()
+
+
+class Vst3BridgeTests(unittest.TestCase):
+    def test_bridge_template_is_serializable(self) -> None:
+        template = bridge_request_template()
+
+        self.assertEqual(template["format"], BRIDGE_REQUEST_FORMAT)
+        json.dumps(template, ensure_ascii=False)
+
+    def test_bridge_request_returns_batch_response(self) -> None:
+        request = {
+            "format": BRIDGE_REQUEST_FORMAT,
+            "command": "render_timeline",
+            "reference_path": "reference.wav",
+            "material_directory": "materials",
+            "output_path": "out/song.rpp",
+            "compute_device": "cpu",
+            "overwrite": True,
+        }
+
+        def fake_run_batch(items: list[object], settings: ProcessingSettings) -> BatchSummary:
+            item = items[0]
+            item.status = "Done"
+            item.message = "Complete"
+            self.assertTrue(settings.daw_timeline_export)
+            self.assertEqual(settings.compute_device, "cpu")
+            return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+        with patch("audio_processor.vst3_bridge.run_batch_queue", side_effect=fake_run_batch):
+            response = run_bridge_request(request)
+
+        self.assertEqual(response["format"], BRIDGE_RESPONSE_FORMAT)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["status"], "Done")
 
 
 if __name__ == "__main__":

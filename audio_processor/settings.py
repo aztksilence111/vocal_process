@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ from .i18n import DEFAULT_LANGUAGE, normalize_language
 
 
 APP_NAME = "AudioProcessorMVP"
+COMPUTE_DEVICE_OPTIONS = ("auto", "cpu", "cuda")
+WINDOW_GEOMETRY_OPTIONS = ("980x680", "1280x800", "1440x900", "1600x1000")
 
 
 @dataclass(frozen=True)
@@ -19,6 +22,8 @@ class ProcessingSettings:
     material_directory: str = ""
     lyrics_file: str = ""
     daw_timeline_export: bool = False
+    compute_device: str = "auto"
+    window_geometry: str = "980x680"
     output_directory: str = ""
     output_extension: str = ".wav"
     overwrite: bool = True
@@ -72,6 +77,8 @@ class ProcessingSettings:
             material_directory=str(data.get("material_directory") or defaults.material_directory),
             lyrics_file=str(data.get("lyrics_file") or defaults.lyrics_file),
             daw_timeline_export=bool(data.get("daw_timeline_export", defaults.daw_timeline_export)),
+            compute_device=normalize_compute_device(data.get("compute_device")),
+            window_geometry=normalize_window_geometry(data.get("window_geometry")),
             output_directory=str(data.get("output_directory") or defaults.output_directory),
             output_extension=normalize_extension(
                 str(data.get("output_extension") or defaults.output_extension),
@@ -97,6 +104,25 @@ def normalize_extension(value: str, *, fallback: str = ".wav") -> str:
     if not extension.startswith("."):
         extension = f".{extension}"
     return extension.lower()
+
+
+def normalize_compute_device(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in COMPUTE_DEVICE_OPTIONS:
+        return text
+    return "auto"
+
+
+def normalize_window_geometry(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "980x680"
+    match = re.fullmatch(r"([1-9]\d{2,4})x([1-9]\d{2,4})", text)
+    if not match:
+        return "980x680"
+    width = min(max(int(match.group(1)), 800), 3840)
+    height = min(max(int(match.group(2)), 560), 2160)
+    return f"{width}x{height}"
 
 
 def optional_string(value: Any) -> str | None:

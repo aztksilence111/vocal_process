@@ -18,7 +18,8 @@ from .engine import (
 )
 from .model_assist import backend_availability, build_model_assisted_pipeline_plan, list_model_candidates
 from .model_runtime import get_model_runtime_report
-from .settings import ProcessingSettings
+from .settings import COMPUTE_DEVICE_OPTIONS, ProcessingSettings
+from .vst3_bridge import bridge_request_template, run_bridge_request_file
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--sample-rate", type=int, help="output sample rate")
     batch_parser.add_argument("--channels", type=int, help="output channel count")
     batch_parser.add_argument("--codec", help="FFmpeg audio codec name")
+    batch_parser.add_argument(
+        "--compute-device",
+        choices=COMPUTE_DEVICE_OPTIONS,
+        default="auto",
+        help="model runtime device: auto, cpu, or cuda",
+    )
 
     daw_parser = subparsers.add_parser(
         "export-daw",
@@ -131,6 +138,18 @@ def build_parser() -> argparse.ArgumentParser:
     daw_parser.add_argument("--lowpass-hz", type=float, help="low-pass cutoff")
     daw_parser.add_argument("--sample-rate", type=int, help="output sample rate")
     daw_parser.add_argument("--channels", type=int, help="output channel count")
+
+    bridge_parser = subparsers.add_parser(
+        "vst3-bridge",
+        help="run a JSON bridge request for future VST3/native host integration",
+    )
+    bridge_parser.add_argument("request", type=Path, nargs="?", help="bridge request JSON file")
+    bridge_parser.add_argument("--response", type=Path, help="response JSON output file")
+    bridge_parser.add_argument(
+        "--template",
+        action="store_true",
+        help="print a bridge request template instead of running a request",
+    )
 
     return parser
 
@@ -198,6 +217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 material_directory=str(args.material_directory),
                 lyrics_file=str(args.lyrics_file or ""),
                 daw_timeline_export=args.daw_timeline_export,
+                compute_device=args.compute_device,
                 output_directory=str(args.output.parent),
                 output_extension=args.output.suffix,
                 overwrite=args.overwrite,
@@ -243,6 +263,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Wrote {result.project_path}")
             print(f"Wrote {result.manifest_path}")
             print(f"Wrote {result.csv_path}")
+            return 0
+
+        if args.command == "vst3-bridge":
+            if args.template:
+                print(json.dumps(bridge_request_template(), ensure_ascii=False, indent=2))
+                return 0
+            if args.request is None:
+                parser.error("vst3-bridge requires a request file unless --template is used")
+                return 2
+            response = run_bridge_request_file(args.request, args.response)
+            if not response.get("ok"):
+                print(json.dumps(response, ensure_ascii=False, indent=2), file=sys.stderr)
+                return 1
+            print(json.dumps(response, ensure_ascii=False, indent=2))
             return 0
 
         parser.error("unknown command")

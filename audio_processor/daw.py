@@ -13,6 +13,7 @@ from .engine import (
     ProcessOptions,
     get_audio_duration_seconds,
     list_audio_files,
+    plan_material_stretch_clips,
     probe_audio,
     process_material_clip_with_progress,
 )
@@ -26,6 +27,8 @@ class DawTimelineClip:
     start_seconds: float
     source_duration_seconds: float
     target_duration_seconds: float
+    tempo: float = 1.0
+    quality_warning: str = ""
     actual_duration_seconds: float = 0.0
 
 
@@ -55,45 +58,42 @@ def plan_daw_timeline(
     reference_path: Path,
     material_paths: Sequence[Path],
     audio_directory: Path,
+    *,
+    target_durations: Sequence[float | None] | None = None,
 ) -> DawTimelinePlan:
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
 
+    clip_stretches = plan_material_stretch_clips(
+        reference_path,
+        material_paths,
+        target_durations=target_durations,
+    )
     normalized_reference = reference_path.expanduser()
-    reference_duration = get_audio_duration_seconds(probe_audio(normalized_reference))
-    if reference_duration <= 0:
-        raise AudioProcessorError(f"Could not read reference audio duration: {normalized_reference}")
-
-    source_durations = [
-        get_audio_duration_seconds(probe_audio(path.expanduser())) for path in material_paths
-    ]
-    material_duration = sum(source_durations)
+    reference_duration = sum(clip.target_duration_seconds for clip in clip_stretches)
+    material_duration = sum(clip.source_duration_seconds for clip in clip_stretches)
     if material_duration <= 0:
         raise AudioProcessorError("Could not read material audio duration")
 
     tempo = material_duration / reference_duration
-    scale = reference_duration / material_duration
     clips: list[DawTimelineClip] = []
     start = 0.0
     used_names: set[str] = set()
-    for index, (path, source_duration) in enumerate(zip(material_paths, source_durations), start=1):
-        if index == len(material_paths):
-            target_duration = max(reference_duration - start, 0.0)
-        else:
-            target_duration = source_duration * scale
-
-        rendered_path = audio_directory / _clip_file_name(index, path, used_names)
+    for clip in clip_stretches:
+        rendered_path = audio_directory / _clip_file_name(clip.index, clip.source_path, used_names)
         clips.append(
             DawTimelineClip(
-                index=index,
-                source_path=path.expanduser(),
+                index=clip.index,
+                source_path=clip.source_path,
                 rendered_path=rendered_path,
                 start_seconds=start,
-                source_duration_seconds=source_duration,
-                target_duration_seconds=target_duration,
+                source_duration_seconds=clip.source_duration_seconds,
+                target_duration_seconds=clip.target_duration_seconds,
+                tempo=clip.tempo,
+                quality_warning=clip.quality_warning,
             )
         )
-        start += target_duration
+        start += clip.target_duration_seconds
 
     return DawTimelinePlan(
         reference_path=normalized_reference,
@@ -111,6 +111,7 @@ def export_daw_timeline_with_progress(
     options: ProcessOptions,
     *,
     material_paths: Sequence[Path] | None = None,
+    target_durations: Sequence[float | None] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> DawExportResult:
@@ -127,7 +128,12 @@ def export_daw_timeline_with_progress(
     audio_directory.mkdir(parents=True, exist_ok=True)
 
     ordered_material_paths = list(material_paths) if material_paths is not None else list_audio_files(material_directory)
-    plan = plan_daw_timeline(reference_path, ordered_material_paths, audio_directory)
+    plan = plan_daw_timeline(
+        reference_path,
+        ordered_material_paths,
+        audio_directory,
+        target_durations=target_durations,
+    )
 
     rendered_clips: list[DawTimelineClip] = []
     total_steps = len(plan.clips) + 1
@@ -159,7 +165,7 @@ def export_daw_timeline_with_progress(
         process_material_clip_with_progress(
             clip.source_path,
             clip.rendered_path,
-            plan.tempo,
+            clip.tempo,
             clip_options,
             target_duration=clip.target_duration_seconds,
             on_progress=clip_progress,
@@ -175,6 +181,8 @@ def export_daw_timeline_with_progress(
                 start_seconds=clip.start_seconds,
                 source_duration_seconds=clip.source_duration_seconds,
                 target_duration_seconds=clip.target_duration_seconds,
+                tempo=clip.tempo,
+                quality_warning=clip.quality_warning,
                 actual_duration_seconds=actual_duration,
             )
         )
@@ -202,8 +210,8 @@ def render_manifest(result: DawExportResult, plan: DawTimelinePlan) -> dict[str,
         },
         "material": {
             "total_duration_seconds": plan.material_duration_seconds,
-            "tempo": plan.tempo,
-            "note": "tempo is material_total_duration / reference_duration",
+            "average_tempo": plan.tempo,
+            "note": "each clip stores its own rubberband tempo; average_tempo is material_total_duration / reference_duration",
         },
         "outputs": {
             "project_path": str(result.project_path),
@@ -252,6 +260,8 @@ def _write_csv(result: DawExportResult) -> None:
                 "rendered_path",
                 "start_seconds",
                 "target_duration_seconds",
+                "rubberband_tempo",
+                "quality_warning",
                 "actual_duration_seconds",
             ]
         )
@@ -263,6 +273,8 @@ def _write_csv(result: DawExportResult) -> None:
                     str(clip.rendered_path),
                     f"{clip.start_seconds:.6f}",
                     f"{clip.target_duration_seconds:.6f}",
+                    f"{clip.tempo:.8f}",
+                    clip.quality_warning,
                     f"{clip.actual_duration_seconds:.6f}",
                 ]
             )

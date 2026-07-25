@@ -32,6 +32,8 @@ The log records:
 6. Material file list, durations, codec, sample rate, and channel count.
 7. Lyrics file path if selected.
 8. Completion, cancellation, expected processing errors, and unexpected exceptions.
+9. Model ordering scores split into transcript, filename hint, duration, speaker, and VAD components.
+10. Per-material stretch plans, including source duration, target duration, rubberband tempo, and moderate/extreme stretch warnings.
 
 JSONL is used so a failed run can still leave useful partial evidence. Each line is independent JSON and can be inspected with a text editor or parsed by tools later.
 
@@ -64,12 +66,14 @@ The model layer is now part of the core material assembly flow. Some backends ar
 
 4. Score material clips:
    - Compare reference segment text with material transcript text.
+   - Compare filename pronunciation hints when ASR is weak, especially for one-character or one-syllable material clips.
+   - Compare material duration against the target reference segment duration.
    - Compare speaker or voice embeddings where available.
    - Penalize clips with weak VAD confidence or extreme stretch ratio.
 
 5. Build an editable timeline:
    - Produce a timeline manifest with source clip, reference segment, start time, target duration, transcript score, and speaker score.
-   - Render each chosen material clip separately with Rubber Band stretch.
+   - Render each chosen material clip separately with Rubber Band stretch, then concatenate or place clips on a DAW timeline.
    - Export REAPER `.rpp`, `timeline.json`, `timeline.csv`, and WAV clips.
 
 ## Current Code Status
@@ -85,6 +89,9 @@ Implemented now:
 7. GUI and CLI environment checks report the local model runtime and cache state.
 8. Batch material assembly requires model-assisted ordering when a material folder is selected.
 9. DAW timeline export receives the model-ordered material path list instead of raw filename order.
+10. Flat WAV assembly now uses per-clip Rubber Band stretching before concatenation, so a single syllable is not forced through one whole-material stretch pass.
+11. Stretch diagnostics record quality warnings for ratios that are likely to damage intelligibility.
+12. A JSON-based VST3 bridge helper exists as `audio_processor.vst3_bridge` and `audio-processor vst3-bridge`.
 10. CLI entry:
 
 ```powershell
@@ -101,7 +108,8 @@ Not default yet:
 ## Next Development Steps
 
 1. Add an `analyze` command that writes `analysis.json` for inspecting model output before rendering.
-2. Add targeted diagnostics for weak transcripts, empty VAD, and extreme stretch ratios.
+2. Use manual test diagnostics to tune the score weights for weak transcripts, filename hints, and extreme stretch ratios.
 3. Improve ordering with word-level alignment when a compatible WhisperX or alternative aligner is available.
 4. Add pyannote diarization after Hugging Face authorization is provided.
-5. Keep refining the portable package smoke test so it verifies both startup and a small model-assisted processing path.
+5. Build a minimal native VST3 prototype that calls the JSON bridge helper outside the audio callback.
+6. Keep refining the portable package smoke test so it verifies both startup and a small model-assisted processing path.

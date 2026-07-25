@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -36,6 +38,16 @@ class ProcessOptions:
     codec: str | None = None
 
 
+@dataclass(frozen=True)
+class MaterialStretchClip:
+    index: int
+    source_path: Path
+    source_duration_seconds: float
+    target_duration_seconds: float
+    tempo: float
+    quality_warning: str = ""
+
+
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".aac",
     ".aiff",
@@ -63,8 +75,12 @@ def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.Com
             [str(arg) for arg in command_args],
             check=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
+            creationflags=_subprocess_creationflags(),
         )
     except FileNotFoundError as exc:
         raise AudioProcessorError(f"Required tool not found: {args[0]}") from exc
@@ -127,22 +143,37 @@ def probe_audio(input_path: Path) -> dict[str, Any]:
     if not path.exists():
         raise AudioProcessorError(f"Input file does not exist: {path}")
 
-    result = run_command(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            str(path),
-        ],
-        capture=True,
-    )
+    try:
+        result = run_command(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            capture=True,
+        )
+    except AudioProcessorError as exc:
+        fallback = _probe_audio_fallback(path)
+        if fallback is not None:
+            fallback["probe_warning"] = "ffprobe command failed; metadata came from fallback"
+            fallback["probe_warning_details"] = str(exc)
+            return fallback
+        raise
+
     output = result.stdout
     if output is None or not output.strip():
         details = (result.stderr or "").strip()
+        fallback = _probe_audio_fallback(path)
+        if fallback is not None:
+            fallback["probe_warning"] = "ffprobe returned no JSON metadata; metadata came from fallback"
+            if details:
+                fallback["probe_warning_details"] = details
+            return fallback
         message = f"FFprobe returned no JSON metadata for: {path}"
         if details:
             message = f"{message}\n{details}"
@@ -151,6 +182,11 @@ def probe_audio(input_path: Path) -> dict[str, Any]:
     try:
         data = json.loads(output)
     except json.JSONDecodeError as exc:
+        fallback = _probe_audio_fallback(path)
+        if fallback is not None:
+            fallback["probe_warning"] = "ffprobe returned invalid JSON metadata; metadata came from fallback"
+            fallback["probe_warning_details"] = output.strip().splitlines()[0][:200] if output.strip() else ""
+            return fallback
         preview = output.strip().splitlines()[0][:200]
         raise AudioProcessorError(
             f"FFprobe returned invalid JSON metadata for: {path}\n{preview}"
@@ -224,6 +260,7 @@ def build_material_assembly_args(
     output_path: Path,
     options: ProcessOptions,
     *,
+    material_target_durations: Sequence[float | None] | None = None,
     progress: bool = False,
 ) -> list[str]:
     _validate_options(options)
@@ -231,21 +268,12 @@ def build_material_assembly_args(
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
 
-    reference_duration = get_audio_duration_seconds(probe_audio(reference_path))
-    material_duration = sum(get_audio_duration_seconds(probe_audio(path)) for path in material_paths)
-    if reference_duration <= 0:
-        raise AudioProcessorError(f"Could not read reference audio duration: {reference_path}")
-    if material_duration <= 0:
-        raise AudioProcessorError("Could not read material audio duration")
-
-    tempo = material_duration / reference_duration
-    _validate_rubberband_tempo(tempo)
-    filters = _build_material_filter_graph(
-        len(material_paths),
-        tempo,
-        options,
-        target_duration=reference_duration,
+    clip_plan = plan_material_stretch_clips(
+        reference_path,
+        material_paths,
+        target_durations=material_target_durations,
     )
+    filters = _build_material_plan_filter_graph(clip_plan, options)
 
     args = ["ffmpeg", "-hide_banner"]
     if progress:
@@ -381,6 +409,7 @@ def assemble_material_to_reference_with_progress(
     options: ProcessOptions,
     *,
     material_paths: Sequence[Path] | None = None,
+    material_target_durations: Sequence[float | None] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> None:
@@ -412,6 +441,7 @@ def assemble_material_to_reference_with_progress(
             channels=options.channels,
             codec=options.codec,
         ),
+        material_target_durations=material_target_durations,
         progress=True,
     )
     _run_progress_process(
@@ -420,6 +450,70 @@ def assemble_material_to_reference_with_progress(
         on_progress=on_progress,
         should_cancel=should_cancel,
     )
+
+
+def plan_material_stretch_clips(
+    reference_path: Path,
+    material_paths: Sequence[Path],
+    *,
+    target_durations: Sequence[float | None] | None = None,
+) -> list[MaterialStretchClip]:
+    if not material_paths:
+        raise AudioProcessorError("Material directory does not contain supported audio files")
+
+    normalized_reference = reference_path.expanduser()
+    reference_duration = get_audio_duration_seconds(probe_audio(normalized_reference))
+    if reference_duration <= 0:
+        raise AudioProcessorError(f"Could not read reference audio duration: {normalized_reference}")
+
+    normalized_materials = [path.expanduser() for path in material_paths]
+    source_durations = [get_audio_duration_seconds(probe_audio(path)) for path in normalized_materials]
+    if any(duration <= 0 for duration in source_durations):
+        bad_paths = [
+            str(path)
+            for path, duration in zip(normalized_materials, source_durations)
+            if duration <= 0
+        ]
+        raise AudioProcessorError(f"Could not read material audio duration: {', '.join(bad_paths)}")
+
+    resolved_targets = _resolve_material_target_durations(
+        reference_duration,
+        source_durations,
+        target_durations=target_durations,
+    )
+
+    clips: list[MaterialStretchClip] = []
+    for index, (path, source_duration, target_duration) in enumerate(
+        zip(normalized_materials, source_durations, resolved_targets),
+        start=1,
+    ):
+        tempo = source_duration / target_duration
+        _validate_rubberband_tempo(tempo)
+        clips.append(
+            MaterialStretchClip(
+                index=index,
+                source_path=path,
+                source_duration_seconds=source_duration,
+                target_duration_seconds=target_duration,
+                tempo=tempo,
+                quality_warning=_stretch_quality_warning(tempo),
+            )
+        )
+    return clips
+
+
+def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": clip.index,
+            "source_path": clip.source_path,
+            "source_duration_seconds": clip.source_duration_seconds,
+            "target_duration_seconds": clip.target_duration_seconds,
+            "rubberband_tempo": clip.tempo,
+            "quality_warning": clip.quality_warning,
+        }
+        for clip in clips
+    ]
 
 
 def get_audio_duration_seconds(data: dict[str, Any]) -> float:
@@ -510,6 +604,33 @@ def _build_material_filter_graph(
     return ";".join(filters)
 
 
+def _build_material_plan_filter_graph(
+    clips: Sequence[MaterialStretchClip],
+    options: ProcessOptions,
+) -> str:
+    if not clips:
+        raise AudioProcessorError("Material stretch plan is empty")
+
+    audio_filters = _build_audio_filters(options)
+    filters: list[str] = []
+    labels: list[str] = []
+    for index, clip in enumerate(clips):
+        output_label = "outa" if len(clips) == 1 else f"clip{index}"
+        post_filters = [
+            _rubberband_filter(clip.tempo),
+        ]
+        if audio_filters:
+            post_filters.append(audio_filters)
+        post_filters.append(f"apad=whole_dur={clip.target_duration_seconds:.6f}")
+        filters.append(f"[{index}:a]{','.join(post_filters)}[{output_label}]")
+        if len(clips) > 1:
+            labels.append(f"[{output_label}]")
+
+    if len(clips) > 1:
+        filters.append(f"{''.join(labels)}concat=n={len(clips)}:v=0:a=1[outa]")
+    return ";".join(filters)
+
+
 def _build_material_clip_filter(
     tempo: float,
     options: ProcessOptions,
@@ -521,13 +642,63 @@ def _build_material_clip_filter(
 
     audio_filters = _build_audio_filters(options)
     filters = [
-        f"rubberband=tempo={tempo:.8f}:pitch=1:formant=preserved:transients=crisp:phase=laminar"
+        _rubberband_filter(tempo)
     ]
     if audio_filters:
         filters.append(audio_filters)
     if target_duration is not None:
         filters.append(f"apad=whole_dur={target_duration:.6f}")
     return ",".join(filters)
+
+
+def _rubberband_filter(tempo: float) -> str:
+    return f"rubberband=tempo={tempo:.8f}:pitch=1:formant=preserved:transients=crisp:phase=laminar"
+
+
+def _resolve_material_target_durations(
+    reference_duration: float,
+    source_durations: Sequence[float],
+    *,
+    target_durations: Sequence[float | None] | None,
+) -> list[float]:
+    if reference_duration <= 0:
+        raise AudioProcessorError("reference_duration must be greater than 0")
+    if not source_durations:
+        raise AudioProcessorError("source_durations must not be empty")
+
+    if target_durations is not None and len(target_durations) == len(source_durations):
+        base = [
+            float(target) if target is not None and float(target) > 0 else float(source)
+            for source, target in zip(source_durations, target_durations)
+        ]
+    else:
+        base = [float(source) for source in source_durations]
+
+    total = sum(base)
+    if total <= 0:
+        raise AudioProcessorError("Could not resolve material target durations")
+
+    scale = reference_duration / total
+    targets = [max(duration * scale, 0.001) for duration in base]
+    if len(targets) == 1:
+        return [reference_duration]
+
+    accumulated = 0.0
+    adjusted: list[float] = []
+    for duration in targets[:-1]:
+        adjusted_duration = min(duration, max(reference_duration - accumulated - 0.001, 0.001))
+        adjusted.append(adjusted_duration)
+        accumulated += adjusted_duration
+    adjusted.append(max(reference_duration - accumulated, 0.001))
+    return adjusted
+
+
+def _stretch_quality_warning(tempo: float) -> str:
+    if tempo < 0.5 or tempo > 2.0:
+        return "extreme_stretch_ratio"
+    if tempo < 0.75 or tempo > 1.5:
+        return "moderate_stretch_ratio"
+    return ""
 
 
 def _validate_options(options: ProcessOptions) -> None:
@@ -614,6 +785,131 @@ def _normal_tool_name(name: str) -> str:
     return normalized
 
 
+def _probe_audio_fallback(path: Path) -> dict[str, Any] | None:
+    wav_data = _probe_wav_with_stdlib(path)
+    if wav_data is not None:
+        return wav_data
+    return _probe_audio_with_ffmpeg_stderr(path)
+
+
+def _probe_wav_with_stdlib(path: Path) -> dict[str, Any] | None:
+    if path.suffix.lower() != ".wav":
+        return None
+
+    try:
+        with wave.open(str(path), "rb") as handle:
+            channels = handle.getnchannels()
+            sample_rate = handle.getframerate()
+            frames = handle.getnframes()
+            sample_width = handle.getsampwidth()
+    except (EOFError, OSError, wave.Error):
+        return None
+
+    duration = frames / sample_rate if sample_rate > 0 else 0.0
+    bits_per_sample = sample_width * 8
+    codec_name = "pcm_u8" if bits_per_sample == 8 else f"pcm_s{bits_per_sample}le"
+    duration_text = f"{duration:.6f}"
+    return {
+        "streams": [
+            {
+                "codec_type": "audio",
+                "codec_name": codec_name,
+                "sample_rate": str(sample_rate),
+                "channels": channels,
+                "duration": duration_text,
+            }
+        ],
+        "format": {"format_name": "wav", "duration": duration_text},
+        "probe_fallback": "python_wave",
+    }
+
+
+def _probe_audio_with_ffmpeg_stderr(path: Path) -> dict[str, Any] | None:
+    try:
+        command_args = _resolve_command_args(["ffmpeg", "-hide_banner", "-i", str(path)])
+        result = subprocess.run(
+            [str(arg) for arg in command_args],
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=_subprocess_creationflags(),
+        )
+    except (FileNotFoundError, OSError, AudioProcessorError):
+        return None
+
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    duration = _parse_ffmpeg_duration(output)
+    if duration is None:
+        return None
+
+    audio_line = _first_ffmpeg_audio_line(output)
+    stream: dict[str, Any] = {"codec_type": "audio", "duration": f"{duration:.6f}"}
+    codec_name = _parse_ffmpeg_audio_codec(audio_line)
+    sample_rate = _parse_ffmpeg_sample_rate(audio_line)
+    channels = _parse_ffmpeg_channels(audio_line)
+    if codec_name:
+        stream["codec_name"] = codec_name
+    if sample_rate:
+        stream["sample_rate"] = str(sample_rate)
+    if channels:
+        stream["channels"] = channels
+
+    return {
+        "streams": [stream],
+        "format": {
+            "format_name": path.suffix.lower().lstrip(".") or "unknown",
+            "duration": f"{duration:.6f}",
+        },
+        "probe_fallback": "ffmpeg_stderr",
+    }
+
+
+def _parse_ffmpeg_duration(output: str) -> float | None:
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+    if not match:
+        return None
+    return max(
+        (int(match.group(1)) * 3600) + (int(match.group(2)) * 60) + float(match.group(3)),
+        0.0,
+    )
+
+
+def _first_ffmpeg_audio_line(output: str) -> str:
+    for line in output.splitlines():
+        if "Audio:" in line:
+            return line.strip()
+    return ""
+
+
+def _parse_ffmpeg_audio_codec(audio_line: str) -> str | None:
+    match = re.search(r"Audio:\s*([^,\s]+)", audio_line)
+    return match.group(1) if match else None
+
+
+def _parse_ffmpeg_sample_rate(audio_line: str) -> int | None:
+    match = re.search(r"(\d+)\s*Hz", audio_line)
+    return int(match.group(1)) if match else None
+
+
+def _parse_ffmpeg_channels(audio_line: str) -> int | None:
+    if re.search(r"\bmono\b", audio_line, re.IGNORECASE):
+        return 1
+    if re.search(r"\bstereo\b", audio_line, re.IGNORECASE):
+        return 2
+    match = re.search(r"(\d+)\s+channels?", audio_line, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _subprocess_creationflags() -> int:
+    if sys.platform.startswith("win"):
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return 0
+
+
 def _format_duration(value: Any) -> str:
     try:
         seconds = float(value)
@@ -635,6 +931,10 @@ def _open_progress_process(args: Sequence[str]) -> subprocess.Popen[str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            creationflags=_subprocess_creationflags(),
         )
     except FileNotFoundError as exc:
         raise AudioProcessorError(f"Required tool not found: {args[0]}") from exc

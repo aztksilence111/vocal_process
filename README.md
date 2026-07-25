@@ -24,6 +24,8 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 7. 生成结构化 `.diagnostics.jsonl`，用于定位无报错失败、模型转写失败、FFprobe 元数据失败等问题。
 8. 输出普通 WAV，或导出 REAPER `.rpp`、`timeline.json`、`timeline.csv` 和独立素材片段 WAV，方便在 DAW 中继续编辑每个素材 item。
 9. 提供 `batch` 命令，便于在便携包里直接跑一条真实模型辅助输出。
+10. 素材集会生成 `.vocalprocess_material_cache.json`，同一文件夹未变化时复用素材分析结果。
+11. GUI 显示运行时长，支持 CPU/GPU 计算设备选择，并允许拖拽窗口边缘或在设置中选择窗口尺寸。
 
 ## 环境要求
 
@@ -70,6 +72,7 @@ python -m audio_processor process input.wav output.mp3 --normalize --gain-db -3 
 
 ```powershell
 python -m audio_processor export-daw reference.wav materials reference_daw\reference.rpp --overwrite
+python -m audio_processor batch reference.wav output.wav --material-directory materials --compute-device cpu --overwrite
 ```
 
 查看模型候选和状态：
@@ -91,8 +94,9 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1
 2. 选择素材集文件夹。
 3. 可选选择歌词文件。
 4. 选择输出目录和输出格式。
-5. 选择是否导出 DAW 时间轴工程。
-6. 点击“开始批量处理”。
+5. 选择计算设备和窗口尺寸。
+6. 选择是否导出 DAW 时间轴工程。
+7. 点击“开始批量处理”。
 
 当选择素材集后，模型辅助排序是核心流程，不提供关闭按钮。处理链路会先分析原音频和素材人声，再把排序结果交给现有的拉伸拼接或 DAW 时间轴导出模块。
 
@@ -104,6 +108,7 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1
 2. DAW 时间轴工程：工程文件夹内的 `diagnostics.jsonl`。
 
 日志会记录处理模式、输入路径、设置快照、参考音频元数据、素材清单、模型排序结果、完成状态和异常堆栈。人工测试失败时，应优先收集这个文件。
+如果 FFprobe 对某个 WAV 返回空 JSON，程序会先尝试 Python WAV/FFmpeg stderr 兜底；诊断阶段的素材元数据失败会写入 warning，不再直接中断整批任务。失败和取消记录会包含运行耗时。
 
 ## 便携版
 
@@ -159,3 +164,16 @@ reference_daw\
 .venv\Scripts\python -m unittest discover
 .venv\Scripts\python -m compileall -q audio_processor tests packaging
 ```
+
+## Recent Runtime Notes
+
+The model-assisted material workflow now writes a `render.stretch_plan` event to diagnostics. This records every material clip's source duration, target duration, Rubber Band tempo, and quality warning. Flat WAV output and DAW timeline export both use per-clip stretching before concatenation or timeline placement.
+
+The VST3 bridge work has started as an offline helper protocol:
+
+```powershell
+python -m audio_processor vst3-bridge --template
+python -m audio_processor vst3-bridge request.json --response response.json
+```
+
+The future native VST3 plug-in should call this helper process instead of running Python, FFmpeg, or model inference inside a real-time audio callback.

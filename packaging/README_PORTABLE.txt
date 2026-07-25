@@ -29,3 +29,9 @@ Troubleshooting:
 - If the app cannot find FFmpeg, make sure `bin\ffmpeg.exe` and `bin\ffprobe.exe` still exist beside `VocalProcess.exe`.
 - If Windows SmartScreen warns about the app, it is because this local build is not code-signed.
 - If processing fails or the output is not meaningful, send the `.diagnostics.jsonl` file together with the original audio, material folder description, and screenshots of the selected settings.
+
+Advanced bridge usage:
+
+- `VocalProcess.exe vst3-bridge --template` prints a JSON request template for future VST3/native host integration.
+- `VocalProcess.exe vst3-bridge request.json --response response.json` runs the offline renderer through that bridge request.
+- The bridge is not a real-time audio plug-in yet; it is the helper process that a future native VST3 plug-in should call.

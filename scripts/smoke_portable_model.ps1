@@ -49,8 +49,10 @@ $AppRoot = (Resolve-Path -LiteralPath $PortableRoot).Path
 $ExePath = Join-Path $AppRoot "$AppName.exe"
 $ModelRoot = Join-Path $AppRoot "models"
 $FfprobePath = Join-Path $AppRoot "bin\ffprobe.exe"
+$TclDataPath = Join-Path $AppRoot "_internal\_tcl_data"
+$TkDataPath = Join-Path $AppRoot "_internal\_tk_data"
 
-foreach ($Path in @($ExePath, $ModelRoot, $FfprobePath)) {
+foreach ($Path in @($ExePath, $ModelRoot, $FfprobePath, $TclDataPath, $TkDataPath)) {
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Required portable path not found: $Path"
     }
@@ -74,13 +76,28 @@ New-SpeechWave (Join-Path $MaterialsRoot "003.wav") "For vocal process."
 
 $PreviousModelCache = $env:VOCAL_PROCESS_MODEL_CACHE
 $env:VOCAL_PROCESS_MODEL_CACHE = $ModelRoot
-Remove-Variable ExitCode -ErrorAction SilentlyContinue
 try {
-    & $ExePath batch `
-        (Join-Path $WorkRoot "reference.wav") `
-        (Join-Path $OutputRoot "reference.wav") `
-        --material-directory $MaterialsRoot `
-        --overwrite
+    $Arguments = @(
+        "batch",
+        (Join-Path $WorkRoot "reference.wav"),
+        (Join-Path $OutputRoot "reference.wav"),
+        "--material-directory",
+        $MaterialsRoot,
+        "--overwrite"
+    )
+    $Process = Start-Process -FilePath $ExePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    $Deadline = (Get-Date).AddSeconds(420)
+    while (-not $Process.HasExited -and (Get-Date) -lt $Deadline) {
+        Start-Sleep -Seconds 2
+        $Process.Refresh()
+    }
+    if (-not $Process.HasExited) {
+        $Process.Kill()
+        throw "$AppName.exe batch did not finish within the portable model smoke-test timeout"
+    }
+    if ($Process.ExitCode -ne 0) {
+        throw "$AppName.exe batch returned exit code $($Process.ExitCode)"
+    }
 }
 finally {
     $env:VOCAL_PROCESS_MODEL_CACHE = $PreviousModelCache
@@ -115,11 +132,6 @@ foreach ($Pattern in @("model.ordering.completed", "batch.item.completed", "refe
 }
 if ($DiagnosticsText -match "batch.item.failed|demucs separation failed") {
     throw "Diagnostics contain a failed processing stage"
-}
-
-$ExitCode = $LASTEXITCODE
-if (($ExitCode -is [int]) -and $ExitCode -ne 0) {
-    throw "$AppName.exe batch returned exit code $ExitCode"
 }
 
 Write-Host "Portable model smoke test passed:"

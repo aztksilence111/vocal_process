@@ -600,3 +600,89 @@ Final artifact:
 - Zip: `dist\VocalProcess-portable.zip`
 - SHA256: `35DBB2AFBD2A79A0D1CF72C8441E4CA19BDF93B87B9A4399470FEC7C2507A68D`
 - Smoke command: `powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1 -PortableRoot dist\VocalProcess-portable\VocalProcess -WorkRoot .tmp\portable-model-smoke-final`
+
+## 2026-07-25: Robust Diagnostics, Cache, Device, and UI Runtime Work
+
+### Root Cause
+
+The user-provided red error log showed `FFprobe returned no JSON metadata` during `_log_input_diagnostics()`. That diagnostics step was probing every reference/material file before model ordering. When FFprobe returned empty stdout for a WAV file, diagnostics raised `AudioProcessorError`, so rendering could fail before the actual model pipeline or FFmpeg render stage had a chance to run.
+
+### Implementation Result
+
+1. `probe_audio()` now falls back to Python `wave` metadata for WAV files and to parsing FFmpeg stderr when FFprobe JSON is empty, invalid, or the ffprobe command fails.
+2. Input diagnostics now record reference/material metadata failures as warning fields instead of aborting the job.
+3. Batch items now track elapsed runtime; completion, cancellation, and errors write elapsed seconds into diagnostics.
+4. Model ordering accepts `compute_device` and resolves `auto` to CUDA when available, otherwise CPU.
+5. Demucs, WhisperX, Whisper, Silero VAD, torch-hub Silero, and SpeechBrain paths now receive the resolved device where supported.
+6. Material folders now store `.vocalprocess_material_cache.json`; cache reuse is keyed by file path, suffix, size, mtime, file count, and ASR model.
+7. Material ordering now uses filename pronunciation text as a correction signal alongside ASR transcript, helping clips named by syllable/word when ASR is weak.
+8. Lyrics are explicitly optional in GUI behavior and logging.
+9. GUI now displays elapsed runtime, keeps live progress bars, supports edge resize, and exposes saved window sizes.
+10. CLI `batch` now accepts `--compute-device`.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m unittest discover` with 41 tests.
+2. `.venv\Scripts\python -m py_compile audio_processor\model_runtime.py audio_processor\model_assist.py audio_processor\batch.py audio_processor\engine.py audio_processor\gui.py audio_processor\settings.py audio_processor\i18n.py audio_processor\cli.py tests\test_engine.py`.
+3. Actual source batch smoke without lyrics: `.venv\Scripts\python -m audio_processor.cli batch .tmp\local-model-smoke-current\reference.wav .tmp\local-model-smoke-current\out\reference.wav --material-directory .tmp\local-model-smoke-current\materials --compute-device cpu --overwrite`.
+4. Second source batch run reused `.vocalprocess_material_cache.json` and completed in about 9 seconds.
+
+### Next Tasks
+
+1. Rebuild and smoke-test the portable ZIP from the current source.
+2. Commit, push, and refresh release artifact if portable verification passes.
+3. Continue VST3/DAW bridge work after this diagnostics/model-stability round is released.
+
+## 2026-07-25: Per-Clip Stretch Planning and VST3 Bridge Helper
+
+### Goal
+
+Respond to manual test feedback that material vocal recognition/order and stretch rendering were still not producing intelligible results consistently. The priority is to make ordering more explainable, reduce avoidable stretch damage to one-syllable/one-character clips, and continue the VST3 bridge path without attempting unsafe real-time Python/FFmpeg processing inside a plug-in callback.
+
+### Technical Decisions
+
+1. Keep model-assisted ordering mandatory when a material folder is selected.
+2. Treat filename text as an explicit pronunciation hint because manual tests showed ASR can be weak on short material clips.
+3. Score duration closeness separately because extreme stretch ratios are a direct cause of degraded syllable intelligibility.
+4. Do not invent speaker similarity when no real embedding is available.
+5. Render flat WAV output with per-clip Rubber Band stretching before concatenation, not one global stretch after concatenating all material.
+6. Use the same per-clip stretch plan for DAW timeline export.
+7. Continue VST3 as an offline bridge first: native VST3 should call a helper process through a small protocol, not embed Python/model inference in the real-time path.
+
+### Implementation Result
+
+1. `audio_processor.model_assist` now records transcript, filename, duration, speaker, and VAD score components.
+2. Short-reference scoring weights filename and duration more heavily so one-syllable material can be matched when ASR output is empty or wrong.
+3. `audio_processor.model_runtime` attaches per-material target duration hints to ordering decisions and diagnostics reports.
+4. `audio_processor.engine` now exposes `MaterialStretchClip`, `plan_material_stretch_clips()`, and `render_material_stretch_plan()`.
+5. Flat WAV material assembly now builds a filter graph that stretches each input independently, then concatenates the stretched clips.
+6. `audio_processor.batch` writes a `render.stretch_plan` JSONL event before rendering.
+7. `audio_processor.daw` now uses the same per-clip target durations and records per-clip tempo and quality warnings in manifest/CSV output.
+8. `audio_processor.vst3_bridge` adds a JSON bridge request/response helper.
+9. CLI adds `vst3-bridge --template` and `vst3-bridge request.json --response response.json`.
+10. Documentation was updated for the current per-clip stretch strategy and VST3 helper boundary.
+
+### Verification
+
+Passed:
+
+1. `.venv\Scripts\python -m unittest discover` with 48 tests.
+2. `.venv\Scripts\python -m compileall -q audio_processor tests packaging`.
+3. Actual source batch smoke using cached local model analysis.
+4. Diagnostics contained `render.stretch_plan` with per-clip tempos and no quality warnings in the smoke sample.
+5. FFprobe confirmed the smoke output WAV as `pcm_s24le`, `22050 Hz`, mono, about `5.19s`.
+6. `audio_processor.cli vst3-bridge --template` returned a valid request template.
+7. Portable ZIP rebuild succeeded.
+8. Portable GUI smoke passed after reusing the extracted tree.
+9. Portable model smoke initially exposed that a windowed PyInstaller EXE cannot be invoked like a normal console process in PowerShell smoke scripts.
+10. `scripts/smoke_portable_model.ps1` now validates Tcl/Tk data folders and uses `Start-Process -PassThru` to wait for the windowed EXE and read its exit code.
+11. Portable model smoke passed after the script fix.
+
+### Remaining Work
+
+1. Commit and push this branch after portable verification.
+2. Rebuild the portable ZIP once more after commit so `BUILD_INFO.txt` points at the final source commit.
+3. Test the JSON bridge helper from a DAW-side script or minimal native VST3 prototype.
+4. Keep tuning ordering weights using real manual-test diagnostics, especially bad ASR, bad filename hints, and extreme stretch cases.

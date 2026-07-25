@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -11,8 +12,10 @@ from .engine import (
     assemble_material_to_reference_with_progress,
     get_audio_duration_seconds,
     list_audio_files,
+    plan_material_stretch_clips,
     probe_audio,
     process_audio_with_progress,
+    render_material_stretch_plan,
 )
 from .model_runtime import build_model_ordering
 from .settings import ProcessingSettings
@@ -25,6 +28,7 @@ class QueueItem:
     status: str = "Queued"
     progress: float = 0.0
     message: str = ""
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,7 @@ def run_batch_queue(
     failed = 0
     cancelled = 0
     total = len(items)
+    batch_started_at = time.monotonic()
 
     if total == 0:
         _notify_queue(on_queue_progress, 0.0, "No queued files")
@@ -70,8 +75,10 @@ def run_batch_queue(
             break
 
         diagnostics = DiagnosticLogger(diagnostic_log_path(item.output_path))
+        item_started_at = time.monotonic()
         item.status = "Processing"
         item.progress = 0.0
+        item.elapsed_seconds = 0.0
         item.message = f"Diagnostics: {diagnostics.path}"
         _notify_item(on_item_update, index, item)
         diagnostics.event(
@@ -87,6 +94,7 @@ def run_batch_queue(
 
         def progress_callback(progress: float, message: str) -> None:
             item.progress = progress
+            item.elapsed_seconds = _elapsed_since(item_started_at)
             item.message = message
             _notify_item(on_item_update, index, item)
             queue_progress = (index + progress) / total
@@ -101,6 +109,7 @@ def run_batch_queue(
                     Path(settings.material_directory),
                     lyrics_file=Path(settings.lyrics_file) if settings.lyrics_file else None,
                     work_dir=diagnostics.path.parent / "model_analysis_cache",
+                    compute_device=settings.compute_device,
                     on_progress=progress_callback,
                 )
                 ordered_material_paths = list(ordering.ordered_paths)
@@ -109,6 +118,18 @@ def run_batch_queue(
                     "Model-assisted material ordering completed",
                     report=ordering.analysis_report,
                 )
+                stretch_plan = plan_material_stretch_clips(
+                    item.input_path,
+                    ordered_material_paths,
+                    target_durations=ordering.target_durations,
+                )
+                diagnostics.event(
+                    "render.stretch_plan",
+                    "Per-material stretch plan prepared",
+                    render_strategy="per_clip_rubberband_then_concat",
+                    quality_warning_count=sum(1 for clip in stretch_plan if clip.quality_warning),
+                    clips=render_material_stretch_plan(stretch_plan),
+                )
                 if settings.daw_timeline_export:
                     export_daw_timeline_with_progress(
                         item.input_path,
@@ -116,6 +137,7 @@ def run_batch_queue(
                         item.output_path,
                         options,
                         material_paths=ordered_material_paths,
+                        target_durations=ordering.target_durations,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                     )
@@ -126,6 +148,7 @@ def run_batch_queue(
                         item.output_path,
                         options,
                         material_paths=ordered_material_paths,
+                        material_target_durations=ordering.target_durations,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                     )
@@ -136,8 +159,14 @@ def run_batch_queue(
                     should_cancel=should_cancel,
                 )
         except AudioProcessorError as exc:
+            item.elapsed_seconds = _elapsed_since(item_started_at)
             if str(exc) == "Processing cancelled":
-                diagnostics.event("batch.item.cancelled", "Processing cancelled by user")
+                diagnostics.event(
+                    "batch.item.cancelled",
+                    "Processing cancelled by user",
+                    elapsed_seconds=item.elapsed_seconds,
+                    total_elapsed_seconds=_elapsed_since(batch_started_at),
+                )
                 item.status = "Cancelled"
                 item.message = _message_with_diagnostics(str(exc), diagnostics)
                 item.progress = 0.0
@@ -146,7 +175,12 @@ def run_batch_queue(
                 cancelled += _mark_remaining_cancelled(items, index + 1, on_item_update)
                 break
 
-            diagnostics.error("batch.item.failed", exc)
+            diagnostics.error(
+                "batch.item.failed",
+                exc,
+                elapsed_seconds=item.elapsed_seconds,
+                total_elapsed_seconds=_elapsed_since(batch_started_at),
+            )
             item.status = "Failed"
             item.message = _message_with_diagnostics(str(exc), diagnostics)
             item.progress = 0.0
@@ -155,7 +189,13 @@ def run_batch_queue(
             _notify_queue(on_queue_progress, (index + 1) / total, f"{index + 1}/{total}: failed")
             continue
         except Exception as exc:
-            diagnostics.error("batch.item.unexpected_failed", exc)
+            item.elapsed_seconds = _elapsed_since(item_started_at)
+            diagnostics.error(
+                "batch.item.unexpected_failed",
+                exc,
+                elapsed_seconds=item.elapsed_seconds,
+                total_elapsed_seconds=_elapsed_since(batch_started_at),
+            )
             item.status = "Failed"
             item.message = _message_with_diagnostics(f"Unexpected error: {exc}", diagnostics)
             item.progress = 0.0
@@ -164,7 +204,13 @@ def run_batch_queue(
             _notify_queue(on_queue_progress, (index + 1) / total, f"{index + 1}/{total}: failed")
             continue
 
-        diagnostics.event("batch.item.completed", "Queued item completed")
+        item.elapsed_seconds = _elapsed_since(item_started_at)
+        diagnostics.event(
+            "batch.item.completed",
+            "Queued item completed",
+            elapsed_seconds=item.elapsed_seconds,
+            total_elapsed_seconds=_elapsed_since(batch_started_at),
+        )
         item.status = "Done"
         item.progress = 1.0
         item.message = _message_with_diagnostics("Complete", diagnostics)
@@ -202,6 +248,10 @@ def _notify_queue(callback: QueueCallback | None, progress: float, message: str)
         callback(progress, message)
 
 
+def _elapsed_since(started_at: float) -> float:
+    return round(max(time.monotonic() - started_at, 0.0), 3)
+
+
 def _processing_mode(settings: ProcessingSettings) -> str:
     if settings.material_directory and settings.daw_timeline_export:
         return "model_assisted_daw_timeline_export"
@@ -215,27 +265,48 @@ def _log_input_diagnostics(
     reference_path: Path,
     settings: ProcessingSettings,
 ) -> None:
-    diagnostics.event(
-        "inputs.reference",
-        "Reference audio metadata collected",
-        reference=_audio_metadata_digest(reference_path),
-    )
+    reference_digest, reference_error = _safe_audio_metadata_digest(reference_path)
+    if reference_digest is not None:
+        diagnostics.event(
+            "inputs.reference",
+            "Reference audio metadata collected",
+            reference=reference_digest,
+        )
+    else:
+        diagnostics.event(
+            "inputs.reference.metadata_failed",
+            "Reference audio metadata could not be collected; rendering will continue to the processing stage",
+            level="warning",
+            reference_path=reference_path,
+            error=reference_error,
+        )
 
     if not settings.material_directory:
         return
 
     material_dir = Path(settings.material_directory)
     material_paths = list_audio_files(material_dir)
-    material_digests = [_audio_metadata_digest(path) for path in material_paths]
+    material_digests: list[dict[str, Any]] = []
+    material_failures: list[dict[str, str]] = []
+    for path in material_paths:
+        digest, error = _safe_audio_metadata_digest(path)
+        if digest is not None:
+            material_digests.append(digest)
+        else:
+            material_failures.append({"path": str(path.expanduser()), "error": error or "unknown error"})
+
     diagnostics.event(
         "inputs.materials",
         "Material audio metadata collected",
         material_directory=material_dir,
         material_count=len(material_paths),
+        metadata_count=len(material_digests),
+        metadata_failure_count=len(material_failures),
         total_duration_seconds=sum(
             float(digest.get("duration_seconds") or 0.0) for digest in material_digests
         ),
         materials=material_digests,
+        metadata_failures=material_failures,
     )
 
     if settings.lyrics_file:
@@ -265,6 +336,13 @@ def _audio_metadata_digest(path: Path) -> dict[str, Any]:
         "sample_rate": audio_stream.get("sample_rate"),
         "channels": audio_stream.get("channels"),
     }
+
+
+def _safe_audio_metadata_digest(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        return _audio_metadata_digest(path), None
+    except AudioProcessorError as exc:
+        return None, str(exc)
 
 
 def _message_with_diagnostics(message: str, diagnostics: DiagnosticLogger) -> str:

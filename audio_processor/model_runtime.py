@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 import contextlib
 import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,7 +17,13 @@ from typing import Any, Callable, Iterable, Sequence
 from xml.etree import ElementTree
 
 from .engine import AudioProcessorError, get_audio_duration_seconds, list_audio_files, probe_audio
-from .model_assist import MaterialAnalysis, VoiceSegment, list_model_candidates, order_materials_for_reference
+from .model_assist import (
+    MaterialAnalysis,
+    MaterialOrderDecision,
+    VoiceSegment,
+    list_model_candidates,
+    order_materials_for_reference,
+)
 from .settings import get_config_dir
 
 
@@ -72,11 +80,14 @@ class OrderingDecision:
     source_path: Path
     score: float
     transcript_score: float
+    filename_score: float
+    duration_score: float
     speaker_score: float
     vad_score: float
     reference_text: str
     material_text: str
     reason: str
+    target_duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +95,7 @@ class ModelOrderingResult:
     reference: ReferenceAnalysis
     library: MaterialLibraryAnalysis
     ordered_paths: tuple[Path, ...]
+    target_durations: tuple[float | None, ...]
     decisions: tuple[OrderingDecision, ...]
     analysis_report: dict[str, Any]
 
@@ -91,6 +103,7 @@ class ModelOrderingResult:
 DEFAULT_ASR_MODEL = os.environ.get("VOCAL_PROCESS_ASR_MODEL", "base")
 DEFAULT_DEVICE = "cpu"
 DEFAULT_COMPUTE_TYPE = "int8"
+MATERIAL_CACHE_FILE = ".vocalprocess_material_cache.json"
 PYANNOTE_DIA_MODEL = "pyannote/speaker-diarization-community-1"
 SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
@@ -101,21 +114,24 @@ def build_model_ordering(
     *,
     lyrics_file: Path | None = None,
     work_dir: Path | None = None,
+    compute_device: str = "auto",
     on_progress: ProgressCallback | None = None,
 ) -> ModelOrderingResult:
     work_root = _prepare_work_root(work_dir)
+    device = _resolve_compute_device(compute_device)
     material_directory = material_directory.expanduser()
     material_paths = list_audio_files(material_directory)
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
 
-    notes: list[str] = []
+    notes: list[str] = [f"compute device resolved: {device}"]
     backend_summary = backend_availability()
     _notify_progress(on_progress, 0.02, "Preparing reference analysis")
     reference = analyze_reference(
         reference_path,
         lyrics_file=lyrics_file,
         work_dir=work_root,
+        compute_device=device,
         on_progress=on_progress,
         notes=notes,
     )
@@ -124,6 +140,7 @@ def build_model_ordering(
     library = analyze_material_library(
         material_directory,
         work_dir=work_root,
+        compute_device=device,
         on_progress=on_progress,
         notes=notes,
     )
@@ -152,6 +169,7 @@ def build_model_ordering(
                 )
                 for segment in analysis.segments
             ),
+            filename_text=_filename_text_hint(analysis.path),
             speaker_embedding=analysis.speaker_embedding,
             vad_coverage=_vad_coverage(analysis.vad_segments, analysis.duration_seconds),
             duration_seconds=analysis.duration_seconds,
@@ -166,24 +184,37 @@ def build_model_ordering(
         reference_embedding=reference.speaker_embedding,
     )
     ordered_paths = tuple(decision.material_path for decision in decisions)
+    target_durations = _target_durations_for_decisions(
+        reference_segments,
+        decisions,
+        reference_duration=reference_duration_for(reference.source_path),
+    )
 
     report = {
         "format": "vocal_process_model_ordering_v1",
+        "compute_device": device,
         "reference": render_reference_analysis(reference),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
+        "material_cache": {
+            "path": str(material_directory / MATERIAL_CACHE_FILE),
+            "notes": [note for note in library.notes if "material analysis cache" in note],
+        },
         "ordering": [
             {
                 "rank": decision.rank,
                 "material_path": str(decision.material_path),
                 "score": decision.score,
                 "transcript_score": decision.transcript_score,
+                "filename_score": decision.filename_score,
+                "duration_score": decision.duration_score,
                 "speaker_score": decision.speaker_score,
                 "vad_score": decision.vad_score,
                 "reference_text": decision.reference_text,
                 "material_text": decision.material_text,
                 "reason": decision.reason,
+                "target_duration_seconds": target_durations[index],
             }
-            for decision in decisions
+            for index, decision in enumerate(decisions)
         ],
         "backend_summary": backend_summary,
         "notes": notes,
@@ -193,19 +224,23 @@ def build_model_ordering(
         reference=reference,
         library=library,
         ordered_paths=ordered_paths,
+        target_durations=target_durations,
         decisions=tuple(
             OrderingDecision(
                 rank=decision.rank,
                 source_path=decision.material_path,
                 score=decision.score,
                 transcript_score=decision.transcript_score,
+                filename_score=decision.filename_score,
+                duration_score=decision.duration_score,
                 speaker_score=decision.speaker_score,
                 vad_score=decision.vad_score,
                 reference_text=decision.reference_text,
                 material_text=decision.material_text,
                 reason=decision.reason,
+                target_duration_seconds=target_durations[index],
             )
-            for decision in decisions
+            for index, decision in enumerate(decisions)
         ),
         analysis_report=report,
     )
@@ -216,6 +251,7 @@ def analyze_reference(
     *,
     lyrics_file: Path | None = None,
     work_dir: Path | None = None,
+    compute_device: str = DEFAULT_DEVICE,
     on_progress: ProgressCallback | None = None,
     notes: list[str] | None = None,
 ) -> ReferenceAnalysis:
@@ -224,9 +260,14 @@ def analyze_reference(
     if not normalized_reference.exists():
         raise AudioProcessorError(f"Reference audio does not exist: {normalized_reference}")
 
-    vocal_path = _maybe_separate_vocals(normalized_reference, work_dir=work_dir, notes=notes)
-    transcript_result = _transcribe_audio(vocal_path, work_dir=work_dir)
-    reference_embedding = _speaker_embedding(vocal_path, work_dir=work_dir)
+    vocal_path = _maybe_separate_vocals(
+        normalized_reference,
+        work_dir=work_dir,
+        compute_device=compute_device,
+        notes=notes,
+    )
+    transcript_result = _transcribe_audio(vocal_path, work_dir=work_dir, compute_device=compute_device)
+    reference_embedding = _speaker_embedding(vocal_path, work_dir=work_dir, compute_device=compute_device)
     segments = _segments_from_transcript(transcript_result["segments"], lyrics_file=lyrics_file)
     if not segments:
         segments = (
@@ -254,22 +295,36 @@ def analyze_material_library(
     material_directory: Path,
     *,
     work_dir: Path | None = None,
+    compute_device: str = DEFAULT_DEVICE,
     on_progress: ProgressCallback | None = None,
     notes: list[str] | None = None,
 ) -> MaterialLibraryAnalysis:
     notes = notes if notes is not None else []
+    material_directory = material_directory.expanduser()
     material_paths = list_audio_files(material_directory)
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
+
+    cache_path = material_directory / MATERIAL_CACHE_FILE
+    snapshot = _material_snapshot(material_paths)
+    cached_library = _load_material_library_cache(
+        cache_path,
+        material_directory=material_directory,
+        snapshot=snapshot,
+    )
+    if cached_library is not None:
+        notes.append(f"material analysis cache reused: {cache_path}")
+        _notify_progress(on_progress, 0.9, "Material analysis cache reused")
+        return cached_library
 
     analyses: list[AudioAnalysis] = []
     total = len(material_paths)
     for index, path in enumerate(material_paths):
         progress = 0.25 + ((index + 1) / max(total, 1)) * 0.65
         _notify_progress(on_progress, progress, f"Analyzing material {index + 1}/{total}: {path.name}")
-        transcript_result = _transcribe_audio(path, work_dir=work_dir)
-        vad_segments = _detect_vad_segments(path)
-        speaker_embedding = _speaker_embedding(path, work_dir=work_dir)
+        transcript_result = _transcribe_audio(path, work_dir=work_dir, compute_device=compute_device)
+        vad_segments = _detect_vad_segments(path, compute_device=compute_device)
+        speaker_embedding = _speaker_embedding(path, work_dir=work_dir, compute_device=compute_device)
         duration = get_audio_duration_seconds(probe_audio(path))
         analyses.append(
             AudioAnalysis(
@@ -293,11 +348,23 @@ def analyze_material_library(
             )
         )
 
-    return MaterialLibraryAnalysis(
+    library = MaterialLibraryAnalysis(
         material_directory=material_directory.expanduser(),
         materials=tuple(analyses),
         backend_summary=backend_availability(),
         notes=tuple(notes),
+    )
+    cache_written = _write_material_library_cache(cache_path, library=library, snapshot=snapshot)
+    updated_notes = list(notes)
+    if cache_written:
+        updated_notes.append(f"material analysis cache updated: {cache_path}")
+    else:
+        updated_notes.append(f"material analysis cache could not be updated: {cache_path}")
+    return MaterialLibraryAnalysis(
+        material_directory=library.material_directory,
+        materials=library.materials,
+        backend_summary=library.backend_summary,
+        notes=tuple(updated_notes),
     )
 
 
@@ -325,6 +392,7 @@ def render_reference_analysis(reference: ReferenceAnalysis) -> dict[str, Any]:
 def render_material_analysis(analysis: AudioAnalysis) -> dict[str, Any]:
     return {
         "path": str(analysis.path),
+        "filename_text": _filename_text_hint(analysis.path),
         "duration_seconds": analysis.duration_seconds,
         "backend": analysis.analysis_source,
         "transcript": analysis.transcript,
@@ -351,13 +419,17 @@ def backend_availability() -> dict[str, bool]:
     }
 
 
-def get_model_runtime_report() -> list[str]:
+def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
     cache_root = _model_cache_root()
     availability = backend_availability()
+    resolved_device = _resolve_compute_device(compute_device)
     lines = [
         "Model runtime: local pretrained models",
         f"Model cache: {cache_root}",
         "Online inference billing: not used",
+        f"Requested compute device: {compute_device}",
+        f"Resolved compute device: {resolved_device}",
+        f"CUDA available: {_torch_cuda_available()}",
     ]
     for name in ("Demucs", "OpenAI Whisper", "Silero VAD", "SpeechBrain", "WhisperX", "pyannote.audio"):
         status = "available" if availability.get(name) else "not installed"
@@ -535,7 +607,13 @@ def _try_word_com_text(path: Path) -> str:
             pass
 
 
-def _maybe_separate_vocals(path: Path, *, work_dir: Path | None = None, notes: list[str]) -> Path:
+def _maybe_separate_vocals(
+    path: Path,
+    *,
+    work_dir: Path | None = None,
+    compute_device: str = DEFAULT_DEVICE,
+    notes: list[str],
+) -> Path:
     if not _module_available("demucs"):
         notes.append("demucs unavailable; using original reference audio")
         return path
@@ -560,6 +638,8 @@ def _maybe_separate_vocals(path: Path, *, work_dir: Path | None = None, notes: l
         "vocals",
         "-n",
         "htdemucs",
+        "-d",
+        compute_device,
         "--out",
         str(separated_root),
         str(path),
@@ -587,29 +667,35 @@ def _maybe_separate_vocals(path: Path, *, work_dir: Path | None = None, notes: l
     return path
 
 
-def _transcribe_audio(path: Path, *, work_dir: Path | None = None) -> dict[str, Any]:
+def _transcribe_audio(
+    path: Path,
+    *,
+    work_dir: Path | None = None,
+    compute_device: str = DEFAULT_DEVICE,
+) -> dict[str, Any]:
     work_root = _prepare_work_root(work_dir)
+    device = _resolve_compute_device(compute_device)
     if _module_available("whisperx"):
         try:
             import whisperx  # type: ignore
 
             model = whisperx.load_model(
                 DEFAULT_ASR_MODEL,
-                DEFAULT_DEVICE,
-                compute_type=DEFAULT_COMPUTE_TYPE,
+                device,
+                compute_type=_compute_type_for_device(device),
                 download_root=str(_model_cache_root() / "whisperx"),
             )
             audio = whisperx.load_audio(str(path))
             result = model.transcribe(audio, batch_size=4)
             align_model, metadata = whisperx.load_align_model(
-                language_code=result["language"], device=DEFAULT_DEVICE
+                language_code=result["language"], device=device
             )
             aligned = whisperx.align(
                 result["segments"],
                 align_model,
                 metadata,
                 audio,
-                DEFAULT_DEVICE,
+                device,
                 return_char_alignments=False,
             )
             segments = [
@@ -627,15 +713,26 @@ def _transcribe_audio(path: Path, *, work_dir: Path | None = None) -> dict[str, 
             return {"backend": "whisperx", "text": text, "segments": segments, "notes": []}
         except Exception as exc:
             # Fall through to Whisper if WhisperX is unavailable or fails on a specific file.
-            return _transcribe_with_whisper(path, work_dir=work_root, fallback_note=f"whisperx failed: {exc}")
+            return _transcribe_with_whisper(
+                path,
+                work_dir=work_root,
+                compute_device=device,
+                fallback_note=f"whisperx failed: {exc}",
+            )
 
-    return _transcribe_with_whisper(path, work_dir=work_root, fallback_note="whisperx unavailable")
+    return _transcribe_with_whisper(
+        path,
+        work_dir=work_root,
+        compute_device=device,
+        fallback_note="whisperx unavailable",
+    )
 
 
 def _transcribe_with_whisper(
     path: Path,
     *,
     work_dir: Path,
+    compute_device: str,
     fallback_note: str,
 ) -> dict[str, Any]:
     if not _module_available("whisper"):
@@ -647,8 +744,13 @@ def _transcribe_with_whisper(
     try:
         import whisper  # type: ignore
 
-        model = whisper.load_model(DEFAULT_ASR_MODEL, download_root=str(_model_cache_root() / "whisper"))
-        result = model.transcribe(str(path), fp16=False, verbose=None)
+        device = _resolve_compute_device(compute_device)
+        model = whisper.load_model(
+            DEFAULT_ASR_MODEL,
+            device=device,
+            download_root=str(_model_cache_root() / "whisper"),
+        )
+        result = model.transcribe(str(path), fp16=device == "cuda", verbose=None)
         segments = [
             TranscriptSegment(
                 start_seconds=float(segment.get("start", 0.0) or 0.0),
@@ -667,13 +769,17 @@ def _transcribe_with_whisper(
         raise AudioProcessorError(f"Whisper transcription failed for {path}: {exc}") from exc
 
 
-def _detect_vad_segments(path: Path) -> tuple[tuple[float, float], ...]:
+def _detect_vad_segments(
+    path: Path,
+    *,
+    compute_device: str = DEFAULT_DEVICE,
+) -> tuple[tuple[float, float], ...]:
     pyannote_segments = _detect_pyannote_segments(path)
     if pyannote_segments:
         return pyannote_segments
 
     if not _module_available("silero_vad"):
-        torch_hub_segments = _detect_vad_segments_with_torch_hub(path)
+        torch_hub_segments = _detect_vad_segments_with_torch_hub(path, compute_device=compute_device)
         if torch_hub_segments:
             return torch_hub_segments
         return ((0.0, get_audio_duration_seconds(probe_audio(path))),)
@@ -681,8 +787,13 @@ def _detect_vad_segments(path: Path) -> tuple[tuple[float, float], ...]:
     try:
         from silero_vad import get_speech_timestamps, load_silero_vad, read_audio  # type: ignore
 
+        device = _resolve_compute_device(compute_device)
         model = load_silero_vad()
+        if device == "cuda" and hasattr(model, "to"):
+            model = model.to(device)
         wav = read_audio(str(path))
+        if device == "cuda" and hasattr(wav, "to"):
+            wav = wav.to(device)
         timestamps = get_speech_timestamps(wav, model, return_seconds=True)
         segments = []
         for entry in timestamps:
@@ -719,7 +830,11 @@ def _detect_pyannote_segments(path: Path) -> tuple[tuple[float, float], ...]:
         return ()
 
 
-def _detect_vad_segments_with_torch_hub(path: Path) -> tuple[tuple[float, float], ...]:
+def _detect_vad_segments_with_torch_hub(
+    path: Path,
+    *,
+    compute_device: str = DEFAULT_DEVICE,
+) -> tuple[tuple[float, float], ...]:
     if not _module_available("torch"):
         return ()
 
@@ -745,7 +860,12 @@ def _detect_vad_segments_with_torch_hub(path: Path) -> tuple[tuple[float, float]
                 trust_repo=True,
             )
         get_speech_timestamps, _, read_audio, _, _ = utils
+        device = _resolve_compute_device(compute_device)
+        if device == "cuda" and hasattr(model, "to"):
+            model = model.to(device)
         wav = read_audio(str(path))
+        if device == "cuda" and hasattr(wav, "to"):
+            wav = wav.to(device)
         timestamps = get_speech_timestamps(wav, model, return_seconds=True)
         segments = []
         for entry in timestamps:
@@ -758,7 +878,12 @@ def _detect_vad_segments_with_torch_hub(path: Path) -> tuple[tuple[float, float]
         return ()
 
 
-def _speaker_embedding(path: Path, *, work_dir: Path | None = None) -> tuple[float, ...] | None:
+def _speaker_embedding(
+    path: Path,
+    *,
+    work_dir: Path | None = None,
+    compute_device: str = DEFAULT_DEVICE,
+) -> tuple[float, ...] | None:
     if not _module_available("speechbrain"):
         return None
 
@@ -771,19 +896,135 @@ def _speaker_embedding(path: Path, *, work_dir: Path | None = None) -> tuple[flo
         if not _speechbrain_model_cached(savedir) and os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") != "1":
             return None
 
+        device = _resolve_compute_device(compute_device)
         classifier = EncoderClassifier.from_hparams(
             source=SPEAKER_EMBEDDING_MODEL,
             savedir=str(savedir),
+            run_opts={"device": device},
         )
         waveform = read_audio(str(path))
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
+        waveform = waveform.to(device)
         with torch.no_grad():
             embedding = classifier.encode_batch(waveform)
         vector = embedding.squeeze().detach().cpu().flatten().tolist()
         return tuple(float(value) for value in vector)
     except Exception:
         return None
+
+
+def _material_snapshot(material_paths: Sequence[Path]) -> list[dict[str, Any]]:
+    snapshot: list[dict[str, Any]] = []
+    for path in material_paths:
+        expanded = path.expanduser()
+        stat = expanded.stat()
+        snapshot.append(
+            {
+                "path": str(expanded),
+                "name": expanded.name,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "suffix": expanded.suffix.lower(),
+            }
+        )
+    return snapshot
+
+
+def _load_material_library_cache(
+    cache_path: Path,
+    *,
+    material_directory: Path,
+    snapshot: Sequence[dict[str, Any]],
+) -> MaterialLibraryAnalysis | None:
+    if not cache_path.exists():
+        return None
+
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("format") != "vocal_process_material_cache_v1":
+        return None
+    if raw.get("asr_model") != DEFAULT_ASR_MODEL:
+        return None
+    if raw.get("snapshot") != list(snapshot):
+        return None
+
+    materials = raw.get("materials")
+    if not isinstance(materials, list) or len(materials) != len(snapshot):
+        return None
+
+    analyses = [_audio_analysis_from_cache(entry) for entry in materials if isinstance(entry, dict)]
+    if len(analyses) != len(snapshot):
+        return None
+
+    return MaterialLibraryAnalysis(
+        material_directory=material_directory,
+        materials=tuple(analyses),
+        backend_summary=backend_availability(),
+        notes=(f"material analysis cache reused: {cache_path}",),
+    )
+
+
+def _write_material_library_cache(
+    cache_path: Path,
+    *,
+    library: MaterialLibraryAnalysis,
+    snapshot: Sequence[dict[str, Any]],
+) -> bool:
+    payload = {
+        "format": "vocal_process_material_cache_v1",
+        "asr_model": DEFAULT_ASR_MODEL,
+        "snapshot": list(snapshot),
+        "materials": [render_material_analysis(analysis) for analysis in library.materials],
+    }
+    try:
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _audio_analysis_from_cache(data: dict[str, Any]) -> AudioAnalysis:
+    segments = tuple(
+        TranscriptSegment(
+            start_seconds=float(segment.get("start_seconds", 0.0) or 0.0),
+            end_seconds=float(segment.get("end_seconds", 0.0) or 0.0),
+            text=str(segment.get("text", "") or ""),
+            confidence=_optional_float(segment.get("confidence")),
+            speaker_id=_optional_string(segment.get("speaker_id")),
+        )
+        for segment in data.get("segments", [])
+        if isinstance(segment, dict)
+    )
+    vad_segments = tuple(
+        (
+            float(segment.get("start", 0.0) or 0.0),
+            float(segment.get("end", 0.0) or 0.0),
+        )
+        for segment in data.get("vad_segments", [])
+        if isinstance(segment, dict)
+    )
+    embedding_raw = data.get("speaker_embedding")
+    speaker_embedding = (
+        tuple(float(value) for value in embedding_raw)
+        if isinstance(embedding_raw, list)
+        else None
+    )
+    return AudioAnalysis(
+        path=Path(str(data.get("path") or "")),
+        duration_seconds=float(data.get("duration_seconds", 0.0) or 0.0),
+        transcript=str(data.get("transcript") or ""),
+        segments=segments,
+        vad_segments=vad_segments,
+        speaker_embedding=speaker_embedding,
+        analysis_source=str(data.get("backend") or "cache"),
+        notes=tuple(str(note) for note in data.get("notes", []) if isinstance(note, str)),
+    )
 
 
 def _speechbrain_model_cached(savedir: Path) -> bool:
@@ -844,10 +1085,123 @@ def reference_duration_for(path: Path) -> float:
     return get_audio_duration_seconds(probe_audio(path))
 
 
+def _target_durations_for_decisions(
+    reference_segments: Sequence[VoiceSegment],
+    decisions: Sequence[MaterialOrderDecision],
+    *,
+    reference_duration: float,
+) -> tuple[float | None, ...]:
+    if not decisions:
+        return ()
+    if reference_duration <= 0:
+        return tuple(None for _ in decisions)
+
+    normalized_reference_texts = {
+        _compact_bridge_text(decision.reference_text)
+        for decision in decisions
+        if decision.reference_text.strip()
+    }
+    if len(decisions) > 1 and len(normalized_reference_texts) <= 1:
+        return _weighted_target_durations(decisions, reference_duration=reference_duration)
+
+    targets: list[float | None] = [None for _ in decisions]
+    used_segments: set[int] = set()
+    for decision_index, decision in enumerate(decisions):
+        decision_text = _compact_bridge_text(decision.reference_text)
+        if not decision_text:
+            continue
+        for segment_index, segment in enumerate(reference_segments):
+            if segment_index in used_segments:
+                continue
+            if segment.duration_seconds <= 0:
+                continue
+            if _compact_bridge_text(segment.text) != decision_text:
+                continue
+            targets[decision_index] = segment.duration_seconds
+            used_segments.add(segment_index)
+            break
+
+    if any(target is not None for target in targets):
+        return tuple(targets)
+    return _weighted_target_durations(decisions, reference_duration=reference_duration)
+
+
+def _weighted_target_durations(
+    decisions: Sequence[MaterialOrderDecision],
+    *,
+    reference_duration: float,
+) -> tuple[float | None, ...]:
+    weights = [_decision_text_weight(decision) for decision in decisions]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return tuple(None for _ in decisions)
+    return tuple(reference_duration * (weight / total_weight) for weight in weights)
+
+
+def _decision_text_weight(decision: MaterialOrderDecision) -> float:
+    text = decision.material_text or decision.material_path.stem
+    units = re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", text.lower())
+    return float(max(len(units), 1))
+
+
+def _compact_bridge_text(text: str) -> str:
+    units = re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", text.lower())
+    return "".join(units)
+
+
 def _prepare_work_root(work_dir: Path | None) -> Path:
     root = (work_dir or Path(tempfile.gettempdir()) / "vocal_process_model_cache").expanduser()
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _resolve_compute_device(requested: str | None) -> str:
+    normalized = str(requested or "auto").strip().lower()
+    if normalized == "cuda":
+        return "cuda" if _torch_cuda_available() else DEFAULT_DEVICE
+    if normalized == "cpu":
+        return DEFAULT_DEVICE
+    if normalized == "auto":
+        return "cuda" if _torch_cuda_available() else DEFAULT_DEVICE
+    return DEFAULT_DEVICE
+
+
+def _compute_type_for_device(device: str) -> str:
+    return "float16" if device == "cuda" else DEFAULT_COMPUTE_TYPE
+
+
+def _torch_cuda_available() -> bool:
+    if not _module_available("torch"):
+        return False
+    try:
+        import torch  # type: ignore
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _filename_text_hint(path: Path) -> str:
+    text = path.stem
+    text = text.replace("_", " ").replace("-", " ")
+    text = " ".join(part for part in text.split() if not part.isdigit())
+    return text.strip()
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _model_cache_root() -> Path:
