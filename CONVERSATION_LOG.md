@@ -1,7 +1,7 @@
 # Conversation Log
 
 > Project path: `C:\Users\WIN11\demo`
-> Current working branch: `codex/material-stretch-assembly`
+> Current working branch: `codex/runtime-env-uvr-worker`
 
 ## 2026-07-23
 
@@ -49,7 +49,31 @@
 2. 后续会话内容记录在本文件中。
 3. 每次修改项目文件前，先创建新的 Git 分支。
 4. 用户是第一次进行 vibe coding；在涉及 Git、分支、提交、远程仓库等流程时，需要主动提醒更标准的做法。
-5. 用户目前没有 GitHub 个人账号，因此当前流程默认只使用本地 Git；远程备份和协作发布之后再处理。
+5. 用户现在已有 GitHub 账号；做出重大修改并完成验证后，应自动提交并推送 GitHub 线上仓库，除非用户明确要求只保留本地修改。
+6. 分支晋升规则：新工作分支完成并验证后，不长期停留为普通 feature 分支；应先把当前 `main` 备份为单独归档/备份分支，再用完成的新分支替换 `main`，并推送备份分支、新 `main` 和工作分支。若替换 `main` 不能快进完成，必须先明确 force-push 风险。
+7. 项目基础规则集中记录在 `PROJECT_RULES.md`；后续接手项目时应先阅读该文件和本日志。
+
+## 2026-07-26: Project Branch Promotion Rule
+
+### User
+
+指出之前遗漏了一条基础规则：每次建立新分支时，完成后应使用新分支替换主分支；原本的主分支需要备份到另一个分支；新的分支名留作下一次主分支更新后的备份分支依据。要求将这条写入项目基础规则。
+
+### Assistant Notes
+
+1. 新增 `PROJECT_RULES.md`，记录项目长期基础规则。
+2. 在本日志的 Standing Rules 中加入分支晋升规则。
+3. 当前 `codex/runtime-env-uvr-worker` 是 `main` 的后续提交，可以快进替换 `main`，不需要强推。
+
+### User Follow-Up
+
+要求删除“用户目前没有 GitHub 个人账号”的长期规则，因为现在已经有 GitHub 账号；同时要求重大修改时自动进行 GitHub 线上仓库修改。
+
+### Assistant Notes
+
+1. Standing Rules 已更新为：重大修改完成并验证后自动提交并推送 GitHub，除非用户明确要求只保留本地修改。
+2. `PROJECT_RULES.md` 已同步加入 GitHub 自动推送规则。
+3. 历史对话中“当时没有 GitHub 账号”的原始事实保留为历史记录，不再作为当前长期规则。
 
 ### User
 

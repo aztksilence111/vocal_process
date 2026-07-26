@@ -1,5 +1,9 @@
 # Project Analysis
 
+## Standing Project Rules
+
+The durable project rules are maintained in `PROJECT_RULES.md`. In particular, completed work branches should replace `main` after verification, while the previous `main` is backed up to a separate archive/backup branch first. Major verified changes should be committed and pushed to GitHub automatically unless the user explicitly asks to keep them local.
+
 ## 2026-07-23: Python and FFmpeg Environment Setup
 
 ### Goal
