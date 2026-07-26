@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -136,6 +137,7 @@ def export_daw_timeline_with_progress(
     )
 
     rendered_clips: list[DawTimelineClip] = []
+    rendered_cache: dict[tuple[object, ...], Path] = {}
     total_steps = len(plan.clips) + 1
     for clip in plan.clips:
         if should_cancel is not None and should_cancel():
@@ -162,15 +164,28 @@ def export_daw_timeline_with_progress(
                 f"Exporting DAW clip {clip.index}/{len(plan.clips)}: {message}",
             )
 
-        process_material_clip_with_progress(
-            clip.source_path,
-            clip.rendered_path,
-            clip.tempo,
-            clip_options,
-            target_duration=clip.target_duration_seconds,
-            on_progress=clip_progress,
-            should_cancel=should_cancel,
-        )
+        cache_key = _clip_render_cache_key(clip, clip_options)
+        cached_render = rendered_cache.get(cache_key)
+        if cached_render is not None and cached_render.exists():
+            if clip.rendered_path.exists() and not options.overwrite:
+                raise AudioProcessorError(f"DAW clip already exists: {clip.rendered_path}")
+            shutil.copyfile(cached_render, clip.rendered_path)
+            _notify_progress(
+                on_progress,
+                clip.index / total_steps,
+                f"Reused rendered DAW clip {clip.index}/{len(plan.clips)}",
+            )
+        else:
+            process_material_clip_with_progress(
+                clip.source_path,
+                clip.rendered_path,
+                clip.tempo,
+                clip_options,
+                target_duration=clip.target_duration_seconds,
+                on_progress=clip_progress,
+                should_cancel=should_cancel,
+            )
+            rendered_cache[cache_key] = clip.rendered_path
 
         actual_duration = get_audio_duration_seconds(probe_audio(clip.rendered_path))
         rendered_clips.append(
@@ -354,6 +369,25 @@ def _clip_file_name(index: int, path: Path, used_names: set[str]) -> str:
         name = f"{index:04d}_{stem}.wav"
     used_names.add(name.lower())
     return name
+
+
+def _clip_render_cache_key(clip: DawTimelineClip, options: ProcessOptions) -> tuple[object, ...]:
+    source = clip.source_path.expanduser()
+    stat = source.stat()
+    return (
+        str(source.resolve()),
+        stat.st_size,
+        stat.st_mtime_ns,
+        round(clip.target_duration_seconds, 6),
+        round(clip.tempo, 8),
+        options.gain_db,
+        options.normalize,
+        options.highpass_hz,
+        options.lowpass_hz,
+        options.sample_rate,
+        options.channels,
+        options.codec,
+    )
 
 
 def _safe_stem(value: str) -> str:

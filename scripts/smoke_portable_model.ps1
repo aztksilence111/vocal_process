@@ -2,7 +2,9 @@ param(
     [string]$AppName = "VocalProcess",
     [string]$PortableRoot = "",
     [string]$WorkRoot = "",
-    [int]$MinimumDurationSeconds = 1
+    [int]$MinimumDurationSeconds = 1,
+    [ValidateSet("auto", "always", "never")]
+    [string]$SourceSeparation = "never"
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,6 +85,8 @@ try {
         (Join-Path $OutputRoot "reference.wav"),
         "--material-directory",
         $MaterialsRoot,
+        "--source-separation",
+        $SourceSeparation,
         "--overwrite"
     )
     $Process = Start-Process -FilePath $ExePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
@@ -125,12 +129,27 @@ if ($Duration -lt $MinimumDurationSeconds) {
 }
 
 $DiagnosticsText = Get-Content -LiteralPath $DiagnosticsPath -Raw -Encoding UTF8
-foreach ($Pattern in @("model.ordering.completed", "batch.item.completed", "reference vocals separated with demucs")) {
+foreach ($Pattern in @("model.ordering.completed", "batch.item.completed")) {
     if ($DiagnosticsText -notmatch [regex]::Escape($Pattern)) {
         throw "Diagnostics did not contain expected model stage: $Pattern"
     }
 }
-if ($DiagnosticsText -match "batch.item.failed|demucs separation failed") {
+if ($SourceSeparation -eq "never") {
+    $SkipPattern = "source separation skipped by user setting"
+    if ($DiagnosticsText -notmatch [regex]::Escape($SkipPattern)) {
+        throw "Diagnostics did not contain expected source-separation skip stage: $SkipPattern"
+    }
+}
+else {
+    $Separated = (
+        $DiagnosticsText -match [regex]::Escape("reference vocals separated with uvr headless runner") -or
+        $DiagnosticsText -match [regex]::Escape("reference vocals separated with demucs")
+    )
+    if (-not $Separated) {
+        throw "Diagnostics did not contain a successful UVR or Demucs separation stage"
+    }
+}
+if ($DiagnosticsText -match "batch.item.failed|demucs separation failed|uvr headless runner exited|uvr headless runner timed out") {
     throw "Diagnostics contain a failed processing stage"
 }
 

@@ -80,7 +80,30 @@ Current bridge progress:
 2. `audio-processor vst3-bridge --template` prints a request template.
 3. `audio-processor vst3-bridge request.json --response response.json` runs the same offline batch renderer through a file-based bridge helper.
 4. The bridge defaults `.rpp` requests to DAW timeline export and returns output and diagnostics paths.
-5. This is intentionally offline and non-real-time; the future native VST3 side should call it as a helper process rather than running Python or FFmpeg inside the audio callback.
+5. `audio-processor vst3-bridge --watch <requests> --responses <responses>` runs a persistent helper loop for DAW/native clients.
+6. `audio-processor vst3-bridge --contract` prints the file naming and heartbeat contract.
+7. `native\vst3_bridge` contains a JUCE/MSVC VST3 plug-in that passes audio through unchanged and calls `VocalProcess.exe` for render/analyze work outside the audio callback.
+8. `scripts\build_vst3_bridge.ps1` builds `VocalProcess Bridge.vst3`; `scripts\build_portable.ps1` bundles it under `VocalProcess\plugins` when the VST3 build exists.
+9. This is intentionally offline and non-real-time; the native VST3 side calls a helper process rather than running Python or FFmpeg inside the audio callback.
+10. `native\vst3_probe` and `scripts\probe_vst3_bridge.ps1` provide a headless JUCE host probe that scans and instantiates the generated VST3 bundle.
+11. `scripts\install_vst3_bridge.ps1` installs the bundle into the common 64-bit VST3 folder for host testing.
+12. The VST3 editor and JSON bridge requests expose `source_separation` so a user can skip Demucs when the reference is already isolated vocals.
+13. Portable packaging is split into `VocalProcess-portable.zip` without VST3 and `VocalProcess-portable-vst3.zip` with the native bridge bundle.
+14. The helper runtime is pinned to Python 3.11, while UVR headless separation is isolated in a Python 3.10 worker and reached only through a process boundary.
+
+Host validation status on this machine:
+
+1. JUCE headless probe: passed. The probe found one VST3 description for `VocalProcess Bridge`, instantiated it, and confirmed 2 inputs / 2 outputs.
+2. REAPER 7.33 x64: passed. `scripts\host_test_reaper_vst3.ps1` launched REAPER with an isolated config and confirmed `VocalProcess Bridge (VocalProcess)` in `reaper-vstplugins64.ini`.
+3. FL Studio 2024: partial. The bridge is installed under `C:\Program Files\Common Files\VST3`, and Plugin Manager launches, but no documented non-interactive scan command is available. Final FL registration should be done with Plugin Manager > Find installed plugins rather than editing FL's database files by hand.
+4. Melodyne/Celemony: considered as an import/edit workflow target. This machine has Melodyne Studio 4 / Celemony paths in standard 64-bit locations on `E:\` and additional legacy 32-bit paths, but Melodyne is not used as a generic VST3 host for this bridge. Use exported PCM WAV or DAW timeline output with Melodyne/ARA inside a 64-bit DAW.
+
+Runtime optimization status:
+
+1. Reference analysis caching avoids repeating Demucs/ASR/speaker embedding work for the same reference, lyrics, compute device, ASR backend, and source separation mode.
+2. Loaded ASR/VAD/speaker models are cached inside the helper process.
+3. DAW timeline export reuses exact duplicate stretched clip renders.
+4. Preflight analysis reports repeated text and duplicate render groups as safe review hints.
 
 Risks:
 
@@ -91,7 +114,7 @@ Risks:
 
 ## Immediate Next Work
 
-1. Test the generated `.rpp` in REAPER.
-2. Ask target DAW users which hosts must be supported first.
-3. Add project exporters for confirmed hosts only.
-4. Build a minimal native VST3 prototype that calls the JSON bridge helper.
+1. Run the FL Studio Plugin Manager manual scan and confirm the bridge appears in the verified plug-in database.
+2. Test the bridge in the next available 64-bit hosts from the user list, prioritizing hosts that support normal VST3 scanning.
+3. Keep Melodyne support focused on rendered WAV/DAW timeline handoff unless a current 64-bit Melodyne/ARA SDK path becomes an explicit requirement.
+4. Add project exporters for confirmed hosts only.

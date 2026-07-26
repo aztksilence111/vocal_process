@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import contextlib
+from collections import namedtuple
+import hashlib
 import io
 import json
 import os
@@ -12,6 +15,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from xml.etree import ElementTree
@@ -25,6 +29,13 @@ from .model_assist import (
     order_materials_for_reference,
 )
 from .settings import get_config_dir
+from .uvr_worker import (
+    find_uvr_vocal_output,
+    make_uvr_output_dir,
+    separate_vocals_with_uvr,
+    uvr_cache_fingerprint,
+    uvr_worker_available,
+)
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -104,6 +115,7 @@ DEFAULT_ASR_MODEL = os.environ.get("VOCAL_PROCESS_ASR_MODEL", "base")
 DEFAULT_DEVICE = "cpu"
 DEFAULT_COMPUTE_TYPE = "int8"
 MATERIAL_CACHE_FILE = ".vocalprocess_material_cache.json"
+REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v1"
 PYANNOTE_DIA_MODEL = "pyannote/speaker-diarization-community-1"
 SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
@@ -115,6 +127,7 @@ def build_model_ordering(
     lyrics_file: Path | None = None,
     work_dir: Path | None = None,
     compute_device: str = "auto",
+    source_separation: str = "auto",
     on_progress: ProgressCallback | None = None,
 ) -> ModelOrderingResult:
     work_root = _prepare_work_root(work_dir)
@@ -132,6 +145,7 @@ def build_model_ordering(
         lyrics_file=lyrics_file,
         work_dir=work_root,
         compute_device=device,
+        source_separation=source_separation,
         on_progress=on_progress,
         notes=notes,
     )
@@ -193,6 +207,7 @@ def build_model_ordering(
     report = {
         "format": "vocal_process_model_ordering_v1",
         "compute_device": device,
+        "source_separation": source_separation,
         "reference": render_reference_analysis(reference),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
         "material_cache": {
@@ -252,6 +267,7 @@ def analyze_reference(
     lyrics_file: Path | None = None,
     work_dir: Path | None = None,
     compute_device: str = DEFAULT_DEVICE,
+    source_separation: str = "auto",
     on_progress: ProgressCallback | None = None,
     notes: list[str] | None = None,
 ) -> ReferenceAnalysis:
@@ -260,14 +276,32 @@ def analyze_reference(
     if not normalized_reference.exists():
         raise AudioProcessorError(f"Reference audio does not exist: {normalized_reference}")
 
+    work_root = _prepare_work_root(work_dir)
+    cache_path = _reference_cache_path(work_root, normalized_reference, lyrics_file, compute_device, source_separation)
+    cached = _load_reference_analysis_cache(cache_path, normalized_reference=normalized_reference)
+    if cached is not None:
+        cache_note = f"reference analysis cache reused: {cache_path}"
+        notes.append(cache_note)
+        _notify_progress(on_progress, 0.2, "Reference analysis cache reused")
+        return ReferenceAnalysis(
+            source_path=cached.source_path,
+            vocal_path=cached.vocal_path,
+            transcript=cached.transcript,
+            segments=cached.segments,
+            speaker_embedding=cached.speaker_embedding,
+            backend=cached.backend,
+            notes=tuple([*cached.notes, cache_note]),
+        )
+
     vocal_path = _maybe_separate_vocals(
         normalized_reference,
-        work_dir=work_dir,
+        work_dir=work_root,
         compute_device=compute_device,
+        source_separation=source_separation,
         notes=notes,
     )
-    transcript_result = _transcribe_audio(vocal_path, work_dir=work_dir, compute_device=compute_device)
-    reference_embedding = _speaker_embedding(vocal_path, work_dir=work_dir, compute_device=compute_device)
+    transcript_result = _transcribe_audio(vocal_path, work_dir=work_root, compute_device=compute_device)
+    reference_embedding = _speaker_embedding(vocal_path, work_dir=work_root, compute_device=compute_device)
     segments = _segments_from_transcript(transcript_result["segments"], lyrics_file=lyrics_file)
     if not segments:
         segments = (
@@ -279,8 +313,7 @@ def analyze_reference(
             ),
         )
 
-    _notify_progress(on_progress, 0.2, "Reference analysis complete")
-    return ReferenceAnalysis(
+    reference = ReferenceAnalysis(
         source_path=normalized_reference,
         vocal_path=vocal_path,
         transcript=transcript_result["text"],
@@ -289,6 +322,9 @@ def analyze_reference(
         backend=transcript_result["backend"],
         notes=tuple(notes),
     )
+    _write_reference_analysis_cache(cache_path, reference)
+    _notify_progress(on_progress, 0.2, "Reference analysis complete")
+    return reference
 
 
 def analyze_material_library(
@@ -413,10 +449,15 @@ def render_material_analysis(analysis: AudioAnalysis) -> dict[str, Any]:
 
 
 def backend_availability() -> dict[str, bool]:
-    return {
-        candidate["name"]: _module_available(candidate["optional_dependency"])
-        for candidate in list_model_candidates()
-    }
+    availability: dict[str, bool] = {}
+    for candidate in list_model_candidates():
+        name = candidate["name"]
+        optional_dependency = candidate["optional_dependency"]
+        if name == "UVR Headless Runner":
+            availability[name] = uvr_worker_available()
+        else:
+            availability[name] = _module_available(optional_dependency)
+    return availability
 
 
 def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
@@ -431,7 +472,19 @@ def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
         f"Resolved compute device: {resolved_device}",
         f"CUDA available: {_torch_cuda_available()}",
     ]
-    for name in ("Demucs", "OpenAI Whisper", "Silero VAD", "SpeechBrain", "WhisperX", "pyannote.audio"):
+    for name in (
+        "Demucs",
+        "UVR Headless Runner",
+        "Faster Whisper",
+        "OpenAI Whisper",
+        "Silero VAD",
+        "SpeechBrain",
+        "WhisperX",
+        "pyannote.audio",
+        "whisper.cpp",
+        "Librosa",
+        "MSAF",
+    ):
         status = "available" if availability.get(name) else "not installed"
         lines.append(f"{name}: {status}")
     lines.append(f"Whisper model cached: {_whisper_model_cached()}")
@@ -612,14 +665,46 @@ def _maybe_separate_vocals(
     *,
     work_dir: Path | None = None,
     compute_device: str = DEFAULT_DEVICE,
+    source_separation: str = "auto",
     notes: list[str],
 ) -> Path:
-    if not _module_available("demucs"):
-        notes.append("demucs unavailable; using original reference audio")
+    mode = source_separation if source_separation in {"auto", "always", "never"} else "auto"
+    if mode == "never":
+        notes.append("source separation skipped by user setting; using reference audio as vocals")
         return path
 
     os.environ.setdefault("TORCH_HOME", str(_model_cache_root() / "torch"))
     work_root = _prepare_work_root(work_dir)
+    separator_backend = _source_separator_backend()
+
+    if separator_backend in {"auto", "uvr", "uvr-only"}:
+        uvr_root = make_uvr_output_dir(work_root, path)
+        cached_uvr = find_uvr_vocal_output(uvr_root)
+        if cached_uvr is not None:
+            notes.append(f"reference vocals reused from uvr cache: {cached_uvr}")
+            return cached_uvr
+
+        uvr_candidate = separate_vocals_with_uvr(
+            path,
+            uvr_root,
+            compute_device=compute_device,
+            notes=notes,
+        )
+        if uvr_candidate is not None:
+            return uvr_candidate
+        if separator_backend == "uvr-only":
+            notes.append("uvr-only source separation requested but no vocal stem was produced; using original reference audio")
+            return path
+        if separator_backend == "uvr":
+            notes.append("uvr source separation requested but unavailable or failed; falling back to demucs when available")
+
+    if separator_backend not in {"auto", "uvr", "demucs"}:
+        notes.append(f"unknown source separator backend {separator_backend!r}; falling back to auto")
+
+    if not _module_available("demucs"):
+        notes.append("demucs unavailable; using original reference audio")
+        return path
+
     separated_root = work_root / "demucs"
     separated_root.mkdir(parents=True, exist_ok=True)
     candidate = separated_root / "htdemucs" / path.stem / "vocals.wav"
@@ -675,15 +760,25 @@ def _transcribe_audio(
 ) -> dict[str, Any]:
     work_root = _prepare_work_root(work_dir)
     device = _resolve_compute_device(compute_device)
-    if _module_available("whisperx"):
+    preferred_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower()
+    fallback_notes: list[str] = []
+
+    if preferred_backend in {"auto", "faster-whisper", "faster_whisper"} and _module_available("faster_whisper"):
         try:
+            return _transcribe_with_faster_whisper(path, compute_device=device)
+        except Exception as exc:
+            if preferred_backend in {"faster-whisper", "faster_whisper"}:
+                raise AudioProcessorError(f"Faster Whisper transcription failed for {path}: {exc}") from exc
+            fallback_notes.append(f"faster-whisper failed: {exc}")
+
+    if preferred_backend in {"auto", "whisperx"} and _module_available("whisperx"):
+        try:
+            _prepare_torchaudio_legacy_api()
             import whisperx  # type: ignore
 
-            model = whisperx.load_model(
+            model = _load_whisperx_model(
                 DEFAULT_ASR_MODEL,
                 device,
-                compute_type=_compute_type_for_device(device),
-                download_root=str(_model_cache_root() / "whisperx"),
             )
             audio = whisperx.load_audio(str(path))
             result = model.transcribe(audio, batch_size=4)
@@ -710,22 +805,51 @@ def _transcribe_audio(
                 if str(segment.get("text", "")).strip()
             ]
             text = " ".join(segment.text for segment in segments).strip()
-            return {"backend": "whisperx", "text": text, "segments": segments, "notes": []}
+            return {"backend": "whisperx", "text": text, "segments": segments, "notes": fallback_notes}
         except Exception as exc:
+            if preferred_backend == "whisperx":
+                raise AudioProcessorError(f"WhisperX transcription failed for {path}: {exc}") from exc
             # Fall through to Whisper if WhisperX is unavailable or fails on a specific file.
-            return _transcribe_with_whisper(
-                path,
-                work_dir=work_root,
-                compute_device=device,
-                fallback_note=f"whisperx failed: {exc}",
-            )
+            fallback_notes.append(f"whisperx failed: {exc}")
 
     return _transcribe_with_whisper(
         path,
         work_dir=work_root,
         compute_device=device,
-        fallback_note="whisperx unavailable",
+        fallback_note="; ".join(fallback_notes) if fallback_notes else "accelerated ASR backend unavailable",
     )
+
+
+def _transcribe_with_faster_whisper(
+    path: Path,
+    *,
+    compute_device: str,
+) -> dict[str, Any]:
+    from faster_whisper import WhisperModel  # type: ignore
+
+    device = _resolve_compute_device(compute_device)
+    model = _load_faster_whisper_model(DEFAULT_ASR_MODEL, device, _compute_type_for_device(device))
+    raw_segments, info = model.transcribe(
+        str(path),
+        beam_size=5,
+        vad_filter=True,
+        word_timestamps=False,
+    )
+    segments = [
+        TranscriptSegment(
+            start_seconds=float(getattr(segment, "start", 0.0) or 0.0),
+            end_seconds=float(getattr(segment, "end", 0.0) or 0.0),
+            text=str(getattr(segment, "text", "") or "").strip(),
+            confidence=None,
+            speaker_id=None,
+        )
+        for segment in raw_segments
+        if str(getattr(segment, "text", "") or "").strip()
+    ]
+    text = " ".join(segment.text for segment in segments).strip()
+    language = str(getattr(info, "language", "") or "")
+    notes = [f"language={language}"] if language else []
+    return {"backend": "faster-whisper", "text": text, "segments": segments, "notes": notes}
 
 
 def _transcribe_with_whisper(
@@ -745,11 +869,7 @@ def _transcribe_with_whisper(
         import whisper  # type: ignore
 
         device = _resolve_compute_device(compute_device)
-        model = whisper.load_model(
-            DEFAULT_ASR_MODEL,
-            device=device,
-            download_root=str(_model_cache_root() / "whisper"),
-        )
+        model = _load_openai_whisper_model(DEFAULT_ASR_MODEL, device)
         result = model.transcribe(str(path), fp16=device == "cuda", verbose=None)
         segments = [
             TranscriptSegment(
@@ -788,7 +908,7 @@ def _detect_vad_segments(
         from silero_vad import get_speech_timestamps, load_silero_vad, read_audio  # type: ignore
 
         device = _resolve_compute_device(compute_device)
-        model = load_silero_vad()
+        model = _load_silero_vad_model(device)
         if device == "cuda" and hasattr(model, "to"):
             model = model.to(device)
         wav = read_audio(str(path))
@@ -815,9 +935,7 @@ def _detect_pyannote_segments(path: Path) -> tuple[tuple[float, float], ...]:
         return ()
 
     try:
-        from pyannote.audio import Pipeline  # type: ignore
-
-        pipeline = Pipeline.from_pretrained(PYANNOTE_DIA_MODEL, token=token)
+        pipeline = _load_pyannote_pipeline(token)
         diarization = pipeline(str(path))
         segments: list[tuple[float, float]] = []
         for turn, _, _speaker in diarization.itertracks(yield_label=True):
@@ -846,19 +964,9 @@ def _detect_vad_segments_with_torch_hub(
         torch.hub.set_dir(str(model_root))
         local_repo = model_root / "snakers4_silero-vad_master"
         if local_repo.exists():
-            model, utils = torch.hub.load(
-                repo_or_dir=str(local_repo),
-                model="silero_vad",
-                source="local",
-                trust_repo=True,
-            )
+            model, utils = _load_torch_hub_silero_vad(str(local_repo), "local")
         else:
-            model, utils = torch.hub.load(
-                repo_or_dir="snakers4/silero-vad",
-                model="silero_vad",
-                source="github",
-                trust_repo=True,
-            )
+            model, utils = _load_torch_hub_silero_vad("snakers4/silero-vad", "github")
         get_speech_timestamps, _, read_audio, _, _ = utils
         device = _resolve_compute_device(compute_device)
         if device == "cuda" and hasattr(model, "to"):
@@ -890,18 +998,13 @@ def _speaker_embedding(
     try:
         import torch  # type: ignore
         from speechbrain.dataio.dataio import read_audio  # type: ignore
-        from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
 
         savedir = _model_cache_root() / "speechbrain" / "ecapa"
         if not _speechbrain_model_cached(savedir) and os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") != "1":
             return None
 
         device = _resolve_compute_device(compute_device)
-        classifier = EncoderClassifier.from_hparams(
-            source=SPEAKER_EMBEDDING_MODEL,
-            savedir=str(savedir),
-            run_opts={"device": device},
-        )
+        classifier = _load_speechbrain_classifier(str(savedir), device)
         waveform = read_audio(str(path))
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
@@ -912,6 +1015,83 @@ def _speaker_embedding(
         return tuple(float(value) for value in vector)
     except Exception:
         return None
+
+
+@lru_cache(maxsize=4)
+def _load_faster_whisper_model(model_name: str, device: str, compute_type: str) -> Any:
+    from faster_whisper import WhisperModel  # type: ignore
+
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        download_root=str(_model_cache_root() / "faster-whisper"),
+    )
+
+
+@lru_cache(maxsize=4)
+def _load_whisperx_model(model_name: str, device: str) -> Any:
+    _prepare_torchaudio_legacy_api()
+    import whisperx  # type: ignore
+
+    return whisperx.load_model(
+        model_name,
+        device,
+        compute_type=_compute_type_for_device(device),
+        download_root=str(_model_cache_root() / "whisperx"),
+    )
+
+
+@lru_cache(maxsize=4)
+def _load_openai_whisper_model(model_name: str, device: str) -> Any:
+    import whisper  # type: ignore
+
+    return whisper.load_model(
+        model_name,
+        device=device,
+        download_root=str(_model_cache_root() / "whisper"),
+    )
+
+
+@lru_cache(maxsize=2)
+def _load_silero_vad_model(device: str) -> Any:
+    from silero_vad import load_silero_vad  # type: ignore
+
+    model = load_silero_vad()
+    if device == "cuda" and hasattr(model, "to"):
+        model = model.to(device)
+    return model
+
+
+@lru_cache(maxsize=2)
+def _load_torch_hub_silero_vad(repo_or_dir: str, source: str) -> tuple[Any, Any]:
+    import torch  # type: ignore
+
+    return torch.hub.load(
+        repo_or_dir=repo_or_dir,
+        model="silero_vad",
+        source=source,
+        trust_repo=True,
+    )
+
+
+@lru_cache(maxsize=2)
+def _load_pyannote_pipeline(token: str) -> Any:
+    _prepare_torchaudio_legacy_api()
+    from pyannote.audio import Pipeline  # type: ignore
+
+    return Pipeline.from_pretrained(PYANNOTE_DIA_MODEL, token=token)
+
+
+@lru_cache(maxsize=2)
+def _load_speechbrain_classifier(savedir: str, device: str) -> Any:
+    from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
+
+    return EncoderClassifier.from_hparams(
+        source=SPEAKER_EMBEDDING_MODEL,
+        savedir=savedir,
+        run_opts={"device": device},
+    )
 
 
 def _material_snapshot(material_paths: Sequence[Path]) -> list[dict[str, Any]]:
@@ -987,6 +1167,123 @@ def _write_material_library_cache(
     except OSError:
         return False
     return True
+
+
+def _reference_cache_path(
+    work_root: Path,
+    reference_path: Path,
+    lyrics_file: Path | None,
+    compute_device: str,
+    source_separation: str,
+) -> Path:
+    payload = {
+        "reference": _file_snapshot(reference_path),
+        "lyrics": _optional_file_snapshot(lyrics_file.expanduser()) if lyrics_file else None,
+        "asr_model": DEFAULT_ASR_MODEL,
+        "asr_backend": os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower(),
+        "speaker_model": SPEAKER_EMBEDDING_MODEL,
+        "compute_device": compute_device,
+        "source_separation": source_separation,
+        "source_separator": uvr_cache_fingerprint(),
+    }
+    key = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_dir = work_root / "reference_analysis_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{key}.json"
+
+
+def _source_separator_backend() -> str:
+    raw = os.environ.get("VOCAL_PROCESS_SOURCE_SEPARATOR", "auto").strip().lower().replace("_", "-")
+    if raw in {"auto", "uvr", "uvr-only", "demucs"}:
+        return raw
+    return "auto"
+
+
+def _load_reference_analysis_cache(
+    cache_path: Path,
+    *,
+    normalized_reference: Path,
+) -> ReferenceAnalysis | None:
+    if not cache_path.exists():
+        return None
+
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(raw, dict) or raw.get("format") != REFERENCE_CACHE_FORMAT:
+        return None
+
+    reference = raw.get("reference")
+    if not isinstance(reference, dict):
+        return None
+
+    source_path = Path(str(reference.get("source_path") or ""))
+    if source_path != normalized_reference:
+        return None
+
+    vocal_path = Path(str(reference.get("vocal_path") or ""))
+    if vocal_path != normalized_reference and not vocal_path.exists():
+        return None
+
+    return ReferenceAnalysis(
+        source_path=source_path,
+        vocal_path=vocal_path,
+        transcript=str(reference.get("transcript") or ""),
+        segments=tuple(
+            VoiceSegment(
+                start_seconds=float(segment.get("start_seconds", 0.0) or 0.0),
+                end_seconds=float(segment.get("end_seconds", 0.0) or 0.0),
+                text=str(segment.get("text", "") or ""),
+                confidence=_optional_float(segment.get("confidence")),
+                speaker_id=_optional_string(segment.get("speaker_id")),
+            )
+            for segment in reference.get("segments", [])
+            if isinstance(segment, dict)
+        ),
+        speaker_embedding=(
+            tuple(float(value) for value in reference.get("speaker_embedding"))
+            if isinstance(reference.get("speaker_embedding"), list)
+            else None
+        ),
+        backend=str(reference.get("backend") or "cache"),
+        notes=tuple(str(note) for note in reference.get("notes", []) if isinstance(note, str)),
+    )
+
+
+def _write_reference_analysis_cache(cache_path: Path, reference: ReferenceAnalysis) -> bool:
+    payload = {
+        "format": REFERENCE_CACHE_FORMAT,
+        "reference": render_reference_analysis(reference),
+    }
+    try:
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _file_snapshot(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "suffix": path.suffix.lower(),
+    }
+
+
+def _optional_file_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "path": str(path),
+            "missing": True,
+            "suffix": path.suffix.lower(),
+        }
+    return _file_snapshot(path)
 
 
 def _audio_analysis_from_cache(data: dict[str, Any]) -> AudioAnalysis:
@@ -1252,8 +1549,14 @@ def _silero_model_cached() -> bool:
 
 def _maybe_module_available(module_name: str) -> bool:
     try:
+        if module_name in {"pyannote.audio", "whisperx"}:
+            _prepare_torchaudio_legacy_api()
+            importlib.import_module(module_name)
+            return True
         return importlib.util.find_spec(module_name) is not None
     except (ModuleNotFoundError, ValueError):
+        return False
+    except Exception:
         return False
 
 
@@ -1261,6 +1564,88 @@ def _module_available(module_name: str) -> bool:
     if module_name == "silero_vad":
         return _maybe_module_available(module_name)
     return _maybe_module_available(module_name)
+
+
+@lru_cache(maxsize=1)
+def _prepare_torchaudio_legacy_api() -> None:
+    try:
+        os.environ.setdefault("MPLCONFIGDIR", str(_model_cache_root() / "matplotlib"))
+        Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+        import soundfile as sf  # type: ignore
+        import torch  # type: ignore
+        import torchaudio  # type: ignore
+    except Exception:
+        return
+
+    if not hasattr(torchaudio, "AudioMetaData"):
+        torchaudio.AudioMetaData = namedtuple(  # type: ignore[attr-defined]
+            "AudioMetaData",
+            ["sample_rate", "num_frames", "num_channels", "bits_per_sample", "encoding"],
+        )
+
+    def info(uri: Any, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        meta = sf.info(uri)
+        return torchaudio.AudioMetaData(  # type: ignore[attr-defined]
+            sample_rate=int(meta.samplerate),
+            num_frames=int(meta.frames),
+            num_channels=int(meta.channels),
+            bits_per_sample=0,
+            encoding=str(meta.subtype or meta.format or "UNKNOWN"),
+        )
+
+    def load(
+        uri: Any,
+        frame_offset: int = 0,
+        num_frames: int = -1,
+        normalize: bool = True,
+        channels_first: bool = True,
+        format: str | None = None,
+        buffer_size: int = 4096,
+        backend: str | None = None,
+    ) -> tuple[Any, int]:
+        del normalize, format, buffer_size, backend
+        stop = -1 if num_frames is None or num_frames < 0 else int(frame_offset) + int(num_frames)
+        data, sample_rate = sf.read(
+            uri,
+            start=int(frame_offset or 0),
+            stop=stop,
+            dtype="float32",
+            always_2d=True,
+        )
+        tensor = torch.from_numpy(data)
+        if channels_first:
+            tensor = tensor.transpose(0, 1)
+        return tensor, int(sample_rate)
+
+    def save(
+        uri: Any,
+        src: Any,
+        sample_rate: int,
+        channels_first: bool = True,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        del args, kwargs
+        data = src.detach().cpu()
+        if channels_first and data.ndim == 2:
+            data = data.transpose(0, 1)
+        sf.write(uri, data.numpy(), int(sample_rate))
+
+    if not hasattr(torchaudio, "info"):
+        torchaudio.info = info  # type: ignore[attr-defined]
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: ["soundfile"]  # type: ignore[attr-defined]
+    if not hasattr(torchaudio, "get_audio_backend"):
+        torchaudio.get_audio_backend = lambda: "soundfile"  # type: ignore[attr-defined]
+    if not hasattr(torchaudio, "set_audio_backend"):
+        torchaudio.set_audio_backend = lambda backend=None: None  # type: ignore[attr-defined]
+
+    try:
+        import torchcodec  # type: ignore  # noqa: F401
+    except Exception:
+        torchaudio.load = load  # type: ignore[assignment]
+        torchaudio.save = save  # type: ignore[assignment]
 
 
 def _vad_coverage(vad_segments: Sequence[tuple[float, float]], duration_seconds: float) -> float | None:

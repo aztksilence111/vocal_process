@@ -13,6 +13,7 @@ from .i18n import DEFAULT_LANGUAGE, normalize_language
 
 APP_NAME = "AudioProcessorMVP"
 COMPUTE_DEVICE_OPTIONS = ("auto", "cpu", "cuda")
+SOURCE_SEPARATION_OPTIONS = ("auto", "always", "never")
 WINDOW_GEOMETRY_OPTIONS = ("980x680", "1280x800", "1440x900", "1600x1000")
 
 
@@ -23,6 +24,7 @@ class ProcessingSettings:
     lyrics_file: str = ""
     daw_timeline_export: bool = False
     compute_device: str = "auto"
+    source_separation: str = "auto"
     window_geometry: str = "980x680"
     output_directory: str = ""
     output_extension: str = ".wav"
@@ -78,6 +80,7 @@ class ProcessingSettings:
             lyrics_file=str(data.get("lyrics_file") or defaults.lyrics_file),
             daw_timeline_export=bool(data.get("daw_timeline_export", defaults.daw_timeline_export)),
             compute_device=normalize_compute_device(data.get("compute_device")),
+            source_separation=normalize_source_separation(data.get("source_separation")),
             window_geometry=normalize_window_geometry(data.get("window_geometry")),
             output_directory=str(data.get("output_directory") or defaults.output_directory),
             output_extension=normalize_extension(
@@ -109,6 +112,13 @@ def normalize_extension(value: str, *, fallback: str = ".wav") -> str:
 def normalize_compute_device(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in COMPUTE_DEVICE_OPTIONS:
+        return text
+    return "auto"
+
+
+def normalize_source_separation(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in SOURCE_SEPARATION_OPTIONS:
         return text
     return "auto"
 

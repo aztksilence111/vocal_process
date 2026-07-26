@@ -1,25 +1,49 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 from .batch import QueueItem, run_batch_queue
 from .diagnostics import diagnostic_log_path
 from .engine import AudioProcessorError
-from .settings import ProcessingSettings, normalize_compute_device
+from .settings import ProcessingSettings, normalize_compute_device, normalize_source_separation
 
 
 BRIDGE_REQUEST_FORMAT = "vocal_process_vst3_bridge_request_v1"
 BRIDGE_RESPONSE_FORMAT = "vocal_process_vst3_bridge_response_v1"
+BRIDGE_WATCH_HEARTBEAT = "vocal_process_vst3_bridge_heartbeat_v1"
 
 
 def run_bridge_request_file(request_path: Path, response_path: Path | None = None) -> dict[str, Any]:
-    request = _load_request(request_path)
-    response = run_bridge_request(request)
-    output_path = response_path or Path(str(request_path)).with_suffix(".response.json")
-    output_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_path = response_path or request_path.parent / f"{_request_base_name(request_path)}.response.json"
+    response = _run_bridge_request_path(request_path)
+    _write_json_atomic(output_path, response)
     return response
+
+
+def run_bridge_watch(
+    request_directory: Path,
+    *,
+    response_directory: Path | None = None,
+    poll_interval_seconds: float = 0.5,
+    once: bool = False,
+) -> int:
+    requests = request_directory.expanduser()
+    responses = (response_directory or request_directory).expanduser()
+    requests.mkdir(parents=True, exist_ok=True)
+    responses.mkdir(parents=True, exist_ok=True)
+    processed = 0
+
+    while True:
+        _write_heartbeat(requests, responses)
+        processed += _process_pending_requests(requests, responses)
+        if once:
+            return processed
+        time.sleep(max(poll_interval_seconds, 0.05))
 
 
 def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
@@ -44,6 +68,7 @@ def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
             default=output_path.suffix.lower() == ".rpp" or command == "render_timeline",
         ),
         compute_device=normalize_compute_device(request.get("compute_device")),
+        source_separation=normalize_source_separation(request.get("source_separation")),
         output_directory=str(output_path.parent),
         output_extension=output_path.suffix or ".wav",
         overwrite=_optional_bool(request, "overwrite", default=True),
@@ -60,6 +85,7 @@ def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
     ok = summary.failed == 0 and summary.cancelled == 0
     return {
         "format": BRIDGE_RESPONSE_FORMAT,
+        "request_id": _optional_string(request.get("request_id")) or "",
         "ok": ok,
         "command": command,
         "status": item.status,
@@ -80,6 +106,7 @@ def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
 def bridge_request_template() -> dict[str, Any]:
     return {
         "format": BRIDGE_REQUEST_FORMAT,
+        "request_id": "example-render-001",
         "command": "render_timeline",
         "reference_path": "C:/path/to/reference.wav",
         "material_directory": "C:/path/to/materials",
@@ -87,8 +114,96 @@ def bridge_request_template() -> dict[str, Any]:
         "output_path": "C:/path/to/output/reference.rpp",
         "daw_timeline_export": True,
         "compute_device": "auto",
+        "source_separation": "auto",
         "overwrite": True,
     }
+
+
+def bridge_watch_contract() -> dict[str, Any]:
+    return {
+        "format": "vocal_process_vst3_bridge_contract_v1",
+        "request_glob": "*.request.json",
+        "request_file_name": "<request_id>.request.json",
+        "response_suffix": ".response.json",
+        "done_suffix": ".done.json",
+        "heartbeat_file": "bridge.heartbeat.json",
+        "helper_command": "VocalProcess.exe vst3-bridge --watch <request_dir> --responses <response_dir>",
+        "write_protocol": [
+            "Write the request to a temporary file in the request directory.",
+            "Atomically rename it to <request_id>.request.json when complete.",
+            "Wait for <request_id>.response.json in the response directory.",
+            "Read ok/status/output_path/diagnostics_path from the response.",
+        ],
+        "request_template": bridge_request_template(),
+    }
+
+
+def _process_pending_requests(requests: Path, responses: Path) -> int:
+    processed = 0
+    for request_path in sorted(requests.glob("*.request.json"), key=lambda path: path.name.lower()):
+        request_name = _request_base_name(request_path)
+        response_path = responses / f"{request_name}.response.json"
+        processing_path = request_path.with_name(f"{request_name}.processing.json")
+        done_path = request_path.with_name(f"{request_name}.done.json")
+        try:
+            request_path.replace(processing_path)
+        except OSError:
+            continue
+        response = _run_bridge_request_path(processing_path)
+        _write_json_atomic(response_path, response)
+        try:
+            processing_path.replace(done_path)
+        except OSError:
+            pass
+        processed += 1
+    return processed
+
+
+def _run_bridge_request_path(path: Path) -> dict[str, Any]:
+    try:
+        request = _load_request(path)
+        response = run_bridge_request(request)
+        response["request_path"] = str(path)
+        return response
+    except Exception as exc:
+        return {
+            "format": BRIDGE_RESPONSE_FORMAT,
+            "ok": False,
+            "status": "Failed",
+            "message": str(exc) or exc.__class__.__name__,
+            "request_path": str(path),
+            "exception_type": exc.__class__.__name__,
+            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        }
+
+
+def _write_heartbeat(requests: Path, responses: Path) -> None:
+    heartbeat = {
+        "format": BRIDGE_WATCH_HEARTBEAT,
+        "process_id": os.getpid(),
+        "request_directory": str(requests),
+        "response_directory": str(responses),
+        "timestamp": time.time(),
+    }
+    try:
+        _write_json_atomic(responses / "bridge.heartbeat.json", heartbeat)
+    except OSError:
+        pass
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _request_base_name(path: Path) -> str:
+    name = path.name
+    suffix = ".request.json"
+    if name.lower().endswith(suffix):
+        return name[: -len(suffix)]
+    return path.stem
 
 
 def _load_request(path: Path) -> dict[str, Any]:

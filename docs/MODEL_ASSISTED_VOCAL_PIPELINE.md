@@ -43,12 +43,17 @@ The model layer is now part of the core material assembly flow. Some backends ar
 
 | Stage | Candidate | GitHub | Purpose |
 | --- | --- | --- | --- |
+| Source separation | UVR Headless Runner | https://github.com/chyinan/uvr-headless-runner | Run UVR-style MDX, Demucs, or VR separation through an isolated Python 3.10 worker. |
 | Source separation | Demucs | https://github.com/facebookresearch/demucs | Extract vocals from a mixed original song before alignment. |
 | Voice activity detection | Silero VAD | https://github.com/snakers4/silero-vad | Detect vocal/speech regions efficiently. |
 | Diarization and speaker features | pyannote.audio | https://github.com/pyannote/pyannote-audio | Segment speakers and extract speaker-related features. |
 | ASR and word alignment | WhisperX | https://github.com/m-bain/whisperX | Transcribe and align words to timestamps. |
+| Accelerated ASR | Faster Whisper | https://github.com/SYSTRAN/faster-whisper | Run Whisper-style ASR through CTranslate2 when installed. |
 | ASR fallback | OpenAI Whisper | https://github.com/openai/whisper | General multilingual speech recognition. |
+| Native ASR candidate | whisper.cpp | https://github.com/ggerganov/whisper.cpp | Candidate for smaller CPU-first native ASR builds. |
 | Speaker similarity | SpeechBrain | https://github.com/speechbrain/speechbrain | Score voice/speaker similarity with pretrained speaker-recognition models. |
+| Music structure | Librosa | https://github.com/librosa/librosa | Candidate for repeated-section/self-similarity analysis. |
+| Music structure | MSAF | https://github.com/urinieto/msaf | Candidate for verse/chorus structural segmentation. |
 
 ## Proposed Processing Architecture
 
@@ -92,24 +97,52 @@ Implemented now:
 10. Flat WAV assembly now uses per-clip Rubber Band stretching before concatenation, so a single syllable is not forced through one whole-material stretch pass.
 11. Stretch diagnostics record quality warnings for ratios that are likely to damage intelligibility.
 12. A JSON-based VST3 bridge helper exists as `audio_processor.vst3_bridge` and `audio-processor vst3-bridge`.
-10. CLI entry:
+13. `audio-processor analyze` writes a preflight report before rendering, including ordering scores, filename hints, target durations, stretch tempo, and review warnings.
+14. Batch diagnostics now emits `model.ordering.review_required` when low match scores or risky stretch ratios should be reviewed before trusting the output.
+15. A native JUCE VST3 bridge plug-in exists under `native\vst3_bridge` and calls the same helper process outside the audio callback.
+16. `source_separation=never` can be selected in GUI/CLI/VST3 bridge requests when the original audio is already an isolated vocal stem.
+17. Reference analysis is cached, and loaded ASR/VAD/speaker models are reused inside the process.
+18. `faster-whisper`, WhisperX, and pyannote.audio are part of the full Python 3.11 model runtime; the code falls back automatically when a backend fails on a specific file.
+19. Preflight reports include an optimization section for duplicate render reuse and repeated reference text hints.
+20. DAW timeline export reuses exact duplicate stretched WAV renders when source file, target duration, tempo, and render options match.
+
+CLI entry:
 
 ```powershell
 python -m audio_processor models
 python -m audio_processor models --json
 ```
 
-Not default yet:
+Gated or future work:
 
-1. WhisperX word-level alignment, because the current Python 3.14 environment is blocked by published dependency pins.
-2. pyannote.audio diarization, because the pretrained pipeline needs Hugging Face token authorization and model terms acceptance.
-3. SpeechBrain first-run downloads, unless `VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD=1` is explicitly set; cached models are used when present.
+1. pyannote.audio pretrained diarization still needs Hugging Face token authorization and model terms acceptance.
+2. WhisperX word-level alignment may require first-run language alignment model downloads.
+3. SpeechBrain first-run downloads require `VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD=1`; cached models are used when present.
+4. Librosa/MSAF structure analysis is tracked for future section-level optimization. The current implementation only reports repeated text and exact duplicate render reuse because those paths are safe.
+5. UVR MDX/VR models require a selected model path/name in the Python 3.10 worker.
+
+## Runtime Optimization Plan
+
+The current 28-second sample taking 7-10 minutes indicates model startup and source separation dominate runtime more than Rubber Band rendering. The implemented low-risk optimizations are:
+
+1. Skip Demucs when the user marks the reference as already isolated vocals.
+2. Reuse loaded Whisper/Faster Whisper/WhisperX/Silero/SpeechBrain models inside the same process.
+3. Cache reference analysis across repeated runs.
+4. Reuse exact duplicate DAW clip renders.
+5. Keep material analysis cache keyed by file snapshot.
+
+Further safe optimization candidates:
+
+1. Add a current 64-bit GPU path and set compute device to `cuda` when available.
+2. Use UVR headless runner before in-process Demucs when the Python 3.10 worker is configured; verify it with `scripts\check_uvr_worker.ps1` before long manual tests.
+3. Add Librosa/MSAF section analysis to detect repeated verse/chorus structures, then reuse timing templates only after preflight confirms similar durations and no low-confidence text matches.
+4. Avoid pitch tracking by default; pitch analysis should be optional because text/timing matching is cheaper and more directly relevant to word ordering.
+5. For long songs, split reference analysis into cached sections so only changed sections are re-analyzed during iterative manual tests.
 
 ## Next Development Steps
 
-1. Add an `analyze` command that writes `analysis.json` for inspecting model output before rendering.
-2. Use manual test diagnostics to tune the score weights for weak transcripts, filename hints, and extreme stretch ratios.
-3. Improve ordering with word-level alignment when a compatible WhisperX or alternative aligner is available.
-4. Add pyannote diarization after Hugging Face authorization is provided.
-5. Build a minimal native VST3 prototype that calls the JSON bridge helper outside the audio callback.
-6. Keep refining the portable package smoke test so it verifies both startup and a small model-assisted processing path.
+1. Use manual test diagnostics and `analysis.json` reports to tune weak transcripts, filename hints, and extreme stretch ratios.
+2. Improve ordering with WhisperX word-level alignment where alignment model caches are available.
+3. Enable pyannote diarization paths after Hugging Face authorization is provided.
+4. Add safe repeated-section timing reuse after enough manual diagnostics prove the heuristic.
+5. Validate the native VST3 bridge in additional real DAW hosts and keep heavy processing in the helper process.

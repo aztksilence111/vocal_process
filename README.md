@@ -17,29 +17,33 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 
 1. GUI 批量处理原音频、素材集、歌词文件和输出目录。
 2. 使用本地预训练模型辅助分析，不使用在线推理计费。
-3. Demucs 用于原音频人声分离。
-4. OpenAI Whisper 用于原音频和素材音频转写。
+3. UVR headless worker 和 Demucs 用于原音频人声分离；可用时优先通过独立 UVR worker 运行，失败时回退到 Demucs。
+4. Faster Whisper、WhisperX 和 OpenAI Whisper 用于原音频和素材音频转写/对齐；默认优先尝试本地加速后端，失败时回退。
 5. Silero VAD 用于检测素材中的人声区域。
 6. SpeechBrain 说话人特征接口已接入；默认只在模型缓存命中时启用，避免用户首次运行时长时间等待 Hugging Face 下载。
 7. 生成结构化 `.diagnostics.jsonl`，用于定位无报错失败、模型转写失败、FFprobe 元数据失败等问题。
 8. 输出普通 WAV，或导出 REAPER `.rpp`、`timeline.json`、`timeline.csv` 和独立素材片段 WAV，方便在 DAW 中继续编辑每个素材 item。
 9. 提供 `batch` 命令，便于在便携包里直接跑一条真实模型辅助输出。
 10. 素材集会生成 `.vocalprocess_material_cache.json`，同一文件夹未变化时复用素材分析结果。
-11. GUI 显示运行时长，支持 CPU/GPU 计算设备选择，并允许拖拽窗口边缘或在设置中选择窗口尺寸。
+11. 原音频分析会生成参考缓存，同一原音频、歌词、计算设备和人声分离策略不变时复用 Demucs/ASR/声纹结果。
+12. GUI 显示运行时长，支持 CPU/GPU 计算设备选择，并提供“自动判断 / 已是人声跳过分离 / 强制分离”按钮。
+13. 完整模型运行时包含 `faster-whisper`、`whisperx` 和 `pyannote.audio`；pyannote 预训练模型仍需要 Hugging Face token 和模型条款授权。
 
 ## 环境要求
 
 源码运行建议：
 
-1. Python 3.11 或更新版本。
+1. 主程序使用 Python 3.11.x，建议通过 `.venv311` 运行；不要依赖本机默认 Python 3.14。
 2. FFmpeg 和 FFprobe 可从 PATH 调用，或使用便携包内置版本。
-3. 已安装项目依赖：`torch`、`torchaudio`、`openai-whisper`、`demucs`、`speechbrain`。
+3. 基础项目安装不再默认拉取完整模型栈；完整模型运行时可通过 `requirements\model-full-py311.txt` 安装。
+4. UVR headless runner 使用独立 Python 3.10 worker：`.uvr-worker`。
 
 本机已验证：
 
-1. Python 3.14.6。
-2. FFmpeg 8.1.2。
-3. CPU 版 PyTorch、Whisper、Demucs、SpeechBrain。
+1. 主程序：Python 3.11.9 in `.venv311`。
+2. UVR worker：Python 3.10.11 in `.uvr-worker`，`uvr-headless-runner` 1.1.0。
+3. FFmpeg 8.1.2。
+4. UVR runner 入口可用，默认 `htdemucs` 模型已下载并通过实际 1 秒人声分离烟测。
 
 ## 常用命令
 
@@ -72,7 +76,7 @@ python -m audio_processor process input.wav output.mp3 --normalize --gain-db -3 
 
 ```powershell
 python -m audio_processor export-daw reference.wav materials reference_daw\reference.rpp --overwrite
-python -m audio_processor batch reference.wav output.wav --material-directory materials --compute-device cpu --overwrite
+python -m audio_processor batch reference.wav output.wav --material-directory materials --compute-device cpu --source-separation never --overwrite
 ```
 
 查看模型候选和状态：
@@ -86,6 +90,7 @@ python -m audio_processor models --json
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1
+powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_uvr_worker.ps1
 ```
 
 ## GUI 流程
@@ -94,9 +99,10 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1
 2. 选择素材集文件夹。
 3. 可选选择歌词文件。
 4. 选择输出目录和输出格式。
-5. 选择计算设备和窗口尺寸。
-6. 选择是否导出 DAW 时间轴工程。
-7. 点击“开始批量处理”。
+5. 选择计算设备。
+6. 选择原音频人声模式：自动判断、已是人声跳过分离、强制分离。
+7. 选择是否导出 DAW 时间轴工程和窗口尺寸。
+8. 点击“开始批量处理”。
 
 当选择素材集后，模型辅助排序是核心流程，不提供关闭按钮。处理链路会先分析原音频和素材人声，再把排序结果交给现有的拉伸拼接或 DAW 时间轴导出模块。
 
@@ -124,7 +130,40 @@ powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1
 dist\VocalProcess-portable.zip
 ```
 
-默认构建会收集模型运行依赖，并把 `.tmp\model-cache` 复制到便携包的 `models` 文件夹。便携运行时会优先读取 `VocalProcess\models`，从而使用本地预训练模型缓存。
+默认构建会生成不含 VST3 的标准完整包 `dist\VocalProcess-portable.zip`，并使用 ZIP optimal 压缩。完整包包含 Python 3.11 模型运行依赖、`.tmp\model-cache` 本地模型缓存和 `uvr-worker` 独立 UVR 运行时。生成含 VST3 的完整宿主测试包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_portable.ps1 -IncludeVst3Bridge
+```
+
+输出位置：
+
+```text
+dist\VocalProcess-portable-vst3.zip
+```
+
+一次生成两个完整变体：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_portable_variants.ps1
+```
+
+构建会收集模型运行依赖，并把 `.tmp\model-cache` 复制到便携包的 `models` 文件夹。便携运行时会优先读取 `VocalProcess\models`，从而使用本地预训练模型缓存。
+
+当前本机完整包大小：
+
+```text
+dist\VocalProcess-portable.zip       1,413,022,068 bytes
+dist\VocalProcess-portable-vst3.zip  1,415,457,165 bytes
+```
+
+只做启动、GUI 或 VST3 包装烟测时，可显式生成轻量包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_portable_variants.ps1 -Lite
+```
+
+轻量包输出为 `dist\VocalProcess-portable-lite.zip` 和 `dist\VocalProcess-portable-lite-vst3.zip`。它们不会复制完整 `site-packages`、模型缓存或 UVR worker，不能作为完整模型功能发布包。
 
 便携版自动冒烟测试：
 
@@ -150,20 +189,52 @@ reference_daw\
 ```
 
 `reference.rpp` 是 REAPER 工程文件，包含参考音频轨和独立素材片段轨；`timeline.json` 和 `timeline.csv` 记录每个素材片段的源文件、输出文件、开始时间、目标时长和排序依据。
+如果 DAW 导出中出现完全相同的源素材、目标时长、Rubber Band tempo 和渲染参数，后续片段会复用已渲染 WAV，避免重复拉伸计算。
 
 ## 已知限制
 
 1. 当前默认 ASR 模型是 Whisper `base`，在复杂歌曲、混响、伴奏很强或非清晰人声素材上仍可能转写不准。
-2. WhisperX 在当前 Python 3.14 环境中受依赖版本限制，未作为默认后端启用。
-3. pyannote.audio 需要 Hugging Face 授权 token 和模型条款确认，当前仅保留可选接入路径。
+2. WhisperX 已纳入完整模型运行时；首次使用对齐模型时可能需要下载对应语言的对齐模型缓存。
+3. pyannote.audio 已纳入完整模型运行时；使用 Hugging Face 预训练 diarization pipeline 仍需要授权 token 和模型条款确认。
 4. 首次完整模型推理在 CPU 上可能较慢；便携包内置缓存可以减少下载等待，但不能消除推理耗时。
+5. `faster-whisper` 已包含在完整模型运行时；CPU 推理仍可能明显慢于 GPU。
 
 ## 测试
 
 ```powershell
-.venv\Scripts\python -m unittest discover
-.venv\Scripts\python -m compileall -q audio_processor tests packaging
+.venv311\Scripts\python -m unittest discover
+.venv311\Scripts\python -m compileall -q audio_processor tests packaging
 ```
+
+## Runtime Version Layout
+
+The production runtime is now split by dependency compatibility:
+
+1. Main app/runtime: Python 3.11 in `.venv311`.
+2. UVR headless worker: Python 3.10 in `.uvr-worker`.
+3. Native VST3 bridge: JUCE/MSVC binary that launches the helper process; it does not embed Python in the audio callback.
+
+Bootstrap the main environment:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\bootstrap_py311_env.ps1 -DevTools
+```
+
+Bootstrap the UVR worker:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\bootstrap_uvr_worker.ps1
+```
+
+Check the UVR worker without running separation inference:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check_uvr_worker.ps1
+```
+
+The helper writes `.tmp\uvr-worker-env.ps1`, which sets `VOCAL_PROCESS_UVR_PYTHON`, `VOCAL_PROCESS_SOURCE_SEPARATOR`, `VOCAL_PROCESS_UVR_ARCH`, and `VOCAL_PROCESS_UVR_MODEL`. Source separation uses the UVR worker first when it is available, then falls back to in-process Demucs when applicable.
+
+`scripts\build_portable.ps1` prefers `VOCAL_PROCESS_PYTHON`, then `.venv311`, then the legacy `.venv`. Portable builds fail fast if the selected runtime is not Python 3.11.x.
 
 ## Recent Runtime Notes
 
@@ -174,6 +245,46 @@ The VST3 bridge work has started as an offline helper protocol:
 ```powershell
 python -m audio_processor vst3-bridge --template
 python -m audio_processor vst3-bridge request.json --response response.json
+python -m audio_processor vst3-bridge --contract
+python -m audio_processor vst3-bridge --watch requests --responses responses --once
+python -m audio_processor analyze reference.wav materials --output analysis.json --compute-device cpu --source-separation never
 ```
 
-The future native VST3 plug-in should call this helper process instead of running Python, FFmpeg, or model inference inside a real-time audio callback.
+The native VST3 bridge plug-in now lives in `native\vst3_bridge`. It is a JUCE/MSVC VST3 control surface that passes audio through unchanged and calls `VocalProcess.exe` as a helper process for render/analyze work. Build it with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_vst3_bridge.ps1
+```
+
+The generated bundle is:
+
+```text
+build\vst3_bridge\VocalProcessBridge_artefacts\Release\VST3\VocalProcess Bridge.vst3
+```
+
+Use `scripts\build_portable.ps1` for the standard no-VST3 full package, and `scripts\build_portable.ps1 -IncludeVst3Bridge` for the VST3 full host-test package. The VST3 package includes the bundle under `VocalProcess\plugins`.
+
+Runtime speed controls:
+
+1. In the GUI, set Reference Vocals / 原音频人声 to `已是人声，跳过分离` when the reference file is already an isolated vocal stem.
+2. The process reuses loaded ASR/VAD/speaker models within the same run.
+3. Reference analysis is cached by file snapshot, lyrics snapshot, compute device, ASR backend, source separation mode, and selected separation backend/model.
+4. DAW timeline export reuses exact duplicate stretched clip renders.
+
+Host-side validation helpers:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\probe_vst3_bridge.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install_vst3_bridge.ps1 -Force
+powershell -ExecutionPolicy Bypass -File scripts\host_test_reaper_vst3.ps1
+powershell -ExecutionPolicy Bypass -File scripts\host_test_flstudio_vst3.ps1
+powershell -ExecutionPolicy Bypass -File scripts\check_melodyne_context.ps1
+```
+
+Current local host results:
+
+1. JUCE headless VST3 probe scanned and instantiated `VocalProcess Bridge.vst3`.
+2. REAPER 7.33 x64 scanned the bridge in an isolated config and cached it successfully.
+3. The bridge was installed to `C:\Program Files\Common Files\VST3\VocalProcess Bridge.vst3` for hosts that scan the common VST3 folder.
+4. FL Studio 2024 Plugin Manager can be launched, but no documented non-interactive scan command was found; use Plugin Manager > Find installed plugins for final FL registration.
+5. Melodyne Studio 4 / Celemony paths were detected in standard 64-bit locations on `E:\`, with additional legacy 32-bit paths on the machine. Melodyne is treated as a WAV/DAW/ARA workflow target, not a generic host in which this 64-bit VST3 bridge is validated.

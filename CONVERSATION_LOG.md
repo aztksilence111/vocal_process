@@ -636,3 +636,263 @@ Passed:
 2. Run the approved portable smoke test first.
 3. Commit, push, and refresh release artifact after portable verification passes.
 4. Continue native VST3 prototype work after the JSON bridge helper is validated by manual DAW-side workflow tests.
+
+## 2026-07-25: Native VST3 Bridge, Watch Helper, and Analysis Preflight
+
+User clarified that implementation is not limited to Python and authorized using other approaches or GitHub open-source projects if needed. The work continued on `codex/continue-runtime-stability-release`.
+
+Implemented:
+
+1. Expanded `audio_processor.vst3_bridge` from a single JSON request helper into a usable bridge protocol:
+   - single request files now write JSON responses even when execution fails;
+   - response naming uses `<request_id>.response.json`;
+   - watch mode processes `*.request.json` files, writes `bridge.heartbeat.json`, atomically writes responses, and moves processed requests to `.done.json`;
+   - `bridge_watch_contract()` exposes the request/response/heartbeat contract.
+2. Extended CLI:
+   - `audio-processor vst3-bridge --contract`;
+   - `audio-processor vst3-bridge --watch <requests> --responses <responses> [--once]`;
+   - `audio-processor analyze <reference> <materials> --output analysis.json --compute-device cpu`.
+3. Added `audio_processor.preflight` to generate an ordering/stretch preflight report before rendering. The report includes model ordering, split scores, target durations, Rubber Band tempo, moderate/extreme stretch warnings, and review status.
+4. Batch diagnostics now emits `model.ordering.review_required` when low match scores or risky stretch ratios mean manual review is needed before trusting output.
+5. Pulled JUCE 8.0.13 into ignored `extern\JUCE` and added a native JUCE/MSVC VST3 project under `native\vst3_bridge`.
+6. The native `VocalProcess Bridge.vst3` plug-in:
+   - passes audio through unchanged;
+   - exposes fields for helper executable, reference audio, material folder, output path, lyrics file, compute device, and DAW timeline mode;
+   - launches `VocalProcess.exe vst3-bridge ... --response ...` for rendering;
+   - launches `VocalProcess.exe analyze ... --output ...` for preflight analysis;
+   - keeps Python/model/FFmpeg work outside the real-time audio callback.
+7. Added `scripts\build_vst3_bridge.ps1` and made `scripts\build_portable.ps1` bundle the built VST3 under `VocalProcess\plugins` when present.
+8. Updated README, DAW/model docs, portable README, and third-party notices.
+
+Verification:
+
+1. `.venv\Scripts\python -m unittest discover` passed: 54 tests.
+2. `.venv\Scripts\python -m compileall -q audio_processor tests packaging` passed.
+3. `powershell -ExecutionPolicy Bypass -File scripts\build_vst3_bridge.ps1` built:
+   `build\vst3_bridge\VocalProcessBridge_artefacts\Release\VST3\VocalProcess Bridge.vst3`.
+4. The generated VST3 bundle contains `Contents\x86_64-win\VocalProcess Bridge.vst3` and `Contents\Resources\moduleinfo.json`.
+
+Manual-test impact:
+
+1. Testers can run `analyze` first to inspect whether ordering is trustworthy before generating audio.
+2. Diagnostics now clearly flags low-confidence ordering and stretch risk instead of only reporting success/failure.
+3. VST3 bridge now has both a persistent helper mode for host integration and a compiled native plug-in control surface.
+
+## 2026-07-25: VST3 Host Probe, REAPER Validation, FL/Melodyne Boundaries
+
+User added that Melodyne must also be considered. Continued on `codex/continue-runtime-stability-release`.
+
+Implemented:
+
+1. Added `native\vst3_probe`, a JUCE-based headless VST3 scanner/instantiator.
+2. Added `scripts\probe_vst3_bridge.ps1` to build/run the probe against `VocalProcess Bridge.vst3`.
+3. Added `scripts\install_vst3_bridge.ps1` to install the bridge bundle into the common 64-bit VST3 folder.
+4. Added `scripts\host_test_reaper_vst3.ps1` to launch REAPER with an isolated config and verify the bridge appears in REAPER's VST cache.
+5. Added `scripts\host_test_flstudio_vst3.ps1` to launch FL Studio Plugin Manager and check the verified plug-in database without hand-editing it.
+6. Added `scripts\check_melodyne_context.ps1` to report whether a usable 64-bit Melodyne/Celemony context exists and to document the Melodyne workflow boundary.
+
+Verification:
+
+1. JUCE headless probe passed: one `VocalProcess Bridge` VST3 description was found, instantiated, and reported as 2 inputs / 2 outputs.
+2. REAPER 7.33 x64 passed: isolated scan cached `VocalProcess Bridge (VocalProcess)` in `reaper-vstplugins64.ini`.
+3. System VST3 install passed: the bridge was copied to `C:\Program Files\Common Files\VST3\VocalProcess Bridge.vst3`.
+4. FL Studio 2024 Plugin Manager launched, but no documented non-interactive scan command or automatic database update was available. Final FL verification should be done through Plugin Manager > Find installed plugins.
+5. Melodyne/Celemony detection initially found legacy paths; the later dedicated script found Melodyne Studio 4 / Celemony paths in standard 64-bit locations on `E:\` plus additional legacy 32-bit locations. Melodyne is still treated as a WAV/DAW/ARA workflow target, not as a generic host validation path for this bridge.
+
+Manual-test impact:
+
+1. The VST3 bridge is no longer only a compiled artifact; it has a headless instantiation test and a real REAPER host scan result.
+2. FL Studio support is documented as installable but requiring one manual scan action, avoiding risky manual edits to Image-Line database files.
+3. Melodyne is explicitly covered as a workflow target without pretending the old 32-bit local install validates the 64-bit bridge.
+
+## 2026-07-25: Portable Variants, Source-Separation Control, and Runtime Optimization
+
+### User
+
+Requested a new plan:
+
+1. Split portable builds into standard no-VST3 and VST3-included packages for isolated manual testing and smaller non-VST3 downloads.
+2. Search mainstream/open-source speech recognition, speech-to-text, speaker matching, and related projects, then improve this project so manual testing does not waste time on ineffective output.
+3. Improve render/runtime speed without sacrificing accuracy. The user noted that 28 seconds of reference vocals taking 7-10 minutes is too slow for normal 2-5 minute songs.
+4. Consider repeated verse/chorus structure and repeated timing as a possible optimization path.
+5. Add a direct GUI button/choice for whether the original audio is already separated vocals.
+
+### Implemented
+
+1. Portable packaging now has two standard outputs:
+   - `dist\VocalProcess-portable.zip`: standard package without VST3;
+   - `dist\VocalProcess-portable-vst3.zip`: host-test package with `plugins\VocalProcess Bridge.vst3`.
+2. Added `scripts\build_portable_variants.ps1` to generate both package variants.
+3. `scripts\build_portable.ps1` now defaults to no VST3, supports `-IncludeVst3Bridge`, and uses optimal ZIP compression.
+4. Added `source_separation` setting with modes `auto`, `never`, and `always`.
+5. GUI now exposes source separation as direct radio buttons:
+   - auto;
+   - already vocal / skip separation;
+   - force separate.
+6. CLI `batch` and `analyze` accept `--source-separation auto|never|always`.
+7. VST3 JSON bridge requests and native VST3 editor now pass `source_separation`.
+8. Reference analysis cache was added for same reference audio, lyrics snapshot, ASR backend, compute device, and source separation mode.
+9. Loaded model objects are cached within the process for Faster Whisper, WhisperX, OpenAI Whisper, Silero VAD, torch-hub Silero, pyannote, and SpeechBrain.
+10. Optional `faster-whisper` ASR support was added; when installed it is preferred, otherwise the code falls back to existing Whisper/WhisperX paths.
+11. Open-source candidate tracking was expanded to include Faster Whisper, whisper.cpp, Librosa, and MSAF.
+12. Preflight analysis now includes an optimization report with exact duplicate render reuse groups, repeated reference text groups, and acceleration availability.
+13. DAW timeline export now reuses exact duplicate stretched clip renders when source file, target duration, tempo, and render options match exactly.
+
+### Verification
+
+Passed so far:
+
+1. `.venv\Scripts\python -m compileall -q audio_processor tests packaging`.
+2. `.venv\Scripts\python -m unittest discover` passed with 57 tests.
+
+Current dependency status:
+
+1. `faster-whisper` installation was attempted with permission but timed out after about two minutes.
+2. Current local environment still reports `faster_whisper=False`, `ctranslate2=False`, `whisper=True`, `speechbrain=True`.
+3. The new code is optional-backend safe: missing Faster Whisper does not block output.
+
+Manual-test impact:
+
+1. If the reference is already isolated vocals, users can skip Demucs directly from GUI/CLI/VST3 bridge and avoid a major runtime cost.
+2. Repeated manual tests with the same reference should reuse reference analysis instead of repeating the slowest model stages.
+3. The non-VST3 portable package is now isolated from plugin-host testing, reducing download size and test variables.
+4. Repeated verse/chorus optimization is not allowed to skip text matching automatically yet; it is exposed as preflight evidence and exact render reuse only when safe.
+
+Additional verification after implementation:
+
+1. Native VST3 rebuilt successfully after adding the source-separation control to the editor.
+2. JUCE headless VST3 probe passed after the rebuild.
+3. Both portable variants were built:
+   - `dist\VocalProcess-portable.zip`, about 702 MB, no VST3 entries;
+   - `dist\VocalProcess-portable-vst3.zip`, about 704 MB, includes `VocalProcess Bridge.vst3`.
+4. Portable GUI smoke passed for both variants. The first full extraction attempts timed out because `Expand-Archive` was slow on the large ZIP, but reusing the completed extraction verified startup.
+5. The rebuilt VST3 was installed to `C:\Program Files\Common Files\VST3\VocalProcess Bridge.vst3`.
+6. REAPER isolated host scan passed after the rebuild.
+7. Melodyne context script reported standard 64-bit Celemony paths on `E:\` and legacy 32-bit paths on `D:\`/`E:\`.
+
+## 2026-07-26: Runtime Version Migration and Branch Isolation
+
+### User
+
+Requested that the Python version migration be handled first, before continuing the UVR headless runner integration, to avoid a long and risky migration later. The user also requested timely logging and branch isolation.
+
+### Current Plan
+
+1. Work is isolated on branch `codex/runtime-env-uvr-worker`.
+2. The long-term main application runtime will target Python 3.11, not the currently default Python 3.14.
+3. UVR will be integrated through a separate Python 3.10 headless worker environment, because the available `uvr-headless-runner` package targets Python versions below 3.11.
+4. The main project and the UVR worker will communicate through explicit runner scripts and environment variables instead of merging incompatible dependency stacks into one virtual environment.
+
+### Progress
+
+1. Python 3.11.9 was installed at `C:\Python311\python.exe`.
+2. The Windows Python launcher now reports both Python 3.14 and Python 3.11.
+3. Branch `codex/runtime-env-uvr-worker` was created from the existing dirty worktree so the pending runtime/VST3/package work remains isolated.
+4. Python 3.10.11 was installed at `C:\Python310\python.exe`.
+5. The main project environment `.venv311` was created and verified with Python 3.11.9.
+6. Default project dependencies were split so `.venv311` can be installed quickly; heavyweight model packages now live in optional extras and `requirements\model-full-py311.txt`.
+7. The UVR worker environment `.uvr-worker` was created with Python 3.10.11 and `uvr-headless-runner` 1.1.0.
+8. UVR worker compatibility required pinning `setuptools<81` because the runner's `librosa` dependency still imports `pkg_resources`.
+9. Added `audio_processor\uvr_worker.py` and connected source separation so `auto`/UVR-enabled runs try the UVR headless worker before falling back to in-process Demucs.
+10. Added `scripts\bootstrap_py311_env.ps1`, `scripts\bootstrap_uvr_worker.ps1`, and `scripts\check_uvr_worker.ps1`.
+11. `scripts\build_portable.ps1` now prefers `VOCAL_PROCESS_PYTHON`, then `.venv311`, then legacy `.venv`, and rejects non-Python-3.11 builds.
+
+### Verification
+
+1. `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging` passed.
+2. `.venv311\Scripts\python.exe -m unittest discover` passed with 60 tests.
+3. `.venv311\Scripts\python.exe -m audio_processor check` reports Python 3.11.9 and `UVR Headless Runner: available`.
+4. `.venv311\Scripts\python.exe -m audio_processor models` reports `UVR Headless Runner [source_separation]: available`.
+5. `scripts\check_uvr_worker.ps1` passed and confirmed `uvr-demucs.exe`, `uvr-mdx.exe`, and `uvr-vr.exe`.
+
+### Current UVR State
+
+1. The UVR runner package is installed and callable.
+2. No UVR separation models are installed yet; the check script reported empty installed-model lists for Demucs, MDX, and VR.
+3. The default `htdemucs` model was downloaded and can be resolved by `uvr-demucs --model-info htdemucs`, even though it still does not appear in the runner's installed-model list.
+4. Actual UVR smoke separation on a 1-second test WAV succeeded and produced `.tmp\uvr-smoke\out\reference_(Vocals).wav`.
+5. First real UVR separation may still include model download time on a fresh machine, so the next manual/runtime test should account for one-time model download time separately from render time.
+
+### Portable Rebuild
+
+1. Interim lightweight `dist\VocalProcess-portable.zip` rebuilt from `.venv311` with `-SkipModelRuntime`; size was about 86 MB and contained no VST3 entries.
+2. Interim lightweight `dist\VocalProcess-portable-vst3.zip` rebuilt from `.venv311` with `-SkipModelRuntime -IncludeVst3Bridge`; size was about 89 MB and included `VocalProcess Bridge.vst3`.
+3. Both rebuilt ZIPs passed `scripts\smoke_portable.ps1`.
+4. The rebuilt packages intentionally do not bundle the heavyweight model runtime or UVR worker. This keeps isolated manual package testing small; full model tests should use the local `.venv311`/`.uvr-worker` environments or a future dedicated full-model package flavor.
+
+### Correction After Package-Size Challenge
+
+The user correctly challenged whether the tens-of-MB portable packages were functionally complete. They were not: those builds used `-SkipModelRuntime` and only validated startup/UI/VST3 packaging. The package semantics were corrected so the default portable outputs are full model-runtime packages, while lightweight builds are explicitly named with `-lite`.
+
+Implemented:
+
+1. Installed the full Python 3.11 model stack in `.venv311`: PyTorch CPU, torchaudio, OpenAI Whisper, Demucs, SpeechBrain, Faster Whisper, Silero VAD, and Librosa.
+2. Kept `pyannote.audio` and WhisperX out of the default full runtime because they remain experimental or authorization-dependent for this project.
+3. Bundled the full model runtime, `.tmp\model-cache`, and `.uvr-worker` into the default portable packages.
+4. Changed `scripts\build_portable_variants.ps1` so normal builds create full packages, while `-Lite` creates `VocalProcess-portable-lite*.zip`.
+5. Added `scripts\smoke_portable_uvr_worker.ps1` to verify the bundled UVR worker can run separation from inside the portable tree.
+
+Current verified package outputs:
+
+1. `dist\VocalProcess-portable.zip`: 1,239,961,593 bytes, no VST3, full model runtime bundled.
+2. `dist\VocalProcess-portable-vst3.zip`: 1,242,394,260 bytes, VST3 bridge bundled, full model runtime bundled.
+3. `dist\VocalProcess-portable-lite.zip`: 388,107,297 bytes, lightweight startup/package smoke only.
+4. `dist\VocalProcess-portable-lite-vst3.zip`: 390,541,294 bytes, lightweight VST3 package smoke only.
+
+Verification:
+
+1. `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging` passed.
+2. `.venv311\Scripts\python.exe -m unittest discover` passed with 60 tests.
+3. `.venv311\Scripts\python.exe -m audio_processor check` reports the full local model stack and UVR worker available.
+4. `.venv311\Scripts\python.exe -m audio_processor models` reports Demucs, UVR Headless Runner, Silero VAD, Faster Whisper, OpenAI Whisper, SpeechBrain, and Librosa available.
+5. Full no-VST3 portable startup smoke passed.
+6. Full VST3 portable startup smoke passed.
+7. Full portable model smoke passed with source separation skipped for an already-isolated smoke input.
+8. Full portable UVR worker smoke passed and produced a vocals stem from the bundled worker.
+
+## 2026-07-26: Add WhisperX and pyannote to Full Runtime
+
+### User
+
+After the assistant clarified that WhisperX and pyannote were not in the default full package yet, the user requested that they be included. The user also reminded the assistant to keep conversation logs, preserve branch isolation, and upload the branch to the git repository.
+
+### Progress
+
+1. Work remains isolated on branch `codex/runtime-env-uvr-worker`.
+2. Initial unpinned install of `whisperx` and `pyannote.audio` timed out after dependency resolution/download.
+3. Latest `whisperx 3.8.6` and `pyannote.audio 4.0.7` were tested with pip dry-run; that combination requires moving to the PyTorch 2.8 line and downloading large torch/torchaudio/torchvision/torchcodec wheels.
+4. Because the large torch wheel download repeatedly stalled, the runtime was pinned to the more compatible Python 3.11 stack:
+   - `whisperx==3.4.5`;
+   - `pyannote.audio==3.4.0`;
+   - `ctranslate2==4.4.0`;
+   - `transformers==4.57.6`.
+5. The packages are installed in `.venv311`, and `pip check` reports no broken requirements.
+6. Direct import initially exposed a real compatibility issue: `pyannote.audio 3.4.0` expects legacy top-level `torchaudio.AudioMetaData`, `torchaudio.info`, and `torchaudio.list_audio_backends`, while the current `torchaudio 2.11.0+cpu` package uses the newer TorchCodec-style API.
+7. Added a project-side torchaudio legacy compatibility shim before WhisperX/pyannote imports. The shim supplies `AudioMetaData`, `info`, backend helpers, and a `soundfile`-based load/save fallback when TorchCodec is unavailable.
+
+### Verification So Far
+
+1. `from audio_processor.model_runtime import _prepare_torchaudio_legacy_api; ... import whisperx, pyannote.audio` passed.
+2. `audio_processor check` reports WhisperX and pyannote.audio available.
+3. `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging` passed.
+4. `.venv311\Scripts\python.exe -m unittest discover` passed with 60 tests.
+
+### Next
+
+1. Update user-facing docs so WhisperX/pyannote are no longer described as outside the default full package.
+2. Rebuild full no-VST3 and VST3 portable packages with the expanded runtime.
+3. Run portable startup/model/UVR smoke tests.
+4. Commit and push the branch after verification.
+
+### Final Verification This Round
+
+1. README, portable README, and model pipeline docs now state that WhisperX and pyannote.audio are part of the full Python 3.11 runtime.
+2. Rebuilt full package outputs:
+   - `dist\VocalProcess-portable.zip`: 1,413,022,068 bytes;
+   - `dist\VocalProcess-portable-vst3.zip`: 1,415,457,165 bytes.
+3. Both rebuilt full packages passed `scripts\smoke_portable.ps1`.
+4. Full package model smoke passed:
+   `scripts\smoke_portable_model.ps1 -PortableRoot dist\VocalProcess-portable\VocalProcess -WorkRoot .tmp\portable-model-smoke-full-expanded -SourceSeparation never`.
+5. Full package UVR worker smoke passed:
+   `scripts\smoke_portable_uvr_worker.ps1 -PortableRoot dist\VocalProcess-portable\VocalProcess -WorkRoot .tmp\portable-uvr-smoke-full-expanded`.
+6. Portable `VocalProcess.exe check` exited 0 and reported `WhisperX: available` and `pyannote.audio: available` from inside the rebuilt package.

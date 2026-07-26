@@ -16,10 +16,11 @@ from .engine import (
     process_audio,
     summarize_probe,
 )
-from .model_assist import backend_availability, build_model_assisted_pipeline_plan, list_model_candidates
-from .model_runtime import get_model_runtime_report
-from .settings import COMPUTE_DEVICE_OPTIONS, ProcessingSettings
-from .vst3_bridge import bridge_request_template, run_bridge_request_file
+from .model_assist import build_model_assisted_pipeline_plan, list_model_candidates
+from .preflight import build_preflight_report
+from .model_runtime import backend_availability, get_model_runtime_report
+from .settings import COMPUTE_DEVICE_OPTIONS, SOURCE_SEPARATION_OPTIONS, ProcessingSettings
+from .vst3_bridge import bridge_request_template, bridge_watch_contract, run_bridge_request_file, run_bridge_watch
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="model runtime device: auto, cpu, or cuda",
     )
+    batch_parser.add_argument(
+        "--source-separation",
+        choices=SOURCE_SEPARATION_OPTIONS,
+        default="auto",
+        help="reference vocal separation strategy: auto, always, or never",
+    )
 
     daw_parser = subparsers.add_parser(
         "export-daw",
@@ -139,12 +146,51 @@ def build_parser() -> argparse.ArgumentParser:
     daw_parser.add_argument("--sample-rate", type=int, help="output sample rate")
     daw_parser.add_argument("--channels", type=int, help="output channel count")
 
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="preflight model ordering and stretch planning without rendering audio",
+    )
+    analyze_parser.add_argument("reference", type=Path, help="reference/original audio file")
+    analyze_parser.add_argument("material_directory", type=Path, help="folder containing material audio")
+    analyze_parser.add_argument("--lyrics-file", type=Path, help="optional lyrics text, LRC, SRT, or DOCX file")
+    analyze_parser.add_argument("--output", type=Path, help="optional JSON report path")
+    analyze_parser.add_argument(
+        "--compute-device",
+        choices=COMPUTE_DEVICE_OPTIONS,
+        default="auto",
+        help="model runtime device: auto, cpu, or cuda",
+    )
+    analyze_parser.add_argument(
+        "--source-separation",
+        choices=SOURCE_SEPARATION_OPTIONS,
+        default="auto",
+        help="reference vocal separation strategy: auto, always, or never",
+    )
+
     bridge_parser = subparsers.add_parser(
         "vst3-bridge",
         help="run a JSON bridge request for future VST3/native host integration",
     )
     bridge_parser.add_argument("request", type=Path, nargs="?", help="bridge request JSON file")
     bridge_parser.add_argument("--response", type=Path, help="response JSON output file")
+    bridge_parser.add_argument("--watch", type=Path, help="watch a request directory for *.request.json files")
+    bridge_parser.add_argument("--responses", type=Path, help="response directory for watch mode")
+    bridge_parser.add_argument(
+        "--poll-ms",
+        type=int,
+        default=500,
+        help="watch polling interval in milliseconds",
+    )
+    bridge_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="process available bridge requests once and exit",
+    )
+    bridge_parser.add_argument(
+        "--contract",
+        action="store_true",
+        help="print the bridge file contract instead of handling a request",
+    )
     bridge_parser.add_argument(
         "--template",
         action="store_true",
@@ -218,6 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lyrics_file=str(args.lyrics_file or ""),
                 daw_timeline_export=args.daw_timeline_export,
                 compute_device=args.compute_device,
+                source_separation=args.source_separation,
                 output_directory=str(args.output.parent),
                 output_extension=args.output.suffix,
                 overwrite=args.overwrite,
@@ -265,12 +312,41 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Wrote {result.csv_path}")
             return 0
 
+        if args.command == "analyze":
+            report = build_preflight_report(
+                args.reference,
+                args.material_directory,
+                lyrics_file=args.lyrics_file,
+                compute_device=args.compute_device,
+                source_separation=args.source_separation,
+            )
+            payload = json.dumps(report, ensure_ascii=False, indent=2)
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(payload, encoding="utf-8")
+                print(f"Wrote {args.output}")
+            else:
+                print(payload)
+            return 0
+
         if args.command == "vst3-bridge":
+            if args.contract:
+                print(json.dumps(bridge_watch_contract(), ensure_ascii=False, indent=2))
+                return 0
             if args.template:
                 print(json.dumps(bridge_request_template(), ensure_ascii=False, indent=2))
                 return 0
+            if args.watch is not None:
+                processed = run_bridge_watch(
+                    args.watch,
+                    response_directory=args.responses,
+                    poll_interval_seconds=max(args.poll_ms, 50) / 1000.0,
+                    once=args.once,
+                )
+                print(json.dumps({"processed": processed}, ensure_ascii=False))
+                return 0
             if args.request is None:
-                parser.error("vst3-bridge requires a request file unless --template is used")
+                parser.error("vst3-bridge requires a request file unless --template, --contract, or --watch is used")
                 return 2
             response = run_bridge_request_file(args.request, args.response)
             if not response.get("ok"):

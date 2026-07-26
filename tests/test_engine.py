@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 import wave
 from pathlib import Path
@@ -11,11 +12,13 @@ from unittest.mock import patch
 from audio_processor import model_runtime
 from audio_processor.batch import BatchSummary, create_queue, run_batch_queue
 from audio_processor.cli import build_parser
+from audio_processor.cli import main as cli_main
 from audio_processor.diagnostics import DiagnosticLogger, diagnostic_log_path
 from audio_processor.daw import (
     DawExportResult,
     DawTimelineClip,
     DawTimelinePlan,
+    export_daw_timeline_with_progress,
     plan_daw_timeline,
     render_reaper_project,
 )
@@ -48,7 +51,10 @@ from audio_processor.vst3_bridge import (
     BRIDGE_REQUEST_FORMAT,
     BRIDGE_RESPONSE_FORMAT,
     bridge_request_template,
+    bridge_watch_contract,
     run_bridge_request,
+    run_bridge_request_file,
+    run_bridge_watch,
 )
 
 
@@ -406,6 +412,53 @@ class ProbeSummaryTests(unittest.TestCase):
                     probe_audio(path)
 
 
+class SourceSeparationTests(unittest.TestCase):
+    def test_uvr_vocal_output_finder_ignores_instrumental_stems(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "song_(Instrumental).wav").write_bytes(b"")
+            vocal = root / "song_(Vocals).wav"
+            vocal.write_bytes(b"")
+
+            self.assertEqual(model_runtime.find_uvr_vocal_output(root), vocal)
+
+    def test_maybe_separate_vocals_uses_uvr_before_demucs(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            vocal = root / "uvr-vocals.wav"
+            reference.write_bytes(b"placeholder")
+            vocal.write_bytes(b"placeholder")
+            notes: list[str] = []
+
+            with patch.dict(os.environ, {"VOCAL_PROCESS_SOURCE_SEPARATOR": "uvr-only"}):
+                with patch("audio_processor.model_runtime.find_uvr_vocal_output", return_value=None):
+                    with patch("audio_processor.model_runtime.separate_vocals_with_uvr", return_value=vocal):
+                        result = model_runtime._maybe_separate_vocals(
+                            reference,
+                            work_dir=root / "work",
+                            compute_device="cpu",
+                            source_separation="auto",
+                            notes=notes,
+                        )
+
+        self.assertEqual(result, vocal)
+        self.assertFalse(any("demucs" in note.lower() for note in notes))
+
+    def test_reference_cache_key_includes_uvr_model(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            reference.write_bytes(b"placeholder")
+
+            with patch.dict(os.environ, {"VOCAL_PROCESS_UVR_MODEL": "htdemucs"}):
+                first = model_runtime._reference_cache_path(root, reference, None, "cpu", "auto")
+            with patch.dict(os.environ, {"VOCAL_PROCESS_UVR_MODEL": "custom-mdx.onnx"}):
+                second = model_runtime._reference_cache_path(root, reference, None, "cpu", "auto")
+
+        self.assertNotEqual(first.name, second.name)
+
+
 class SettingsTests(unittest.TestCase):
     def test_default_output_extension_is_wav(self) -> None:
         self.assertEqual(ProcessingSettings().output_extension, ".wav")
@@ -416,6 +469,7 @@ class SettingsTests(unittest.TestCase):
             material_directory="materials",
             lyrics_file="lyrics.txt",
             daw_timeline_export=True,
+            source_separation="never",
             output_directory="out",
             output_extension="wav",
             overwrite=False,
@@ -435,6 +489,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(loaded.material_directory, "materials")
         self.assertEqual(loaded.lyrics_file, "lyrics.txt")
         self.assertTrue(loaded.daw_timeline_export)
+        self.assertEqual(loaded.source_separation, "never")
         self.assertEqual(loaded.output_directory, "out")
         self.assertFalse(loaded.overwrite)
         self.assertEqual(loaded.gain_db, -2.5)
@@ -600,12 +655,43 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.compute_device, "cpu")
 
+    def test_batch_subcommand_accepts_source_separation(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "batch",
+                "reference.wav",
+                "out.wav",
+                "--material-directory",
+                "materials",
+                "--source-separation",
+                "never",
+            ]
+        )
+
+        self.assertEqual(args.source_separation, "never")
+
     def test_vst3_bridge_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["vst3-bridge", "request.json", "--response", "response.json"])
 
         self.assertEqual(args.command, "vst3-bridge")
         self.assertEqual(args.request, Path("request.json"))
         self.assertEqual(args.response, Path("response.json"))
+
+    def test_analyze_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(["analyze", "reference.wav", "materials", "--output", "analysis.json"])
+
+        self.assertEqual(args.command, "analyze")
+        self.assertEqual(args.reference, Path("reference.wav"))
+        self.assertEqual(args.material_directory, Path("materials"))
+        self.assertEqual(args.output, Path("analysis.json"))
+
+    def test_vst3_bridge_watch_arguments_are_registered(self) -> None:
+        args = build_parser().parse_args(["vst3-bridge", "--watch", "requests", "--responses", "responses", "--once"])
+
+        self.assertEqual(args.command, "vst3-bridge")
+        self.assertEqual(args.watch, Path("requests"))
+        self.assertEqual(args.responses, Path("responses"))
+        self.assertTrue(args.once)
 
 
 class I18nTests(unittest.TestCase):
@@ -760,6 +846,76 @@ class ModelRuntimeTests(unittest.TestCase):
         vad_mock.assert_not_called()
         speaker_mock.assert_not_called()
 
+    def test_reference_analysis_cache_reuses_matching_cache(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            _write_test_wave(reference)
+            transcript = {
+                "backend": "fake",
+                "text": "alpha",
+                "segments": [model_runtime.TranscriptSegment(0.0, 1.0, "alpha")],
+                "notes": [],
+            }
+
+            with patch("audio_processor.model_runtime._maybe_separate_vocals", return_value=reference):
+                with patch("audio_processor.model_runtime._transcribe_audio", return_value=transcript) as transcribe_mock:
+                    with patch("audio_processor.model_runtime._speaker_embedding", return_value=None):
+                        first = model_runtime.analyze_reference(
+                            reference,
+                            work_dir=root / "work",
+                            source_separation="never",
+                        )
+                        second = model_runtime.analyze_reference(
+                            reference,
+                            work_dir=root / "work",
+                            source_separation="never",
+                        )
+
+        self.assertEqual(first.transcript, "alpha")
+        self.assertEqual(second.transcript, "alpha")
+        self.assertEqual(transcribe_mock.call_count, 1)
+
+
+class DawRenderReuseTests(unittest.TestCase):
+    def test_daw_export_reuses_duplicate_stretched_clip(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            material = material_dir / "same.wav"
+            project = root / "out" / "song.rpp"
+            _write_test_wave(reference, duration_seconds=2.0)
+            _write_test_wave(material, duration_seconds=1.0)
+
+            def fake_render(
+                input_path: Path,
+                output_path: Path,
+                tempo: float,
+                options: ProcessOptions,
+                *,
+                target_duration: float | None = None,
+                on_progress: object | None = None,
+                should_cancel: object | None = None,
+            ) -> None:
+                _write_test_wave(output_path, duration_seconds=target_duration or 1.0)
+
+            with patch("audio_processor.daw.process_material_clip_with_progress", side_effect=fake_render) as render_mock:
+                result = export_daw_timeline_with_progress(
+                    reference,
+                    material_dir,
+                    project,
+                    ProcessOptions(input_path=reference, output_path=project, overwrite=True),
+                    material_paths=[material, material],
+                    target_durations=[1.0, 1.0],
+                )
+
+                self.assertEqual(render_mock.call_count, 1)
+                self.assertEqual(len(result.clips), 2)
+                self.assertTrue(result.clips[0].rendered_path.exists())
+                self.assertTrue(result.clips[1].rendered_path.exists())
+
 
 class Vst3BridgeTests(unittest.TestCase):
     def test_bridge_template_is_serializable(self) -> None:
@@ -793,6 +949,114 @@ class Vst3BridgeTests(unittest.TestCase):
         self.assertEqual(response["format"], BRIDGE_RESPONSE_FORMAT)
         self.assertTrue(response["ok"])
         self.assertEqual(response["status"], "Done")
+
+    def test_bridge_request_file_writes_response_next_to_request(self) -> None:
+        request = {
+            "format": BRIDGE_REQUEST_FORMAT,
+            "request_id": "bridge-test-002",
+            "command": "render_timeline",
+            "reference_path": "reference.wav",
+            "material_directory": "materials",
+            "output_path": "out/song.rpp",
+            "compute_device": "cpu",
+            "overwrite": True,
+        }
+
+        def fake_run_batch(items: list[object], settings: ProcessingSettings) -> BatchSummary:
+            item = items[0]
+            item.status = "Done"
+            item.message = "Complete"
+            return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request_path = root / "bridge-test-002.request.json"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+
+            with patch("audio_processor.vst3_bridge.run_batch_queue", side_effect=fake_run_batch):
+                response = run_bridge_request_file(request_path)
+
+            response_path = root / "bridge-test-002.response.json"
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+            self.assertTrue(response_path.exists())
+
+        self.assertEqual(payload["request_id"], "bridge-test-002")
+        self.assertEqual(response["request_id"], "bridge-test-002")
+
+    def test_bridge_watch_processes_request_files(self) -> None:
+        request = {
+            "format": BRIDGE_REQUEST_FORMAT,
+            "request_id": "bridge-test-001",
+            "command": "render_timeline",
+            "reference_path": "reference.wav",
+            "material_directory": "materials",
+            "output_path": "out/song.rpp",
+            "compute_device": "cpu",
+            "overwrite": True,
+        }
+
+        def fake_run_batch(items: list[object], settings: ProcessingSettings) -> BatchSummary:
+            item = items[0]
+            item.status = "Done"
+            item.message = "Complete"
+            self.assertTrue(settings.daw_timeline_export)
+            self.assertEqual(settings.compute_device, "cpu")
+            return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request_dir = root / "requests"
+            response_dir = root / "responses"
+            request_dir.mkdir()
+            response_dir.mkdir()
+            request_path = request_dir / "bridge-test-001.request.json"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+
+            with patch("audio_processor.vst3_bridge.run_batch_queue", side_effect=fake_run_batch):
+                processed = run_bridge_watch(request_dir, response_directory=response_dir, once=True)
+
+            response_path = response_dir / "bridge-test-001.response.json"
+            done_path = request_dir / "bridge-test-001.done.json"
+            heartbeat_path = response_dir / "bridge.heartbeat.json"
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(done_path.exists())
+            self.assertTrue(heartbeat_path.exists())
+
+        self.assertEqual(processed, 1)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["request_id"], "bridge-test-001")
+
+    def test_bridge_watch_contract_is_serializable(self) -> None:
+        contract = bridge_watch_contract()
+
+        self.assertEqual(contract["format"], "vocal_process_vst3_bridge_contract_v1")
+        json.dumps(contract, ensure_ascii=False)
+
+    def test_analyze_cli_writes_json_report(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "analysis.json"
+
+            with patch(
+                "audio_processor.cli.build_preflight_report",
+                return_value={
+                    "format": "vocal_process_preflight_analysis_v1",
+                    "status": "ok",
+                },
+            ):
+                code = cli_main([
+                    "analyze",
+                    "reference.wav",
+                    "materials",
+                    "--output",
+                    str(output),
+                ])
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["format"], "vocal_process_preflight_analysis_v1")
 
 
 if __name__ == "__main__":

@@ -8,3 +8,19 @@ This portable package includes FFmpeg command-line binaries:
 The FFmpeg binaries installed on this build machine are licensed under the GNU General Public License version 3. The portable package copies the upstream FFmpeg LICENSE and README files into the licenses folder.
 
 FFmpeg project: https://ffmpeg.org/
+
+If this package includes `plugins\VocalProcess Bridge.vst3`, that plug-in was built with JUCE.
+JUCE project: https://github.com/juce-framework/JUCE
+JUCE licensing is governed by the JUCE licence terms or AGPLv3 option for eligible use.
+
+Optional model/runtime projects referenced by the source tree:
+
+- OpenAI Whisper: https://github.com/openai/whisper
+- Faster Whisper: https://github.com/SYSTRAN/faster-whisper
+- Demucs: https://github.com/facebookresearch/demucs
+- Silero VAD: https://github.com/snakers4/silero-vad
+- SpeechBrain: https://github.com/speechbrain/speechbrain
+- pyannote.audio: https://github.com/pyannote/pyannote-audio
+- whisper.cpp: https://github.com/ggerganov/whisper.cpp
+- Librosa: https://github.com/librosa/librosa
+- MSAF: https://github.com/urinieto/msaf

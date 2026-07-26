@@ -110,6 +110,7 @@ def run_batch_queue(
                     lyrics_file=Path(settings.lyrics_file) if settings.lyrics_file else None,
                     work_dir=diagnostics.path.parent / "model_analysis_cache",
                     compute_device=settings.compute_device,
+                    source_separation=settings.source_separation,
                     on_progress=progress_callback,
                 )
                 ordered_material_paths = list(ordering.ordered_paths)
@@ -130,6 +131,17 @@ def run_batch_queue(
                     quality_warning_count=sum(1 for clip in stretch_plan if clip.quality_warning),
                     clips=render_material_stretch_plan(stretch_plan),
                 )
+                lowest_score = min((decision.score for decision in ordering.decisions), default=0.0)
+                review_required = lowest_score < 0.18 or any(clip.quality_warning for clip in stretch_plan)
+                if review_required:
+                    diagnostics.event(
+                        "model.ordering.review_required",
+                        "Model-assisted ordering or stretch plan should be reviewed before trusting the output",
+                        level="warning",
+                        lowest_score=lowest_score,
+                        severe_warning_count=sum(1 for clip in stretch_plan if clip.quality_warning == "extreme_stretch_ratio"),
+                        moderate_warning_count=sum(1 for clip in stretch_plan if clip.quality_warning == "moderate_stretch_ratio"),
+                    )
                 if settings.daw_timeline_export:
                     export_daw_timeline_with_progress(
                         item.input_path,

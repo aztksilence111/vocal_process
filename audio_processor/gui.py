@@ -15,10 +15,12 @@ from .i18n import normalize_language, translate, translate_message, translate_st
 from .model_runtime import get_model_runtime_report
 from .settings import (
     COMPUTE_DEVICE_OPTIONS,
+    SOURCE_SEPARATION_OPTIONS,
     WINDOW_GEOMETRY_OPTIONS,
     ProcessingSettings,
     load_settings,
     normalize_compute_device,
+    normalize_source_separation,
     normalize_window_geometry,
     save_settings,
 )
@@ -59,6 +61,7 @@ class AudioProcessorApp(tk.Tk):
         self.lyrics_file_var = tk.StringVar()
         self.daw_timeline_export_var = tk.BooleanVar()
         self.compute_device_var = tk.StringVar(value="auto")
+        self.source_separation_var = tk.StringVar(value="auto")
         self.window_geometry_var = tk.StringVar(value="980x680")
         self.output_extension_var = tk.StringVar()
         self.overwrite_var = tk.BooleanVar()
@@ -227,6 +230,25 @@ class AudioProcessorApp(tk.Tk):
             state="readonly",
             width=12,
         ).grid(row=row, column=1, sticky="w", pady=4)
+
+        row += 1
+        self._label(parent, "source_separation").grid(row=row, column=0, sticky="w", pady=4)
+        source_mode_frame = ttk.Frame(parent)
+        source_mode_frame.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
+        for index, (mode, key) in enumerate(
+            (
+                ("auto", "source_separation_auto"),
+                ("never", "source_separation_never"),
+                ("always", "source_separation_always"),
+            )
+        ):
+            button = ttk.Radiobutton(
+                source_mode_frame,
+                variable=self.source_separation_var,
+                value=mode,
+            )
+            button.grid(row=0, column=index, sticky="w", padx=(0 if index == 0 else 8, 0))
+            self.translated_widgets.append((button, key))
 
         row += 1
         self._label(parent, "window_geometry").grid(row=row, column=0, sticky="w", pady=4)
@@ -482,6 +504,7 @@ class AudioProcessorApp(tk.Tk):
             lyrics_file=self.lyrics_file_var.get().strip(),
             daw_timeline_export=self.daw_timeline_export_var.get(),
             compute_device=normalize_compute_device(self.compute_device_var.get()),
+            source_separation=normalize_source_separation(self.source_separation_var.get()),
             window_geometry=normalize_window_geometry(self.window_geometry_var.get()),
             output_directory=self.output_directory_var.get().strip(),
             output_extension=self.output_extension_var.get().strip(),
@@ -503,6 +526,7 @@ class AudioProcessorApp(tk.Tk):
         self.lyrics_file_var.set(settings.lyrics_file)
         self.daw_timeline_export_var.set(settings.daw_timeline_export)
         self.compute_device_var.set(settings.compute_device)
+        self.source_separation_var.set(settings.source_separation)
         self.window_geometry_var.set(settings.window_geometry)
         self.output_directory_var.set(settings.output_directory)
         self.output_extension_var.set(settings.output_extension)
@@ -710,6 +734,8 @@ class AudioProcessorApp(tk.Tk):
     ) -> None:
         if settings.compute_device not in COMPUTE_DEVICE_OPTIONS:
             raise ValueError(self._t("invalid_compute_device"))
+        if settings.source_separation not in SOURCE_SEPARATION_OPTIONS:
+            raise ValueError(self._t("invalid_source_separation"))
 
         if require_material and not settings.material_directory:
             raise ValueError(self._t("missing_material_directory"))
@@ -734,6 +760,7 @@ class AudioProcessorApp(tk.Tk):
             self._log(self._t("model_assisted_ordering_active"))
             self._log(self._t("material_cache_enabled"))
             self._log(self._t("compute_device_active", device=settings.compute_device))
+            self._log(self._t("source_separation_active", mode=settings.source_separation))
             if settings.daw_timeline_export:
                 self._log(self._t("daw_timeline_mode_active"))
             self._log(self._t("material_active", path=settings.material_directory))

@@ -73,6 +73,15 @@ OPEN_SOURCE_MODEL_CANDIDATES: tuple[ModelCandidate, ...] = (
         notes="Useful when the original audio is a mixed song instead of isolated vocals.",
     ),
     ModelCandidate(
+        name="UVR Headless Runner",
+        repository_url="https://github.com/chyinan/uvr-headless-runner",
+        pipeline_stage="source_separation",
+        role="Run UVR-style MDX, Demucs, or VR separation models in an isolated Python 3.10 worker.",
+        optional_dependency="uvr-headless-runner",
+        install_hint="powershell -ExecutionPolicy Bypass -File scripts\\bootstrap_uvr_worker.ps1",
+        notes="Kept outside the main Python 3.11 environment because the package targets Python versions below 3.11.",
+    ),
+    ModelCandidate(
         name="Silero VAD",
         repository_url="https://github.com/snakers4/silero-vad",
         pipeline_stage="voice_activity_detection",
@@ -100,6 +109,15 @@ OPEN_SOURCE_MODEL_CANDIDATES: tuple[ModelCandidate, ...] = (
         notes="Best fit for matching material text to reference vocal timing.",
     ),
     ModelCandidate(
+        name="Faster Whisper",
+        repository_url="https://github.com/SYSTRAN/faster-whisper",
+        pipeline_stage="asr",
+        role="Run Whisper-style transcription through CTranslate2 for faster local ASR.",
+        optional_dependency="faster_whisper",
+        install_hint="pip install faster-whisper",
+        notes="Preferred accelerated ASR backend when installed; falls back to OpenAI Whisper if unavailable.",
+    ),
+    ModelCandidate(
         name="OpenAI Whisper",
         repository_url="https://github.com/openai/whisper",
         pipeline_stage="asr",
@@ -109,6 +127,15 @@ OPEN_SOURCE_MODEL_CANDIDATES: tuple[ModelCandidate, ...] = (
         notes="General-purpose multilingual speech recognition model.",
     ),
     ModelCandidate(
+        name="whisper.cpp",
+        repository_url="https://github.com/ggerganov/whisper.cpp",
+        pipeline_stage="asr",
+        role="Potential future native/offline ASR runtime for smaller CPU-first packages.",
+        optional_dependency="whisper_cpp",
+        install_hint="install a whisper.cpp binary or Python binding",
+        notes="Not called by the current Python pipeline; tracked as a candidate for smaller non-Python ASR builds.",
+    ),
+    ModelCandidate(
         name="SpeechBrain",
         repository_url="https://github.com/speechbrain/speechbrain",
         pipeline_stage="speaker_similarity",
@@ -116,6 +143,24 @@ OPEN_SOURCE_MODEL_CANDIDATES: tuple[ModelCandidate, ...] = (
         optional_dependency="speechbrain",
         install_hint="pip install speechbrain",
         notes="Candidate backend for ECAPA-TDNN style speaker embeddings.",
+    ),
+    ModelCandidate(
+        name="Librosa",
+        repository_url="https://github.com/librosa/librosa",
+        pipeline_stage="music_structure",
+        role="Estimate repeated sections and self-similar regions for future safe reuse planning.",
+        optional_dependency="librosa",
+        install_hint="pip install librosa",
+        notes="Useful for non-destructive structure analysis; not a replacement for ASR matching.",
+    ),
+    ModelCandidate(
+        name="MSAF",
+        repository_url="https://github.com/urinieto/msaf",
+        pipeline_stage="music_structure",
+        role="Candidate framework for music structural segmentation such as verse/chorus boundaries.",
+        optional_dependency="msaf",
+        install_hint="pip install msaf",
+        notes="Potential future section detector; kept optional because it increases dependency weight.",
     ),
 )
 
@@ -133,7 +178,7 @@ def build_model_assisted_pipeline_plan() -> dict[str, object]:
                 "stage": "source_separation",
                 "input": "original/reference audio",
                 "output": "isolated reference vocal stem when needed",
-                "candidate_models": ["Demucs"],
+                "candidate_models": ["UVR Headless Runner", "Demucs"],
             },
             {
                 "stage": "voice_activity_detection",
@@ -145,7 +190,7 @@ def build_model_assisted_pipeline_plan() -> dict[str, object]:
                 "stage": "asr_alignment",
                 "input": "vocal ranges",
                 "output": "transcript segments with timestamps",
-                "candidate_models": ["WhisperX", "OpenAI Whisper"],
+                "candidate_models": ["Faster Whisper", "WhisperX", "OpenAI Whisper", "whisper.cpp"],
             },
             {
                 "stage": "speaker_similarity",
@@ -158,6 +203,12 @@ def build_model_assisted_pipeline_plan() -> dict[str, object]:
                 "input": "transcript, timing, and similarity scores",
                 "output": "ordered material clips with start times for WAV/RPP export",
                 "candidate_models": ["VocalProcess internal planner"],
+            },
+            {
+                "stage": "music_structure",
+                "input": "reference audio and transcript timings",
+                "output": "safe repeated-section hints for caching and manual review",
+                "candidate_models": ["Librosa", "MSAF", "VocalProcess internal repetition planner"],
             },
         ],
         "candidates": list_model_candidates(),
