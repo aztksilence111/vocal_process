@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import hashlib
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,9 @@ class MaterialStretchClip:
     target_duration_seconds: float
     tempo: float
     quality_warning: str = ""
+    requested_tempo: float | None = None
+    stretch_strategy: str = "rubberband_full_clip"
+    text_hint: str = ""
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {
@@ -261,6 +265,7 @@ def build_material_assembly_args(
     options: ProcessOptions,
     *,
     material_target_durations: Sequence[float | None] | None = None,
+    material_text_hints: Sequence[str] | None = None,
     progress: bool = False,
 ) -> list[str]:
     _validate_options(options)
@@ -272,6 +277,7 @@ def build_material_assembly_args(
         reference_path,
         material_paths,
         target_durations=material_target_durations,
+        material_text_hints=material_text_hints,
     )
     filters = _build_material_plan_filter_graph(clip_plan, options)
 
@@ -317,6 +323,44 @@ def build_material_clip_args(
     args.append("-y" if options.overwrite else "-n")
     args.extend(["-i", str(input_path)])
     args.extend(["-af", _build_material_clip_filter(tempo, options, target_duration=target_duration)])
+
+    if options.sample_rate is not None:
+        args.extend(["-ar", str(options.sample_rate)])
+
+    if options.channels is not None:
+        args.extend(["-ac", str(options.channels)])
+
+    codec = options.codec or _default_audio_codec(output_path)
+    if codec:
+        args.extend(["-codec:a", codec])
+
+    args.append(str(output_path))
+    return args
+
+
+def _build_rendered_clip_concat_args(
+    clip_paths: Sequence[Path],
+    output_path: Path,
+    options: ProcessOptions,
+    *,
+    progress: bool = False,
+) -> list[str]:
+    if not clip_paths:
+        raise AudioProcessorError("Rendered material clip list is empty")
+
+    args = ["ffmpeg", "-hide_banner"]
+    if progress:
+        args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+
+    args.append("-y" if options.overwrite else "-n")
+    for path in clip_paths:
+        args.extend(["-i", str(path)])
+
+    if len(clip_paths) == 1:
+        args.extend(["-map", "0:a"])
+    else:
+        labels = "".join(f"[{index}:a]" for index in range(len(clip_paths)))
+        args.extend(["-filter_complex", f"{labels}concat=n={len(clip_paths)}:v=0:a=1[outa]", "-map", "[outa]"])
 
     if options.sample_rate is not None:
         args.extend(["-ar", str(options.sample_rate)])
@@ -410,6 +454,7 @@ def assemble_material_to_reference_with_progress(
     *,
     material_paths: Sequence[Path] | None = None,
     material_target_durations: Sequence[float | None] | None = None,
+    material_text_hints: Sequence[str] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> None:
@@ -423,6 +468,20 @@ def assemble_material_to_reference_with_progress(
 
     ordered_material_paths = list(material_paths) if material_paths is not None else list_audio_files(material_directory)
     reference_duration = get_audio_duration_seconds(probe_audio(normalized_reference))
+    if len(ordered_material_paths) > 1 or material_target_durations is not None or material_text_hints is not None:
+        _assemble_material_clips_with_render_cache(
+            normalized_reference,
+            ordered_material_paths,
+            normalized_output,
+            options,
+            material_target_durations=material_target_durations,
+            material_text_hints=material_text_hints,
+            reference_duration=reference_duration,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+        )
+        return
+
     args = build_material_assembly_args(
         normalized_reference,
         ordered_material_paths,
@@ -442,6 +501,7 @@ def assemble_material_to_reference_with_progress(
             codec=options.codec,
         ),
         material_target_durations=material_target_durations,
+        material_text_hints=material_text_hints,
         progress=True,
     )
     _run_progress_process(
@@ -452,11 +512,100 @@ def assemble_material_to_reference_with_progress(
     )
 
 
+def _assemble_material_clips_with_render_cache(
+    reference_path: Path,
+    material_paths: Sequence[Path],
+    output_path: Path,
+    options: ProcessOptions,
+    *,
+    material_target_durations: Sequence[float | None] | None,
+    material_text_hints: Sequence[str] | None,
+    reference_duration: float,
+    on_progress: ProgressCallback | None,
+    should_cancel: CancelCallback | None,
+) -> None:
+    if output_path.exists() and not options.overwrite:
+        raise AudioProcessorError(f"Output file already exists: {output_path}")
+
+    clips = plan_material_stretch_clips(
+        reference_path,
+        material_paths,
+        target_durations=material_target_durations,
+        material_text_hints=material_text_hints,
+    )
+    cache_root = output_path.parent / ".vocalprocess_render_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    rendered_paths: list[Path] = []
+    total_steps = len(clips) + 1
+
+    for clip in clips:
+        if should_cancel is not None and should_cancel():
+            raise AudioProcessorError("Processing cancelled")
+
+        cache_path = cache_root / f"{_material_render_cache_key(clip, options)}.wav"
+        if cache_path.exists():
+            rendered_paths.append(cache_path)
+            _notify_progress(
+                on_progress,
+                clip.index / total_steps,
+                f"Reused rendered material clip {clip.index}/{len(clips)}",
+            )
+            continue
+
+        cache_options = ProcessOptions(
+            input_path=clip.source_path,
+            output_path=cache_path,
+            overwrite=True,
+            gain_db=options.gain_db,
+            normalize=options.normalize,
+            highpass_hz=options.highpass_hz,
+            lowpass_hz=options.lowpass_hz,
+            sample_rate=options.sample_rate,
+            channels=options.channels,
+            codec=DAW_WAV_CODEC,
+        )
+
+        def clip_progress(progress: float, message: str) -> None:
+            _notify_progress(
+                on_progress,
+                ((clip.index - 1) + progress) / total_steps,
+                f"Rendering material clip {clip.index}/{len(clips)}: {message}",
+            )
+
+        process_material_clip_with_progress(
+            clip.source_path,
+            cache_path,
+            clip.tempo,
+            cache_options,
+            target_duration=clip.target_duration_seconds,
+            on_progress=clip_progress,
+            should_cancel=should_cancel,
+        )
+        rendered_paths.append(cache_path)
+
+    args = _build_rendered_clip_concat_args(rendered_paths, output_path, options, progress=True)
+
+    def concat_progress(progress: float, message: str) -> None:
+        _notify_progress(
+            on_progress,
+            (len(clips) + progress) / total_steps,
+            f"Concatenating rendered material clips: {message}",
+        )
+
+    _run_progress_process(
+        args,
+        duration_seconds=reference_duration,
+        on_progress=concat_progress,
+        should_cancel=should_cancel,
+    )
+
+
 def plan_material_stretch_clips(
     reference_path: Path,
     material_paths: Sequence[Path],
     *,
     target_durations: Sequence[float | None] | None = None,
+    material_text_hints: Sequence[str] | None = None,
 ) -> list[MaterialStretchClip]:
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
@@ -483,11 +632,13 @@ def plan_material_stretch_clips(
     )
 
     clips: list[MaterialStretchClip] = []
-    for index, (path, source_duration, target_duration) in enumerate(
-        zip(normalized_materials, source_durations, resolved_targets),
+    resolved_text_hints = _resolve_material_text_hints(len(normalized_materials), material_text_hints)
+    for index, (path, source_duration, target_duration, text_hint) in enumerate(
+        zip(normalized_materials, source_durations, resolved_targets, resolved_text_hints),
         start=1,
     ):
-        tempo = source_duration / target_duration
+        requested_tempo = source_duration / target_duration
+        tempo, strategy = _resolve_stretch_strategy(requested_tempo, text_hint)
         _validate_rubberband_tempo(tempo)
         clips.append(
             MaterialStretchClip(
@@ -496,7 +647,10 @@ def plan_material_stretch_clips(
                 source_duration_seconds=source_duration,
                 target_duration_seconds=target_duration,
                 tempo=tempo,
-                quality_warning=_stretch_quality_warning(tempo),
+                quality_warning=_stretch_quality_warning(requested_tempo),
+                requested_tempo=requested_tempo,
+                stretch_strategy=strategy,
+                text_hint=text_hint,
             )
         )
     return clips
@@ -510,6 +664,9 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "source_duration_seconds": clip.source_duration_seconds,
             "target_duration_seconds": clip.target_duration_seconds,
             "rubberband_tempo": clip.tempo,
+            "requested_rubberband_tempo": clip.requested_tempo if clip.requested_tempo is not None else clip.tempo,
+            "stretch_strategy": clip.stretch_strategy,
+            "text_hint": clip.text_hint,
             "quality_warning": clip.quality_warning,
         }
         for clip in clips
@@ -691,6 +848,51 @@ def _resolve_material_target_durations(
         accumulated += adjusted_duration
     adjusted.append(max(reference_duration - accumulated, 0.001))
     return adjusted
+
+
+def _resolve_material_text_hints(count: int, hints: Sequence[str] | None) -> list[str]:
+    if hints is None or len(hints) != count:
+        return ["" for _ in range(count)]
+    return [str(hint or "") for hint in hints]
+
+
+def _resolve_stretch_strategy(requested_tempo: float, text_hint: str) -> tuple[float, str]:
+    if _is_short_material_text(text_hint) and requested_tempo < 0.75:
+        return 0.75, "syllable_safe_expand_with_tail_padding"
+    return requested_tempo, "rubberband_full_clip"
+
+
+def _is_short_material_text(text: str) -> bool:
+    units = re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", text.lower())
+    compact = "".join(units)
+    return 0 < len(compact) <= 4
+
+
+def _material_render_cache_key(clip: MaterialStretchClip, options: ProcessOptions) -> str:
+    stat = clip.source_path.stat()
+    payload = {
+        "format": "vocal_process_render_cache_key_v1",
+        "source_path": str(clip.source_path),
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "source_duration_seconds": round(clip.source_duration_seconds, 9),
+        "target_duration_seconds": round(clip.target_duration_seconds, 9),
+        "rubberband_tempo": round(clip.tempo, 10),
+        "requested_rubberband_tempo": round(clip.requested_tempo if clip.requested_tempo is not None else clip.tempo, 10),
+        "stretch_strategy": clip.stretch_strategy,
+        "text_hint": clip.text_hint,
+        "options": {
+            "gain_db": options.gain_db,
+            "normalize": options.normalize,
+            "highpass_hz": options.highpass_hz,
+            "lowpass_hz": options.lowpass_hz,
+            "sample_rate": options.sample_rate,
+            "channels": options.channels,
+            "codec": DAW_WAV_CODEC,
+        },
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _stretch_quality_warning(tempo: float) -> str:

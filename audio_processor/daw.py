@@ -30,6 +30,9 @@ class DawTimelineClip:
     target_duration_seconds: float
     tempo: float = 1.0
     quality_warning: str = ""
+    requested_tempo: float | None = None
+    stretch_strategy: str = "rubberband_full_clip"
+    text_hint: str = ""
     actual_duration_seconds: float = 0.0
 
 
@@ -61,6 +64,7 @@ def plan_daw_timeline(
     audio_directory: Path,
     *,
     target_durations: Sequence[float | None] | None = None,
+    material_text_hints: Sequence[str] | None = None,
 ) -> DawTimelinePlan:
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
@@ -69,6 +73,7 @@ def plan_daw_timeline(
         reference_path,
         material_paths,
         target_durations=target_durations,
+        material_text_hints=material_text_hints,
     )
     normalized_reference = reference_path.expanduser()
     reference_duration = sum(clip.target_duration_seconds for clip in clip_stretches)
@@ -92,6 +97,9 @@ def plan_daw_timeline(
                 target_duration_seconds=clip.target_duration_seconds,
                 tempo=clip.tempo,
                 quality_warning=clip.quality_warning,
+                requested_tempo=clip.requested_tempo,
+                stretch_strategy=clip.stretch_strategy,
+                text_hint=clip.text_hint,
             )
         )
         start += clip.target_duration_seconds
@@ -113,6 +121,7 @@ def export_daw_timeline_with_progress(
     *,
     material_paths: Sequence[Path] | None = None,
     target_durations: Sequence[float | None] | None = None,
+    material_text_hints: Sequence[str] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> DawExportResult:
@@ -134,6 +143,7 @@ def export_daw_timeline_with_progress(
         ordered_material_paths,
         audio_directory,
         target_durations=target_durations,
+        material_text_hints=material_text_hints,
     )
 
     rendered_clips: list[DawTimelineClip] = []
@@ -198,6 +208,9 @@ def export_daw_timeline_with_progress(
                 target_duration_seconds=clip.target_duration_seconds,
                 tempo=clip.tempo,
                 quality_warning=clip.quality_warning,
+                requested_tempo=clip.requested_tempo,
+                stretch_strategy=clip.stretch_strategy,
+                text_hint=clip.text_hint,
                 actual_duration_seconds=actual_duration,
             )
         )
@@ -276,6 +289,9 @@ def _write_csv(result: DawExportResult) -> None:
                 "start_seconds",
                 "target_duration_seconds",
                 "rubberband_tempo",
+                "requested_rubberband_tempo",
+                "stretch_strategy",
+                "text_hint",
                 "quality_warning",
                 "actual_duration_seconds",
             ]
@@ -289,6 +305,9 @@ def _write_csv(result: DawExportResult) -> None:
                     f"{clip.start_seconds:.6f}",
                     f"{clip.target_duration_seconds:.6f}",
                     f"{clip.tempo:.8f}",
+                    f"{(clip.requested_tempo if clip.requested_tempo is not None else clip.tempo):.8f}",
+                    clip.stretch_strategy,
+                    clip.text_hint,
                     clip.quality_warning,
                     f"{clip.actual_duration_seconds:.6f}",
                 ]

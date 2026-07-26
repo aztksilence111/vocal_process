@@ -8,6 +8,7 @@
 4. Before a new feature/change round starts, work must be isolated on a Git branch.
 5. After major verified changes, automatically commit and push the corresponding repository updates to GitHub unless the user explicitly asks to keep the work local.
 6. Every time `main` is updated, `README.md` must include an update log directly after the download instructions. This update log is the second-priority README section and should summarize what changed, release assets, and manual-test impact.
+7. Code changes must prioritize the long-term project architecture, maintainability, and manual-test reliability over the smallest immediately shippable patch. Each implementation round should fit the durable roadmap, reduce future rework, and avoid creating avoidable manual-test failures.
 
 ## Branch Promotion Rule
 

@@ -26,7 +26,8 @@ from .model_assist import (
     MaterialOrderDecision,
     VoiceSegment,
     list_model_candidates,
-    order_materials_for_reference,
+    plan_material_ordering,
+    render_ordering_score_matrix,
 )
 from .settings import get_config_dir
 from .uvr_worker import (
@@ -48,6 +49,7 @@ class TranscriptSegment:
     text: str
     confidence: float | None = None
     speaker_id: str | None = None
+    timing_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,9 +97,14 @@ class OrderingDecision:
     duration_score: float
     speaker_score: float
     vad_score: float
+    phonetic_score: float
+    evidence_count: int
+    confidence_label: str
     reference_text: str
     material_text: str
     reason: str
+    reference_segment_index: int | None = None
+    text_position: int | None = None
     target_duration_seconds: float | None = None
 
 
@@ -180,6 +187,7 @@ def build_model_ordering(
                     text=segment.text,
                     confidence=segment.confidence,
                     speaker_id=segment.speaker_id,
+                    timing_source=segment.timing_source,
                 )
                 for segment in analysis.segments
             ),
@@ -192,11 +200,12 @@ def build_model_ordering(
         for analysis in library.materials
     ]
 
-    decisions = order_materials_for_reference(
+    ordering_plan = plan_material_ordering(
         reference_segments,
         material_analyses,
         reference_embedding=reference.speaker_embedding,
     )
+    decisions = list(ordering_plan.decisions)
     ordered_paths = tuple(decision.material_path for decision in decisions)
     target_durations = _target_durations_for_decisions(
         reference_segments,
@@ -214,6 +223,8 @@ def build_model_ordering(
             "path": str(material_directory / MATERIAL_CACHE_FILE),
             "notes": [note for note in library.notes if "material analysis cache" in note],
         },
+        "ordering_strategy": ordering_plan.strategy,
+        "score_matrix": render_ordering_score_matrix(ordering_plan),
         "ordering": [
             {
                 "rank": decision.rank,
@@ -221,9 +232,14 @@ def build_model_ordering(
                 "score": decision.score,
                 "transcript_score": decision.transcript_score,
                 "filename_score": decision.filename_score,
+                "phonetic_score": decision.phonetic_score,
                 "duration_score": decision.duration_score,
                 "speaker_score": decision.speaker_score,
                 "vad_score": decision.vad_score,
+                "evidence_count": decision.evidence_count,
+                "confidence_label": decision.confidence_label,
+                "reference_segment_index": decision.reference_segment_index,
+                "text_position": decision.text_position,
                 "reference_text": decision.reference_text,
                 "material_text": decision.material_text,
                 "reason": decision.reason,
@@ -250,6 +266,11 @@ def build_model_ordering(
                 duration_score=decision.duration_score,
                 speaker_score=decision.speaker_score,
                 vad_score=decision.vad_score,
+                phonetic_score=decision.phonetic_score,
+                evidence_count=decision.evidence_count,
+                confidence_label=decision.confidence_label,
+                reference_segment_index=decision.reference_segment_index,
+                text_position=decision.text_position,
                 reference_text=decision.reference_text,
                 material_text=decision.material_text,
                 reason=decision.reason,
@@ -302,6 +323,7 @@ def analyze_reference(
     )
     transcript_result = _transcribe_audio(vocal_path, work_dir=work_root, compute_device=compute_device)
     reference_embedding = _speaker_embedding(vocal_path, work_dir=work_root, compute_device=compute_device)
+    notes.extend(_lyric_timing_notes(lyrics_file, transcript_result["segments"]))
     segments = _segments_from_transcript(transcript_result["segments"], lyrics_file=lyrics_file)
     if not segments:
         segments = (
@@ -310,6 +332,7 @@ def analyze_reference(
                 end_seconds=max(get_audio_duration_seconds(probe_audio(vocal_path)), 0.0),
                 text=transcript_result["text"],
                 confidence=0.0,
+                timing_source="asr_full_text_fallback",
             ),
         )
 
@@ -417,6 +440,7 @@ def render_reference_analysis(reference: ReferenceAnalysis) -> dict[str, Any]:
                 "text": segment.text,
                 "confidence": segment.confidence,
                 "speaker_id": segment.speaker_id,
+                "timing_source": segment.timing_source,
             }
             for segment in reference.segments
         ],
@@ -439,6 +463,7 @@ def render_material_analysis(analysis: AudioAnalysis) -> dict[str, Any]:
                 "text": segment.text,
                 "confidence": segment.confidence,
                 "speaker_id": segment.speaker_id,
+                "timing_source": segment.timing_source,
             }
             for segment in analysis.segments
         ],
@@ -488,6 +513,8 @@ def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
         status = "available" if availability.get(name) else "not installed"
         lines.append(f"{name}: {status}")
     lines.append(f"Whisper model cached: {_whisper_model_cached()}")
+    lines.append(f"Faster Whisper model cached: {_faster_whisper_model_cached()}")
+    lines.append(f"WhisperX model cached: {_whisperx_model_cached()}")
     lines.append(f"Silero VAD cached: {_silero_model_cached()}")
     lines.append(f"SpeechBrain cached: {_speechbrain_model_cached(cache_root / 'speechbrain' / 'ecapa')}")
     return lines
@@ -519,6 +546,7 @@ def plan_reference_text_segments(
                 end_seconds=float(index + 1),
                 text=sentence,
                 confidence=1.0,
+                timing_source="transcript_sequence",
             )
         )
     return tuple(segments)
@@ -548,42 +576,179 @@ def parse_lyrics_file(path: Path | None) -> list[VoiceSegment]:
     return segments
 
 
+def _lyric_timing_notes(
+    lyrics_file: Path | None,
+    transcript_segments: Sequence[TranscriptSegment],
+) -> list[str]:
+    if lyrics_file is None:
+        return []
+
+    lyric_segments = parse_lyrics_file(lyrics_file)
+    timed_lyrics = [
+        segment
+        for segment in lyric_segments
+        if segment.timing_source in {"lrc_timestamp", "srt_timestamp"} and segment.duration_seconds > 0
+    ]
+    if not timed_lyrics:
+        return ["lyric_timing_absent: lyrics provide text only; acoustic/model timing remains primary"]
+    if not transcript_segments:
+        return [
+            "lyric_timing_unverified: timestamped lyrics exist but ASR segment timing is unavailable; "
+            "lyrics may be used only as a fallback timing prior"
+        ]
+
+    comparable_count = min(len(timed_lyrics), len(transcript_segments))
+    conflicts: list[str] = []
+    for index in range(comparable_count):
+        lyric = timed_lyrics[index]
+        transcript = transcript_segments[index]
+        tolerance = max(0.35, 0.25 * max(lyric.duration_seconds, transcript.end_seconds - transcript.start_seconds, 0.001))
+        start_delta = abs(lyric.start_seconds - transcript.start_seconds)
+        end_delta = abs(lyric.end_seconds - transcript.end_seconds)
+        if start_delta > tolerance or end_delta > tolerance:
+            conflicts.append(
+                f"#{index + 1} start_delta={start_delta:.3f}s end_delta={end_delta:.3f}s tolerance={tolerance:.3f}s"
+            )
+
+    if conflicts:
+        preview = "; ".join(conflicts[:5])
+        more = f"; additional_conflicts={len(conflicts) - 5}" if len(conflicts) > 5 else ""
+        return [
+            "lyric_timing_conflict: timestamped lyrics disagree with ASR/acoustic timing; "
+            f"acoustic segment timing retained; conflicts={len(conflicts)}/{comparable_count}; {preview}{more}"
+        ]
+
+    return [
+        "lyric_timing_consistent: timestamped lyrics are consistent with ASR/acoustic timing within tolerance; "
+        "timestamps remain a timing prior, not an absolute truth source"
+    ]
+
+
 def _lyrics_text_to_segments(text: str, *, suffix: str) -> list[VoiceSegment]:
-    lines: list[str] = []
     if suffix == ".lrc":
+        timed_lines: list[tuple[float, str]] = []
         for raw_line in text.splitlines():
-            stripped = raw_line.strip()
+            stripped = raw_line.strip().lstrip("\ufeff")
             if not stripped:
                 continue
+            timestamps = re.findall(r"\[(\d{1,2}:\d{2}(?:[.:]\d{1,3})?)\]", stripped)
             cleaned = _strip_lrc_timestamp(stripped)
-            if cleaned:
-                lines.append(cleaned)
+            if cleaned and timestamps:
+                for timestamp in timestamps:
+                    start = _parse_lrc_timestamp(timestamp)
+                    if start is not None:
+                        timed_lines.append((start, cleaned))
+        if timed_lines:
+            timed_lines.sort(key=lambda item: item[0])
+            return [
+                VoiceSegment(
+                    start_seconds=start,
+                    end_seconds=timed_lines[index + 1][0] if index + 1 < len(timed_lines) else start + 1.0,
+                    text=line,
+                    confidence=0.8,
+                    timing_source="lrc_timestamp",
+                )
+                for index, (start, line) in enumerate(timed_lines)
+                if line
+            ]
+        lines = [
+            _strip_lrc_timestamp(raw_line.strip())
+            for raw_line in text.splitlines()
+            if _strip_lrc_timestamp(raw_line.strip())
+        ]
     elif suffix == ".srt":
-        block: list[str] = []
-        for raw_line in text.splitlines():
-            stripped = raw_line.strip()
-            if not stripped:
-                if block:
-                    lines.extend(block[1:])
-                    block = []
-                continue
-            block.append(stripped)
-        if block:
-            lines.extend(block[1:])
+        timed_segments = _parse_srt_segments(text)
+        if timed_segments:
+            return timed_segments
+        lines = _srt_text_lines_without_timing(text)
     else:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     return [
-        VoiceSegment(start_seconds=float(index), end_seconds=float(index + 1), text=line, confidence=1.0)
+        VoiceSegment(
+            start_seconds=float(index),
+            end_seconds=float(index + 1),
+            text=line,
+            confidence=1.0,
+            timing_source="lyrics_sequence",
+        )
         for index, line in enumerate(lines)
         if line
     ]
 
 
 def _strip_lrc_timestamp(line: str) -> str:
+    line = line.lstrip("\ufeff").strip()
     while line.startswith("[") and "]" in line:
         line = line.split("]", 1)[1].strip()
     return line
+
+
+def _parse_lrc_timestamp(value: str) -> float | None:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?", value.strip())
+    if not match:
+        return None
+    minutes = int(match.group(1))
+    seconds = int(match.group(2))
+    fraction = match.group(3) or "0"
+    fraction_seconds = int(fraction) / (10 ** len(fraction))
+    return (minutes * 60.0) + seconds + fraction_seconds
+
+
+def _parse_srt_segments(text: str) -> list[VoiceSegment]:
+    segments: list[VoiceSegment] = []
+    blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n"))
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        timing_index = next((index for index, line in enumerate(lines) if "-->" in line), None)
+        if timing_index is None:
+            continue
+        start, end = _parse_srt_time_range(lines[timing_index])
+        if start is None or end is None or end <= start:
+            continue
+        subtitle_text = " ".join(lines[timing_index + 1 :]).strip()
+        if not subtitle_text:
+            continue
+        segments.append(
+            VoiceSegment(
+                start_seconds=start,
+                end_seconds=end,
+                text=subtitle_text,
+                confidence=0.8,
+                timing_source="srt_timestamp",
+            )
+        )
+    return segments
+
+
+def _parse_srt_time_range(line: str) -> tuple[float | None, float | None]:
+    parts = [part.strip() for part in line.split("-->", 1)]
+    if len(parts) != 2:
+        return None, None
+    return _parse_srt_timestamp(parts[0]), _parse_srt_timestamp(parts[1])
+
+
+def _parse_srt_timestamp(value: str) -> float | None:
+    match = re.search(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})", value)
+    if not match:
+        return None
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    fraction = match.group(4)
+    return (hours * 3600.0) + (minutes * 60.0) + seconds + (int(fraction) / (10 ** len(fraction)))
+
+
+def _srt_text_lines_without_timing(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.isdigit() or "-->" in stripped:
+            continue
+        lines.append(stripped)
+    return lines
 
 
 def _read_docx_text(path: Path) -> str:
@@ -762,55 +927,63 @@ def _transcribe_audio(
     device = _resolve_compute_device(compute_device)
     preferred_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower()
     fallback_notes: list[str] = []
+    allow_model_download = os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") == "1"
 
     if preferred_backend in {"auto", "faster-whisper", "faster_whisper"} and _module_available("faster_whisper"):
-        try:
-            return _transcribe_with_faster_whisper(path, compute_device=device)
-        except Exception as exc:
-            if preferred_backend in {"faster-whisper", "faster_whisper"}:
-                raise AudioProcessorError(f"Faster Whisper transcription failed for {path}: {exc}") from exc
-            fallback_notes.append(f"faster-whisper failed: {exc}")
+        if preferred_backend == "auto" and not allow_model_download and not _faster_whisper_model_cached():
+            fallback_notes.append("faster-whisper skipped: local model cache not found and downloads are not enabled")
+        else:
+            try:
+                return _transcribe_with_faster_whisper(path, compute_device=device)
+            except Exception as exc:
+                if preferred_backend in {"faster-whisper", "faster_whisper"}:
+                    raise AudioProcessorError(f"Faster Whisper transcription failed for {path}: {exc}") from exc
+                fallback_notes.append(f"faster-whisper failed: {exc}")
 
     if preferred_backend in {"auto", "whisperx"} and _module_available("whisperx"):
-        try:
-            _prepare_torchaudio_legacy_api()
-            import whisperx  # type: ignore
+        if preferred_backend == "auto" and not allow_model_download and not _whisperx_model_cached():
+            fallback_notes.append("whisperx skipped: local model cache not found and downloads are not enabled")
+        else:
+            try:
+                _prepare_torchaudio_legacy_api()
+                import whisperx  # type: ignore
 
-            model = _load_whisperx_model(
-                DEFAULT_ASR_MODEL,
-                device,
-            )
-            audio = whisperx.load_audio(str(path))
-            result = model.transcribe(audio, batch_size=4)
-            align_model, metadata = whisperx.load_align_model(
-                language_code=result["language"], device=device
-            )
-            aligned = whisperx.align(
-                result["segments"],
-                align_model,
-                metadata,
-                audio,
-                device,
-                return_char_alignments=False,
-            )
-            segments = [
-                TranscriptSegment(
-                    start_seconds=float(segment.get("start", 0.0) or 0.0),
-                    end_seconds=float(segment.get("end", 0.0) or 0.0),
-                    text=str(segment.get("text", "")).strip(),
-                    confidence=_segment_confidence(segment),
-                    speaker_id=segment.get("speaker"),
+                model = _load_whisperx_model(
+                    DEFAULT_ASR_MODEL,
+                    device,
                 )
-                for segment in aligned.get("segments", [])
-                if str(segment.get("text", "")).strip()
-            ]
-            text = " ".join(segment.text for segment in segments).strip()
-            return {"backend": "whisperx", "text": text, "segments": segments, "notes": fallback_notes}
-        except Exception as exc:
-            if preferred_backend == "whisperx":
-                raise AudioProcessorError(f"WhisperX transcription failed for {path}: {exc}") from exc
-            # Fall through to Whisper if WhisperX is unavailable or fails on a specific file.
-            fallback_notes.append(f"whisperx failed: {exc}")
+                audio = whisperx.load_audio(str(path))
+                result = model.transcribe(audio, batch_size=4)
+                align_model, metadata = whisperx.load_align_model(
+                    language_code=result["language"], device=device
+                )
+                aligned = whisperx.align(
+                    result["segments"],
+                    align_model,
+                    metadata,
+                    audio,
+                    device,
+                    return_char_alignments=False,
+                )
+                segments = [
+                    TranscriptSegment(
+                        start_seconds=float(segment.get("start", 0.0) or 0.0),
+                        end_seconds=float(segment.get("end", 0.0) or 0.0),
+                        text=str(segment.get("text", "")).strip(),
+                        confidence=_segment_confidence(segment),
+                        speaker_id=segment.get("speaker"),
+                        timing_source="whisperx_alignment",
+                    )
+                    for segment in aligned.get("segments", [])
+                    if str(segment.get("text", "")).strip()
+                ]
+                text = " ".join(segment.text for segment in segments).strip()
+                return {"backend": "whisperx", "text": text, "segments": segments, "notes": fallback_notes}
+            except Exception as exc:
+                if preferred_backend == "whisperx":
+                    raise AudioProcessorError(f"WhisperX transcription failed for {path}: {exc}") from exc
+                # Fall through to Whisper if WhisperX is unavailable or fails on a specific file.
+                fallback_notes.append(f"whisperx failed: {exc}")
 
     return _transcribe_with_whisper(
         path,
@@ -842,6 +1015,7 @@ def _transcribe_with_faster_whisper(
             text=str(getattr(segment, "text", "") or "").strip(),
             confidence=None,
             speaker_id=None,
+            timing_source="faster_whisper_segment",
         )
         for segment in raw_segments
         if str(getattr(segment, "text", "") or "").strip()
@@ -878,6 +1052,7 @@ def _transcribe_with_whisper(
                 text=str(segment.get("text", "")).strip(),
                 confidence=None,
                 speaker_id=None,
+                timing_source="whisper_segment",
             )
             for segment in result.get("segments", [])
             if str(segment.get("text", "")).strip()
@@ -1240,6 +1415,7 @@ def _load_reference_analysis_cache(
                 text=str(segment.get("text", "") or ""),
                 confidence=_optional_float(segment.get("confidence")),
                 speaker_id=_optional_string(segment.get("speaker_id")),
+                timing_source=str(segment.get("timing_source") or ""),
             )
             for segment in reference.get("segments", [])
             if isinstance(segment, dict)
@@ -1294,6 +1470,7 @@ def _audio_analysis_from_cache(data: dict[str, Any]) -> AudioAnalysis:
             text=str(segment.get("text", "") or ""),
             confidence=_optional_float(segment.get("confidence")),
             speaker_id=_optional_string(segment.get("speaker_id")),
+            timing_source=str(segment.get("timing_source") or ""),
         )
         for segment in data.get("segments", [])
         if isinstance(segment, dict)
@@ -1349,18 +1526,28 @@ def _segments_from_transcript(
                             text=lyric.text,
                             confidence=transcript_segment.confidence,
                             speaker_id=transcript_segment.speaker_id,
+                            timing_source="asr_segment_with_lyric_text",
                         )
                     )
                 if len(lyric_segments) > max_count and segments:
                     last_end = paired[-1].end_seconds if paired else segments[-1].end_seconds
                     for index in range(max_count, len(lyric_segments)):
                         lyric = lyric_segments[index]
+                        if lyric.timing_source in {"lrc_timestamp", "srt_timestamp"} and lyric.duration_seconds > 0:
+                            start_seconds = lyric.start_seconds
+                            end_seconds = lyric.end_seconds
+                            timing_source = f"{lyric.timing_source}_without_asr_segment"
+                        else:
+                            start_seconds = last_end + float(index - max_count)
+                            end_seconds = last_end + float(index - max_count + 1)
+                            timing_source = "lyrics_sequence_without_asr_segment"
                         paired.append(
                             VoiceSegment(
-                                start_seconds=last_end + float(index - max_count),
-                                end_seconds=last_end + float(index - max_count + 1),
+                                start_seconds=start_seconds,
+                                end_seconds=end_seconds,
                                 text=lyric.text,
                                 confidence=1.0,
+                                timing_source=timing_source,
                             )
                         )
                 return tuple(paired)
@@ -1373,6 +1560,7 @@ def _segments_from_transcript(
             text=segment.text,
             confidence=segment.confidence,
             speaker_id=segment.speaker_id,
+            timing_source="asr_segment",
         )
         for segment in segments
     )
@@ -1398,12 +1586,22 @@ def _target_durations_for_decisions(
         for decision in decisions
         if decision.reference_text.strip()
     }
-    if len(decisions) > 1 and len(normalized_reference_texts) <= 1:
+    has_segment_indices = any(decision.reference_segment_index is not None for decision in decisions)
+    if len(decisions) > 1 and len(normalized_reference_texts) <= 1 and not has_segment_indices:
         return _weighted_target_durations(decisions, reference_duration=reference_duration)
 
     targets: list[float | None] = [None for _ in decisions]
     used_segments: set[int] = set()
     for decision_index, decision in enumerate(decisions):
+        if decision.reference_segment_index is not None:
+            segment_index = decision.reference_segment_index
+            if 0 <= segment_index < len(reference_segments):
+                segment = reference_segments[segment_index]
+                if segment.duration_seconds > 0:
+                    targets[decision_index] = segment.duration_seconds
+                    used_segments.add(segment_index)
+                    continue
+
         decision_text = _compact_bridge_text(decision.reference_text)
         if not decision_text:
             continue
@@ -1540,6 +1738,20 @@ def _ensure_model_cache_root(path: Path) -> Path | None:
 def _whisper_model_cached() -> bool:
     model_name = DEFAULT_ASR_MODEL
     return (_model_cache_root() / "whisper" / f"{model_name}.pt").exists()
+
+
+def _faster_whisper_model_cached() -> bool:
+    root = _model_cache_root() / "faster-whisper"
+    if not root.exists():
+        return False
+    return any(root.rglob("model.bin")) or any(root.rglob("config.json"))
+
+
+def _whisperx_model_cached() -> bool:
+    root = _model_cache_root() / "whisperx"
+    if not root.exists():
+        return False
+    return any(root.rglob("model.bin")) or any(root.rglob("config.json"))
 
 
 def _silero_model_cached() -> bool:

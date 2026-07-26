@@ -1006,3 +1006,20 @@ Open-source references considered for the planning direction:
 6. Incremental caches and batched ASR.
 7. Flat WAV render reuse.
 8. Persistent VST3 helper progress protocol.
+
+### User Correction During Implementation Start
+
+The user corrected the implementation approach: future work must not default to the smallest local change first. Every code change should start from the long-term project architecture and maintenance plan, so the project avoids later rework and avoids unnecessary manual-test errors. This has been added to `PROJECT_RULES.md` as a standing rule.
+
+### Implementation Result
+
+1. Created implementation branch `codex/core-ordering-v2-implementation` from the planning branch.
+2. Added the long-term architecture rule to `PROJECT_RULES.md`: code changes must prioritize durable architecture, maintainability, and manual-test reliability over the smallest immediate patch.
+3. Implemented core ordering v2: full score matrix, global one-to-one assignment when reference segments support it, decision-level score breakdowns, evidence counts, confidence labels, and reference segment indices.
+4. Added phonetic matching with optional `pypinyin` support and made `pypinyin>=0.51,<1` a main runtime dependency.
+5. Added LRC/SRT timestamp parsing plus timing validation notes; timestamped lyrics are timing priors only and do not override ASR/acoustic timing by default.
+6. Added short-material stretch strategy `syllable_safe_expand_with_tail_padding` for extreme expansion cases, preserving the voiced core better than full-clip extreme stretching.
+7. Added normal WAV clip render caching through `.vocalprocess_render_cache`, reusing exact duplicate source/target/render-option matches before final concatenation.
+8. Added VST3 bridge `progress_path` support so the helper writes atomic JSON progress/status while it runs.
+9. Fixed main Python 3.11 runtime compatibility by pinning `setuptools>=69,<81`; this restores `pkg_resources` for current model dependencies while keeping the project on Python 3.11.
+10. Verification passed: compileall, unittest with 66 tests, `pip check`, `audio_processor check`, and a real CLI batch smoke with diagnostics showing score matrix, phonetic matching, syllable-safe stretch, and completion.

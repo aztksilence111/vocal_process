@@ -11,6 +11,8 @@ requires-python = ">=3.11,<3.12"
 license = { text = "MIT" }
 authors = [{ name = "Local project" }]
 dependencies = [
+    "setuptools>=69,<81",
+    "pypinyin>=0.51,<1",
 ]
 
 [project.optional-dependencies]

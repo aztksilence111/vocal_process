@@ -114,6 +114,7 @@ def run_batch_queue(
                     on_progress=progress_callback,
                 )
                 ordered_material_paths = list(ordering.ordered_paths)
+                ordered_material_texts = [decision.material_text for decision in ordering.decisions]
                 diagnostics.event(
                     "model.ordering.completed",
                     "Model-assisted material ordering completed",
@@ -123,6 +124,7 @@ def run_batch_queue(
                     item.input_path,
                     ordered_material_paths,
                     target_durations=ordering.target_durations,
+                    material_text_hints=ordered_material_texts,
                 )
                 diagnostics.event(
                     "render.stretch_plan",
@@ -132,13 +134,20 @@ def run_batch_queue(
                     clips=render_material_stretch_plan(stretch_plan),
                 )
                 lowest_score = min((decision.score for decision in ordering.decisions), default=0.0)
-                review_required = lowest_score < 0.18 or any(clip.quality_warning for clip in stretch_plan)
+                review_required = (
+                    lowest_score < 0.18
+                    or any(decision.confidence_label == "review_required" for decision in ordering.decisions)
+                    or any(clip.quality_warning for clip in stretch_plan)
+                )
                 if review_required:
                     diagnostics.event(
                         "model.ordering.review_required",
                         "Model-assisted ordering or stretch plan should be reviewed before trusting the output",
                         level="warning",
                         lowest_score=lowest_score,
+                        review_required_decision_count=sum(
+                            1 for decision in ordering.decisions if decision.confidence_label == "review_required"
+                        ),
                         severe_warning_count=sum(1 for clip in stretch_plan if clip.quality_warning == "extreme_stretch_ratio"),
                         moderate_warning_count=sum(1 for clip in stretch_plan if clip.quality_warning == "moderate_stretch_ratio"),
                     )
@@ -150,6 +159,7 @@ def run_batch_queue(
                         options,
                         material_paths=ordered_material_paths,
                         target_durations=ordering.target_durations,
+                        material_text_hints=ordered_material_texts,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                     )
@@ -161,6 +171,7 @@ def run_batch_queue(
                         options,
                         material_paths=ordered_material_paths,
                         material_target_durations=ordering.target_durations,
+                        material_text_hints=ordered_material_texts,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                     )

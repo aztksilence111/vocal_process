@@ -8,6 +8,22 @@ The durable project rules are maintained in `PROJECT_RULES.md`. In particular, c
 
 GitHub Release `v2026.07.27-portable-full-runtime` publishes the two full portable ZIP packages: `VocalProcess-portable.zip` for normal GUI/CLI and local model testing, and `VocalProcess-portable-vst3.zip` for DAW/VST3 bridge testing. The `-lite` ZIPs remain smoke-test-only assets and should not be presented as full functional packages.
 
+## 2026-07-27: Core Ordering v2 Implementation
+
+The core material ordering path now uses a long-term planner shape instead of another local scoring patch. `audio_processor.model_assist` builds a full reference-segment by material-clip score matrix and uses global assignment when there are enough reference segments for one-to-one matching. Each decision records transcript, filename, phonetic, duration, speaker, VAD, evidence count, confidence label, and reference segment index.
+
+Lyrics timestamps are parsed for LRC/SRT, but they are treated as timing priors only. When ASR/acoustic segments exist, acoustic timing remains primary and lyric text is paired onto those segments. Timing conflicts are reported through `lyric_timing_conflict` notes and preflight warnings instead of being silently trusted.
+
+Short material handling now includes pinyin/phonetic matching through `pypinyin` when installed, short-clip evidence gating, and a first syllable-safe stretch strategy. Extreme expansion of short material clips uses `syllable_safe_expand_with_tail_padding`, limiting core Rubber Band stretching and filling the remaining target duration with padding.
+
+Runtime and integration optimizations added in the same architecture pass:
+
+1. Automatic ASR skips uncached Faster Whisper/WhisperX models unless `VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD=1`, avoiding repeated offline Hub lookup delays during manual tests.
+2. Normal flat WAV assembly can render clips through `.vocalprocess_render_cache` and reuse exact duplicate source/target/render-option matches before final concatenation.
+3. VST3 bridge requests accept `progress_path` and write atomic JSON progress updates while the helper runs.
+
+Verification passed with `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging`, `.venv311\Scripts\python.exe -m unittest discover` with 66 tests, `pip check`, `audio_processor check`, and a real CLI `batch` smoke that produced output WAV plus diagnostics containing `score_matrix`, `phonetic_similarity`, `syllable_safe_expand_with_tail_padding`, and `batch.item.completed`.
+
 ## 2026-07-23: Python and FFmpeg Environment Setup
 
 ### Goal

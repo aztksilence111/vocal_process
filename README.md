@@ -13,6 +13,16 @@
 
 ## 更新日志
 
+### 2026-07-27: 核心排序 v2 与短字安全渲染
+
+1. 素材排序从逐段贪心选择升级为全局评分矩阵和一一对应分配，`analysis.json` 与 diagnostics 会记录 `ordering_strategy`、`score_matrix`、分项得分和低置信度标记。
+2. 新增中文短字/单音节发音匹配层，安装 `pypinyin` 后会把中文和文件名拼音提示纳入 `phonetic_score`，用于改善“一个字”素材的一一对应排序。
+3. LRC/SRT 时间戳会被解析和校验，但不会作为最高优先级真值；当歌词时间戳与 ASR/声学时间冲突时，会记录 `lyric_timing_conflict` 或相关 timing note。
+4. 短字素材大幅拉长时启用 `syllable_safe_expand_with_tail_padding`，限制人声核心过度拉伸并用尾部补白补足目标时长。
+5. 普通 WAV 输出也开始使用片段渲染缓存；相同源素材、目标时长、Rubber Band 参数和处理参数会复用已渲染片段。
+6. VST3 bridge 请求支持 `progress_path`，helper 会持续写入 JSON 进度，便于 DAW UI 后续读取状态。
+7. 自动 ASR 模式会跳过未缓存的 Faster Whisper/WhisperX 模型，除非显式允许下载，避免人工测试时反复等待离线 Hub 查找失败。
+
 ### 2026-07-27: 完整便携包与 VST3 包发布更新
 
 1. Release 资产应同时提供两个完整便携包：
@@ -42,6 +52,7 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 11. 原音频分析会生成参考缓存，同一原音频、歌词、计算设备和人声分离策略不变时复用 Demucs/ASR/声纹结果。
 12. GUI 显示运行时长，支持 CPU/GPU 计算设备选择，并提供“自动判断 / 已是人声跳过分离 / 强制分离”按钮。
 13. 完整模型运行时包含 `faster-whisper`、`whisperx` 和 `pyannote.audio`；pyannote 预训练模型仍需要 Hugging Face token 和模型条款授权。
+14. 排序诊断包含全局评分矩阵、拼音/发音分数、证据计数和低置信度标记，便于人工测试前复核。
 
 ## 环境要求
 

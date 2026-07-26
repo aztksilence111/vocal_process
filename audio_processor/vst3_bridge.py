@@ -58,6 +58,7 @@ def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
     material_directory = _required_path(request, "material_directory")
     output_path = _required_path(request, "output_path")
     lyrics_file = _optional_path(request, "lyrics_file")
+    progress_path = _optional_path(request, "progress_path")
 
     settings = ProcessingSettings(
         material_directory=str(material_directory),
@@ -81,8 +82,36 @@ def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
         codec=_optional_string(request.get("codec")),
     )
     item = QueueItem(input_path=reference_path, output_path=output_path)
-    summary = run_batch_queue([item], settings)
+
+    def item_progress(index: int, updated_item: QueueItem) -> None:
+        _write_bridge_progress(
+            progress_path,
+            request,
+            progress=updated_item.progress,
+            status=updated_item.status,
+            message=updated_item.message,
+        )
+
+    def queue_progress(progress: float, message: str) -> None:
+        _write_bridge_progress(
+            progress_path,
+            request,
+            progress=progress,
+            status=item.status,
+            message=message,
+        )
+
+    _write_bridge_progress(progress_path, request, progress=0.0, status="Queued", message="Bridge request queued")
+    summary = run_batch_queue([item], settings, on_item_update=item_progress, on_queue_progress=queue_progress)
     ok = summary.failed == 0 and summary.cancelled == 0
+    _write_bridge_progress(
+        progress_path,
+        request,
+        progress=1.0 if ok else item.progress,
+        status=item.status,
+        message=item.message,
+        done=True,
+    )
     return {
         "format": BRIDGE_RESPONSE_FORMAT,
         "request_id": _optional_string(request.get("request_id")) or "",
@@ -100,6 +129,7 @@ def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
         "material_directory": str(material_directory),
         "output_path": str(output_path),
         "diagnostics_path": str(diagnostic_log_path(output_path)),
+        "progress_path": str(progress_path) if progress_path else "",
     }
 
 
@@ -112,6 +142,7 @@ def bridge_request_template() -> dict[str, Any]:
         "material_directory": "C:/path/to/materials",
         "lyrics_file": "",
         "output_path": "C:/path/to/output/reference.rpp",
+        "progress_path": "C:/path/to/output/reference.progress.json",
         "daw_timeline_export": True,
         "compute_device": "auto",
         "source_separation": "auto",
@@ -133,6 +164,7 @@ def bridge_watch_contract() -> dict[str, Any]:
             "Atomically rename it to <request_id>.request.json when complete.",
             "Wait for <request_id>.response.json in the response directory.",
             "Read ok/status/output_path/diagnostics_path from the response.",
+            "Optionally provide progress_path and poll that JSON file for progress/status while the helper runs.",
         ],
         "request_template": bridge_request_template(),
     }
@@ -189,6 +221,30 @@ def _write_heartbeat(requests: Path, responses: Path) -> None:
         _write_json_atomic(responses / "bridge.heartbeat.json", heartbeat)
     except OSError:
         pass
+
+
+def _write_bridge_progress(
+    progress_path: Path | None,
+    request: dict[str, Any],
+    *,
+    progress: float,
+    status: str,
+    message: str,
+    done: bool = False,
+) -> None:
+    if progress_path is None:
+        return
+    payload = {
+        "format": "vocal_process_vst3_bridge_progress_v1",
+        "request_id": _optional_string(request.get("request_id")) or "",
+        "process_id": os.getpid(),
+        "timestamp": time.time(),
+        "progress": max(min(float(progress), 1.0), 0.0),
+        "status": status,
+        "message": message,
+        "done": done,
+    }
+    _write_json_atomic(progress_path, payload)
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

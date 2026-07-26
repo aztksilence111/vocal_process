@@ -36,6 +36,7 @@ def build_preflight_report(
         target_durations=ordering.target_durations,
     )
     warnings = _preflight_warnings(ordering, stretch_plan)
+    lyric_conflict_count = sum(1 for warning in warnings if warning.get("kind") == "lyric_timing_conflict")
     return {
         "format": PREFLIGHT_REPORT_FORMAT,
         "reference_path": str(reference_path.expanduser()),
@@ -48,6 +49,10 @@ def build_preflight_report(
             "material_count": len(ordering.ordered_paths),
             "warning_count": len(warnings),
             "error_warning_count": sum(1 for warning in warnings if warning["severity"] == "error"),
+            "review_required_match_count": sum(
+                1 for decision in ordering.decisions if decision.confidence_label == "review_required"
+            ),
+            "lyric_timing_conflict_count": lyric_conflict_count,
             "minimum_match_score": _minimum_score(ordering),
             "extreme_stretch_count": sum(
                 1 for clip in stretch_plan if clip.quality_warning == "extreme_stretch_ratio"
@@ -81,7 +86,24 @@ def _preflight_warnings(
                     "message": "Material match score is too low for reliable automatic ordering.",
                 }
             )
-        elif decision.transcript_score < WEAK_TEXT_SCORE and decision.filename_score < WEAK_TEXT_SCORE:
+        elif decision.confidence_label == "review_required":
+            warnings.append(
+                {
+                    "severity": "error",
+                    "kind": "short_clip_insufficient_evidence",
+                    "rank": decision.rank,
+                    "material_path": str(decision.source_path),
+                    "score": decision.score,
+                    "evidence_count": decision.evidence_count,
+                    "phonetic_score": decision.phonetic_score,
+                    "message": "Short material requires at least two reliable evidence signals before automatic ordering is trusted.",
+                }
+            )
+        elif (
+            decision.transcript_score < WEAK_TEXT_SCORE
+            and decision.filename_score < WEAK_TEXT_SCORE
+            and decision.phonetic_score < WEAK_TEXT_SCORE
+        ):
             warnings.append(
                 {
                     "severity": "warning",
@@ -91,7 +113,19 @@ def _preflight_warnings(
                     "score": decision.score,
                     "transcript_score": decision.transcript_score,
                     "filename_score": decision.filename_score,
-                    "message": "ASR transcript and filename hint both provide weak ordering signal.",
+                    "message": "ASR transcript, filename hint, and pronunciation evidence provide weak ordering signal.",
+                }
+            )
+        elif _is_short_text(decision.reference_text) and decision.phonetic_score < WEAK_TEXT_SCORE:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "kind": "weak_phonetic_signal",
+                    "rank": decision.rank,
+                    "material_path": str(decision.source_path),
+                    "score": decision.score,
+                    "phonetic_score": decision.phonetic_score,
+                    "message": "Short material has weak pronunciation evidence; verify the one-to-one order before rendering.",
                 }
             )
 
@@ -103,6 +137,17 @@ def _preflight_warnings(
                     "rank": decision.rank,
                     "material_path": str(decision.source_path),
                     "message": "Automatic recognition could not match this clip; filename order was used.",
+                }
+            )
+
+    notes = ordering.analysis_report.get("notes", [])
+    for note in (notes if isinstance(notes, list) else []):
+        if isinstance(note, str) and note.startswith("lyric_timing_conflict:"):
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "kind": "lyric_timing_conflict",
+                    "message": note,
                 }
             )
 

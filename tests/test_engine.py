@@ -26,6 +26,7 @@ from audio_processor.engine import (
     AudioProcessorError,
     ProcessOptions,
     _build_material_filter_graph,
+    assemble_material_to_reference_with_progress,
     build_material_assembly_args,
     build_material_clip_args,
     build_process_args,
@@ -44,6 +45,8 @@ from audio_processor.model_assist import (
     build_model_assisted_pipeline_plan,
     list_model_candidates,
     order_materials_for_reference,
+    phonetic_similarity,
+    plan_material_ordering,
     text_similarity,
 )
 from audio_processor.settings import ProcessingSettings, load_settings, save_settings
@@ -237,6 +240,69 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(clips[0].target_duration_seconds, 10.0)
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
+
+    def test_short_material_expansion_uses_syllable_safe_tail_padding(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "2.0"}, "streams": []},
+                {"format": {"duration": "0.5"}, "streams": []},
+            ],
+        ):
+            clips = plan_material_stretch_clips(
+                Path("reference.wav"),
+                [Path("shi.wav")],
+                material_text_hints=["是"],
+            )
+
+        self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 0.25)
+        self.assertAlmostEqual(clips[0].tempo, 0.75)
+        self.assertEqual(clips[0].stretch_strategy, "syllable_safe_expand_with_tail_padding")
+        self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
+
+    def test_flat_wav_assembly_reuses_duplicate_render_cache(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "material.wav"
+            output = root / "output.wav"
+            _write_test_wave(reference, duration_seconds=2.0)
+            _write_test_wave(material, duration_seconds=1.0)
+
+            def fake_render(
+                input_path: Path,
+                output_path: Path,
+                tempo: float,
+                options: ProcessOptions,
+                *,
+                target_duration: float | None = None,
+                on_progress=None,
+                should_cancel=None,
+            ) -> None:
+                _write_test_wave(output_path, duration_seconds=target_duration or 1.0)
+
+            with patch(
+                "audio_processor.engine.probe_audio",
+                side_effect=[
+                    {"format": {"duration": "2.0"}, "streams": []},
+                    {"format": {"duration": "2.0"}, "streams": []},
+                    {"format": {"duration": "1.0"}, "streams": []},
+                    {"format": {"duration": "1.0"}, "streams": []},
+                ],
+            ):
+                with patch("audio_processor.engine.process_material_clip_with_progress", side_effect=fake_render) as render_mock:
+                    with patch("audio_processor.engine._run_progress_process") as concat_mock:
+                        assemble_material_to_reference_with_progress(
+                            reference,
+                            root,
+                            output,
+                            ProcessOptions(input_path=reference, output_path=output, overwrite=True),
+                            material_paths=[material, material],
+                            material_target_durations=[1.0, 1.0],
+                        )
+
+        self.assertEqual(render_mock.call_count, 1)
+        concat_mock.assert_called_once()
 
 
 class DawTimelineTests(unittest.TestCase):
@@ -784,6 +850,50 @@ class ModelAssistTests(unittest.TestCase):
         self.assertGreater(decisions[0].filename_score, 0)
         self.assertGreater(decisions[0].duration_score, 0.8)
 
+    def test_global_assignment_avoids_greedy_first_match_trap(self) -> None:
+        plan = plan_material_ordering(
+            [
+                VoiceSegment(0.0, 1.0, "a", speaker_id="s1"),
+                VoiceSegment(1.0, 2.0, "b", speaker_id="s2"),
+            ],
+            [
+                MaterialAnalysis(
+                    Path("speaker_b.wav"),
+                    transcript="a",
+                    duration_seconds=1.0,
+                    speaker_label="s2",
+                    speaker_embedding=(1.0,),
+                ),
+                MaterialAnalysis(
+                    Path("plain_a.wav"),
+                    transcript="a",
+                    duration_seconds=1.0,
+                    speaker_embedding=(1.0,),
+                ),
+            ],
+        )
+
+        self.assertEqual(plan.strategy, "global_assignment")
+        self.assertEqual([decision.material_path.name for decision in plan.decisions], ["plain_a.wav", "speaker_b.wav"])
+        self.assertEqual([decision.reference_segment_index for decision in plan.decisions], [0, 1])
+        self.assertEqual(len(plan.score_matrix), 2)
+        self.assertEqual(len(plan.score_matrix[0]), 2)
+
+    def test_phonetic_similarity_supports_chinese_short_materials(self) -> None:
+        self.assertGreater(phonetic_similarity("是", "shi"), 0.8)
+
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 0.5, "是")],
+            [
+                MaterialAnalysis(Path("wrong.wav"), transcript="", filename_text="ma", duration_seconds=2.0),
+                MaterialAnalysis(Path("right.wav"), transcript="", filename_text="shi", duration_seconds=2.0),
+            ],
+        )
+
+        self.assertEqual(decisions[0].material_path.name, "right.wav")
+        self.assertGreater(decisions[0].phonetic_score, 0.8)
+        self.assertEqual(decisions[0].reason, "phonetic_similarity")
+
 
 class ModelRuntimeTests(unittest.TestCase):
     def test_model_cache_root_falls_back_when_candidate_is_not_creatable(self) -> None:
@@ -876,6 +986,54 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(second.transcript, "alpha")
         self.assertEqual(transcribe_mock.call_count, 1)
 
+    def test_lrc_timestamps_are_parsed_but_conflicts_are_not_trusted_silently(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "line.lrc"
+            lyrics.write_text("\ufeff[00:10.00]alpha\n[00:12.00]beta\n", encoding="utf-8")
+
+            lyric_segments = model_runtime.parse_lyrics_file(lyrics)
+            notes = model_runtime._lyric_timing_notes(
+                lyrics,
+                [
+                    model_runtime.TranscriptSegment(0.0, 1.0, "alpha", timing_source="whisperx_alignment"),
+                    model_runtime.TranscriptSegment(1.0, 2.0, "beta", timing_source="whisperx_alignment"),
+                ],
+            )
+
+        self.assertEqual(lyric_segments[0].start_seconds, 10.0)
+        self.assertEqual(lyric_segments[0].text, "alpha")
+        self.assertEqual(lyric_segments[0].timing_source, "lrc_timestamp")
+        self.assertTrue(any(note.startswith("lyric_timing_conflict:") for note in notes))
+
+    def test_auto_asr_skips_uncached_accelerated_backends(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "input.wav"
+            _write_test_wave(audio)
+
+            with patch.dict(os.environ, {"VOCAL_PROCESS_ASR_BACKEND": "auto"}, clear=False):
+                with patch("audio_processor.model_runtime._module_available", return_value=True):
+                    with patch("audio_processor.model_runtime._faster_whisper_model_cached", return_value=False):
+                        with patch("audio_processor.model_runtime._whisperx_model_cached", return_value=False):
+                            with patch("audio_processor.model_runtime._transcribe_with_faster_whisper") as faster_mock:
+                                with patch("audio_processor.model_runtime._load_whisperx_model") as whisperx_mock:
+                                    with patch(
+                                        "audio_processor.model_runtime._transcribe_with_whisper",
+                                        return_value={
+                                            "backend": "whisper",
+                                            "text": "alpha",
+                                            "segments": [],
+                                            "notes": ["fallback"],
+                                        },
+                                    ) as whisper_mock:
+                                        result = model_runtime._transcribe_audio(audio, compute_device="cpu")
+
+        self.assertEqual(result["backend"], "whisper")
+        faster_mock.assert_not_called()
+        whisperx_mock.assert_not_called()
+        whisper_mock.assert_called_once()
+
 
 class DawRenderReuseTests(unittest.TestCase):
     def test_daw_export_reuses_duplicate_stretched_clip(self) -> None:
@@ -925,30 +1083,42 @@ class Vst3BridgeTests(unittest.TestCase):
         json.dumps(template, ensure_ascii=False)
 
     def test_bridge_request_returns_batch_response(self) -> None:
-        request = {
-            "format": BRIDGE_REQUEST_FORMAT,
-            "command": "render_timeline",
-            "reference_path": "reference.wav",
-            "material_directory": "materials",
-            "output_path": "out/song.rpp",
-            "compute_device": "cpu",
-            "overwrite": True,
-        }
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            progress_path = root / "song.progress.json"
+            request = {
+                "format": BRIDGE_REQUEST_FORMAT,
+                "command": "render_timeline",
+                "reference_path": "reference.wav",
+                "material_directory": "materials",
+                "output_path": str(root / "song.rpp"),
+                "progress_path": str(progress_path),
+                "compute_device": "cpu",
+                "overwrite": True,
+            }
 
-        def fake_run_batch(items: list[object], settings: ProcessingSettings) -> BatchSummary:
-            item = items[0]
-            item.status = "Done"
-            item.message = "Complete"
-            self.assertTrue(settings.daw_timeline_export)
-            self.assertEqual(settings.compute_device, "cpu")
-            return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+            def fake_run_batch(items: list[object], settings: ProcessingSettings, **kwargs: object) -> BatchSummary:
+                item = items[0]
+                on_queue_progress = kwargs.get("on_queue_progress")
+                if callable(on_queue_progress):
+                    on_queue_progress(0.5, "half done")
+                item.status = "Done"
+                item.message = "Complete"
+                item.progress = 1.0
+                self.assertTrue(settings.daw_timeline_export)
+                self.assertEqual(settings.compute_device, "cpu")
+                return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
 
-        with patch("audio_processor.vst3_bridge.run_batch_queue", side_effect=fake_run_batch):
-            response = run_bridge_request(request)
+            with patch("audio_processor.vst3_bridge.run_batch_queue", side_effect=fake_run_batch):
+                response = run_bridge_request(request)
+
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
 
         self.assertEqual(response["format"], BRIDGE_RESPONSE_FORMAT)
         self.assertTrue(response["ok"])
         self.assertEqual(response["status"], "Done")
+        self.assertEqual(progress["format"], "vocal_process_vst3_bridge_progress_v1")
+        self.assertTrue(progress["done"])
 
     def test_bridge_request_file_writes_response_next_to_request(self) -> None:
         request = {
@@ -962,7 +1132,7 @@ class Vst3BridgeTests(unittest.TestCase):
             "overwrite": True,
         }
 
-        def fake_run_batch(items: list[object], settings: ProcessingSettings) -> BatchSummary:
+        def fake_run_batch(items: list[object], settings: ProcessingSettings, **kwargs: object) -> BatchSummary:
             item = items[0]
             item.status = "Done"
             item.message = "Complete"
@@ -995,7 +1165,7 @@ class Vst3BridgeTests(unittest.TestCase):
             "overwrite": True,
         }
 
-        def fake_run_batch(items: list[object], settings: ProcessingSettings) -> BatchSummary:
+        def fake_run_batch(items: list[object], settings: ProcessingSettings, **kwargs: object) -> BatchSummary:
             item = items[0]
             item.status = "Done"
             item.message = "Complete"
