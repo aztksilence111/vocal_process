@@ -942,3 +942,67 @@ After the assistant clarified that WhisperX and pyannote were not in the default
 5. Full package UVR worker smoke passed:
    `scripts\smoke_portable_uvr_worker.ps1 -PortableRoot dist\VocalProcess-portable\VocalProcess -WorkRoot .tmp\portable-uvr-smoke-full-expanded`.
 6. Portable `VocalProcess.exe check` exited 0 and reported `WhisperX: available` and `pyannote.audio: available` from inside the rebuilt package.
+
+## 2026-07-27: Core Ordering Optimization Plan
+
+### User
+
+The user rejected treating timestamped lyrics as the highest-priority truth source. The user clarified that even timestamped lyric files may be inaccurate, so lyric timestamps must not override better acoustic evidence by default. The user accepted the other optimization directions and emphasized that character/pronunciation recognition, one-to-one material ordering, and alignment are the core function of this project. The user requested a practical planning target list based on the current framework, current code, and open-source project experience, then asked that it be recorded in this conversation log.
+
+### Planning Notes
+
+The corrected direction is multi-evidence alignment. No single signal should be treated as absolute truth. Lyrics, LRC/SRT timestamps, ASR text, WhisperX-style forced alignment, filename hints, duration similarity, VAD coverage, speaker similarity, and future phonetic features should all contribute to confidence-scored ordering. Timestamped lyrics are useful evidence, but only after consistency checks against ASR/acoustic timing.
+
+Open-source references considered for the planning direction:
+
+1. WhisperX: ASR plus VAD and forced alignment for word-level timestamps.
+   <https://github.com/m-bain/whisperX>
+2. Faster Whisper: CTranslate2-based Whisper inference, including batching-oriented faster local transcription.
+   <https://github.com/SYSTRAN/faster-whisper>
+3. Montreal Forced Aligner: dictionary/acoustic-model based forced alignment, useful as a design reference for phoneme-aware alignment and confidence boundaries.
+   <https://github.com/MontrealCorpusTools/Montreal-Forced-Aligner>
+4. pyannote.audio: speaker diarization and speaker-related audio analysis reference.
+   <https://github.com/pyannote/pyannote-audio>
+5. librosa DTW/sequence tooling: reference direction for acoustic-sequence alignment and future verse/chorus similarity hints.
+   <https://librosa.org/doc/latest/generated/librosa.sequence.dtw.html>
+
+### Practical Planning Targets
+
+1. Ordering engine v2: replace the current greedy per-segment selection with a global matching planner. Build a reference-segment by material-clip score matrix, then solve the complete ordering with dynamic programming or Hungarian-style assignment. Preserve optional order constraints so repeated verse/chorus material does not jump to impossible positions.
+
+2. Multi-evidence score schema: keep separate score components for ASR transcript, filename hint, duration, VAD coverage, speaker similarity, lyric text, lyric timestamp consistency, and future phonetic similarity. The final score must be explainable in `analysis.json` and `.diagnostics.jsonl`.
+
+3. Lyric timestamp demotion and validation: LRC/SRT timestamps should become a candidate timing prior, not the highest-priority source. Use them only when they agree with ASR/acoustic segment timing within tolerance; otherwise mark `lyric_timing_conflict` and fall back to acoustic/model timing.
+
+4. Phonetic matching layer: add a phoneme/pinyin/romaji-aware matching stage for short clips and one-character materials. Filename and ASR text should be normalized into pronunciation units before scoring. This is critical because visual text similarity alone is weak when ASR returns empty or wrong text for single syllables.
+
+5. Short-clip safe alignment: detect one-character or one-syllable materials and apply stricter matching rules. A short clip should require enough confidence from at least two evidence types, such as filename pronunciation plus duration, or ASR plus VAD timing. If confidence is too low, diagnostics must require review instead of silently accepting a likely wrong match.
+
+6. Syllable-safe stretch policy: keep per-clip Rubber Band rendering, but add a short-vocal policy that protects the voiced core. For extreme ratios, prefer separating voiced core from leading/trailing silence, mild core stretch, and silence/tail padding over destructive full-clip stretching.
+
+7. Batch material ASR: reduce first-run time by optionally concatenating short materials with boundary markers and running a batched Faster Whisper/WhisperX pass, then mapping transcripts back to source files. If batch mapping confidence is weak, fall back to per-file ASR for only the uncertain clips.
+
+8. Incremental material analysis: split material analysis into fast metadata, VAD, ASR, and speaker stages. Cache each stage independently so changing one file does not invalidate the whole material folder. Reuse previous stage outputs whenever file snapshot, model version, compute device, and settings match.
+
+9. Global reference cache: move reference analysis cache toward a stable user/project cache keyed by reference file snapshot, lyrics snapshot, source-separation mode, UVR model fingerprint, ASR backend, model version, and compute device. This avoids recomputing UVR/ASR when only output format or render settings change.
+
+10. Preflight-first workflow: strengthen `audio_processor analyze` and the GUI preflight path so users can inspect ordering, low-confidence pairs, stretch ratios, repeated text groups, and lyric timing conflicts before rendering. Rendering should remain possible, but warnings should be explicit enough to prevent wasted manual tests.
+
+11. Flat WAV render cache: extend the DAW duplicate-render reuse idea to normal WAV output. Render stretched clips to a cache when beneficial, reuse exact duplicate source/target/tempo/render-option combinations, then concatenate cached PCM clips.
+
+12. VST3 helper persistence: keep the native VST3 bridge as an offline control surface, but make the helper process persistent where possible. A persistent helper can keep model objects loaded, process request files, write progress/heartbeat/status, and avoid repeated model initialization from the DAW UI.
+
+13. Verification suite expansion: add deterministic tests for global assignment, lyric timestamp conflict handling, phonetic matching, one-character materials, extreme stretch warnings, batch-ASR mapping fallback, stage-cache invalidation, and VST3 bridge request/response progress.
+
+14. Real manual-test acceptance target: the ordering system should aim for correct one-to-one material correspondence in the majority of clean or moderately noisy cases. The project should not claim perfect automatic accuracy; instead it should fail visibly with `review_required` when evidence is insufficient.
+
+### Priority Order
+
+1. Ordering engine v2 and score matrix diagnostics.
+2. Phonetic/short-clip matching.
+3. Lyric timestamp validation without treating timestamps as truth.
+4. Syllable-safe stretch policy.
+5. Preflight-first GUI/CLI review.
+6. Incremental caches and batched ASR.
+7. Flat WAV render reuse.
+8. Persistent VST3 helper progress protocol.
