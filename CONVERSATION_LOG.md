@@ -94,6 +94,8 @@
 1. 已删除无独立提交的临时分支 `codex/update-release-portable-assets`，本次发布整理直接在 `main` 上处理。
 2. `PROJECT_RULES.md` 已加入规则：每次更新 `main` 时，README 下载说明之后必须有更新日志，记录变更、发布资产和人工测试影响。
 3. README 已新增 `2026-07-27: 完整便携包与 VST3 包发布更新`，说明非 VST3 包和 VST3 包区别，以及 `-lite` 包不作为完整功能发布包。
+4. 已创建 GitHub Release `v2026.07.27-portable-full-runtime`：<https://github.com/aztksilence111/vocal_process/releases/tag/v2026.07.27-portable-full-runtime>。
+5. Release 已上传两个完整包：`VocalProcess-portable.zip`（1,413,022,068 bytes，sha256 `0e440f8c2e2249852f1d11040df2df74fab211bf341ff5cc244f7fb56725be98`）和 `VocalProcess-portable-vst3.zip`（1,415,457,165 bytes，sha256 `0a166ff979808fec4581894757918e9db3db299cab85ba13fdc6b7da57fcb4eb`）。
 
 ### User
 

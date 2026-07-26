@@ -21,6 +21,7 @@
 2. 两个完整包都包含 Python 3.11 模型运行时、本地模型缓存、UVR worker、Faster Whisper、WhisperX 和 pyannote.audio。
 3. 非 VST3 版体积略小，测试变量更少；VST3 版只在需要宿主软件扫描/加载插件时使用。
 4. 带 `-lite` 的压缩包只用于启动、GUI 或 VST3 包装烟测，不作为完整功能发布包。
+5. 本次完整包 Release：`v2026.07.27-portable-full-runtime`，地址为 <https://github.com/aztksilence111/vocal_process/releases/tag/v2026.07.27-portable-full-runtime>。
 
 项目基础协作规则记录在 `PROJECT_RULES.md`。继续开发前应先阅读该文件、`CONVERSATION_LOG.md` 和 `PROJECT_ANALYSIS.md`。
 
