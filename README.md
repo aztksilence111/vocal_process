@@ -11,6 +11,17 @@
 下载后请进入 Release 的 Assets，取 `VocalProcess-portable.zip`，解压后直接运行 `VocalProcess.exe`。
 如果你是克隆仓库后再取包，Release 页面里的资产和源码压缩包是分开的，不要把源码 zip 当成便携包。
 
+## 更新日志
+
+### 2026-07-27: 完整便携包与 VST3 包发布更新
+
+1. Release 资产应同时提供两个完整便携包：
+   - `VocalProcess-portable.zip`：不含 VST3，适合普通 GUI/CLI 人工测试和本地模型处理。
+   - `VocalProcess-portable-vst3.zip`：包含 `plugins\VocalProcess Bridge.vst3`，适合 DAW 宿主插件测试。
+2. 两个完整包都包含 Python 3.11 模型运行时、本地模型缓存、UVR worker、Faster Whisper、WhisperX 和 pyannote.audio。
+3. 非 VST3 版体积略小，测试变量更少；VST3 版只在需要宿主软件扫描/加载插件时使用。
+4. 带 `-lite` 的压缩包只用于启动、GUI 或 VST3 包装烟测，不作为完整功能发布包。
+
 项目基础协作规则记录在 `PROJECT_RULES.md`。继续开发前应先阅读该文件、`CONVERSATION_LOG.md` 和 `PROJECT_ANALYSIS.md`。
 
 VocalProcess 是一个本地人声素材处理工具，提供命令行入口和桌面 GUI。当前主流程面向“用一组素材人声匹配原音频结构后拉伸拼接”的测试场景：原音频负责提供参考人声、时长和时间轴，素材集负责提供可替换的人声音频。

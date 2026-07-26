@@ -85,6 +85,16 @@
 2. 远端已推送新的内容型备份分支，并删除旧的日期型远端分支。
 3. `PROJECT_RULES.md` 的推荐命名已改为 `archive/main-before-<content-summary>`；日期只能作为同内容重复备份时的可选消歧后缀。
 
+### User Follow-Up
+
+要求更新 Release 并上传便携压缩包 ZIP，同时在 README 中说明有无 VST3 版的区别。随后说明这次 `main` 本体内容没有大改，不用新建分支，并新增规则：每次更新主分支时，README.md 需要在下载说明之后撰写更新日志，且该更新日志重要性排第二。
+
+### Assistant Notes
+
+1. 已删除无独立提交的临时分支 `codex/update-release-portable-assets`，本次发布整理直接在 `main` 上处理。
+2. `PROJECT_RULES.md` 已加入规则：每次更新 `main` 时，README 下载说明之后必须有更新日志，记录变更、发布资产和人工测试影响。
+3. README 已新增 `2026-07-27: 完整便携包与 VST3 包发布更新`，说明非 VST3 包和 VST3 包区别，以及 `-lite` 包不作为完整功能发布包。
+
 ### User
 
 继续项目
