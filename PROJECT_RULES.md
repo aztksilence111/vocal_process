@@ -21,5 +21,8 @@ This project does not use long-lived feature branches as the final delivery stat
 Recommended backup branch name:
 
 ```text
-archive/main-before-<work-branch-name>-<YYYYMMDD>
+archive/main-before-<content-summary>
 ```
+
+Use a content summary such as `python311-uvr-vst3-runtime`, not a date-driven name.
+Dates may be appended only when they disambiguate two backups with the same content summary.

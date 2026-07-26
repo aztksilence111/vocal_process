@@ -75,6 +75,16 @@
 2. `PROJECT_RULES.md` 已同步加入 GitHub 自动推送规则。
 3. 历史对话中“当时没有 GitHub 账号”的原始事实保留为历史记录，不再作为当前长期规则。
 
+### User Follow-Up
+
+指出备份分支名 `archive/main-before-runtime-env-uvr-worker-20260726` 仍然不够符合规则：分支名应根据备份内容命名，而不是直接按日期命名。
+
+### Assistant Notes
+
+1. 本地备份分支已改名为 `archive/main-before-python311-uvr-vst3-runtime`。
+2. 远端已推送新的内容型备份分支，并删除旧的日期型远端分支。
+3. `PROJECT_RULES.md` 的推荐命名已改为 `archive/main-before-<content-summary>`；日期只能作为同内容重复备份时的可选消歧后缀。
+
 ### User
 
 继续项目
