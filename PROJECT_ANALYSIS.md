@@ -987,3 +987,16 @@ WhisperX and pyannote should be included in the default full Python 3.11 runtime
 4. The no-VST3 full package passed model smoke with source separation skipped for an already-isolated fixture.
 5. The no-VST3 full package passed bundled UVR worker separation smoke.
 6. Portable `VocalProcess.exe check` reports WhisperX and pyannote.audio available.
+
+## 2026-07-27: Melodyne 3.x Compatibility Target
+
+### Result
+
+1. The local Melodyne 3.2 standalone at `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe` launches successfully and can be closed cleanly.
+2. This machine has no detected Melodyne 5 executable in the checked Celemony paths.
+3. Melodyne compatibility work should target Melodyne 3.x here, with 5.x only if a valid local installation becomes available.
+
+### Follow-Up
+
+1. Keep Melodyne smoke tests pointed at the 3.x executable path.
+2. Treat Melodyne as an editor/ARA workflow target rather than a generic host for the VST3 bridge.

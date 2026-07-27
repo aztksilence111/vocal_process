@@ -1023,3 +1023,16 @@ The user corrected the implementation approach: future work must not default to 
 8. Added VST3 bridge `progress_path` support so the helper writes atomic JSON progress/status while it runs.
 9. Fixed main Python 3.11 runtime compatibility by pinning `setuptools>=69,<81`; this restores `pkg_resources` for current model dependencies while keeping the project on Python 3.11.
 10. Verification passed: compileall, unittest with 66 tests, `pip check`, `audio_processor check`, and a real CLI batch smoke with diagnostics showing score matrix, phonetic matching, syllable-safe stretch, and completion.
+
+## 2026-07-27: Melodyne 3.x Compatibility Target
+
+### User
+
+The user clarified that Melodyne 4 should not be considered for this machine because the local Melodyne 4 install is incomplete or not properly removed. The requested target is Melodyne 3.x compatibility; Melodyne 5 can be considered later if installed.
+
+### Assistant Notes
+
+1. The requested `Melodyne Studio 3.2` folder name does not exist on this machine; the real 3.2 executable is `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe`.
+2. `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe` launched successfully and closed cleanly during the smoke test.
+3. Added `scripts\test_melodyne_3x.ps1` for repeatable Melodyne 3.x launch validation.
+4. Updated Melodyne context/docs so future testing does not treat the local Melodyne 4 state as a project compatibility result.

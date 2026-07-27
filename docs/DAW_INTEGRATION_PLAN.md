@@ -96,7 +96,7 @@ Host validation status on this machine:
 1. JUCE headless probe: passed. The probe found one VST3 description for `VocalProcess Bridge`, instantiated it, and confirmed 2 inputs / 2 outputs.
 2. REAPER 7.33 x64: passed. `scripts\host_test_reaper_vst3.ps1` launched REAPER with an isolated config and confirmed `VocalProcess Bridge (VocalProcess)` in `reaper-vstplugins64.ini`.
 3. FL Studio 2024: partial. The bridge is installed under `C:\Program Files\Common Files\VST3`, and Plugin Manager launches, but no documented non-interactive scan command is available. Final FL registration should be done with Plugin Manager > Find installed plugins rather than editing FL's database files by hand.
-4. Melodyne/Celemony: considered as an import/edit workflow target. This machine has Melodyne Studio 4 / Celemony paths in standard 64-bit locations on `E:\` and additional legacy 32-bit paths, but Melodyne is not used as a generic VST3 host for this bridge. Use exported PCM WAV or DAW timeline output with Melodyne/ARA inside a 64-bit DAW.
+4. Melodyne/Celemony: considered as an import/edit workflow target. This machine's practical compatibility target is Melodyne 3.2 at `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe`. Use exported PCM WAV or DAW timeline output with Melodyne/ARA inside a compatible DAW.
 
 Runtime optimization status:
 
@@ -116,5 +116,5 @@ Risks:
 
 1. Run the FL Studio Plugin Manager manual scan and confirm the bridge appears in the verified plug-in database.
 2. Test the bridge in the next available 64-bit hosts from the user list, prioritizing hosts that support normal VST3 scanning.
-3. Keep Melodyne support focused on rendered WAV/DAW timeline handoff unless a current 64-bit Melodyne/ARA SDK path becomes an explicit requirement.
+3. Keep Melodyne support focused on rendered WAV/DAW timeline handoff unless a current Melodyne 3.x or 5.x ARA/SDK path becomes an explicit requirement.
 4. Add project exporters for confirmed hosts only.

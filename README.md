@@ -13,6 +13,12 @@
 
 ## 更新日志
 
+### 2026-07-27: Melodyne 3.x 适配目标
+
+1. Melodyne 验证目标改为本机可用的 Melodyne 3.x，不再把本机未正确安装或删除不完整的 Melodyne 4 当成适配结论。
+2. 已验证 `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe` 可以正常启动并关闭。
+3. 新增 `scripts\test_melodyne_3x.ps1`，用于重复执行 Melodyne 3.x 启动烟测。
+
 ### 2026-07-27: 核心排序 v2 与短字安全渲染
 
 1. 素材排序从逐段贪心选择升级为全局评分矩阵和一一对应分配，`analysis.json` 与 diagnostics 会记录 `ordering_strategy`、`score_matrix`、分项得分和低置信度标记。
@@ -304,6 +310,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_vst3_bridge.ps1 -Force
 powershell -ExecutionPolicy Bypass -File scripts\host_test_reaper_vst3.ps1
 powershell -ExecutionPolicy Bypass -File scripts\host_test_flstudio_vst3.ps1
 powershell -ExecutionPolicy Bypass -File scripts\check_melodyne_context.ps1
+powershell -ExecutionPolicy Bypass -File scripts\test_melodyne_3x.ps1
 ```
 
 Current local host results:
@@ -312,4 +319,4 @@ Current local host results:
 2. REAPER 7.33 x64 scanned the bridge in an isolated config and cached it successfully.
 3. The bridge was installed to `C:\Program Files\Common Files\VST3\VocalProcess Bridge.vst3` for hosts that scan the common VST3 folder.
 4. FL Studio 2024 Plugin Manager can be launched, but no documented non-interactive scan command was found; use Plugin Manager > Find installed plugins for final FL registration.
-5. Melodyne Studio 4 / Celemony paths were detected in standard 64-bit locations on `E:\`, with additional legacy 32-bit paths on the machine. Melodyne is treated as a WAV/DAW/ARA workflow target, not a generic host in which this 64-bit VST3 bridge is validated.
+5. Melodyne 3.2 at `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe` launches successfully on this machine. Melodyne 3.x is the local compatibility target, and Melodyne remains a WAV/DAW/ARA workflow target rather than a generic host for this 64-bit VST3 bridge.
