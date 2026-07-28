@@ -1210,3 +1210,10 @@ Remaining after this continuation:
 3. Material analysis cache writes were redirected to per-case output folders, so the source material sets remain audio-only from the app’s point of view.
 4. The real smoke case `PlasticLove_JP__vmzJP` completed analysis with `compute_device=cpu` and `source_separation=never`; it ended in `review_required`, which is expected for a conservative first pass on one real JP case.
 5. Verification after the real-test changes passed `compileall`, the full `unittest discover` suite with 86 tests, and the one-case real smoke run.
+
+### Cache Routing Follow-up
+
+1. The default material-analysis cache path now resolves under the work cache (`work_root/material_analysis_cache/<fingerprint>/...`) for normal ordering runs, so the live app path no longer writes cache files into the source material folder by default.
+2. The explicit `material_cache_dir` override remains available for real-test harnesses and any caller that wants a custom cache location.
+3. GUI text and README guidance were updated to describe work-cache reuse instead of source-folder cache generation.
+4. Verification after this follow-up passed `compileall` and `unittest discover` with 87 tests.

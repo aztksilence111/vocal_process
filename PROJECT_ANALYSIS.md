@@ -1175,3 +1175,10 @@ Next architecture direction:
 3. The cache redirection matters operationally: material analysis cache no longer has to live beside the source audio, which keeps the real test corpus cleaner and makes it easier to swap or refresh audio without incidental cache churn.
 4. A real JP smoke case on `PlasticLove_JP__vmzJP` finished as `review_required`. That is a useful baseline rather than a defect: it shows the pipeline is conservative on live data and still expects review on many homophone-heavy material clips.
 5. The latest verification pass reached 86 unit/integration tests plus one full real smoke run, so the pronunciation-ordering and timeline-splitting changes are now covered by both synthetic and real corpus checks.
+
+### 2026-07-28 Cache Routing Follow-up
+
+1. Normal model-assisted ordering now routes material analysis caches into the work cache tree instead of writing beside the source material directory. That keeps both the app flow and future real-test corpora cleaner.
+2. The explicit cache-directory override remains in place for the `tests_real` harness and other controlled cases, so cache placement can still be forced when a caller wants it.
+3. The user-facing copy was updated to match the new behavior, which reduces the risk that the GUI or README implies source-folder mutation where none should happen.
+4. The current regression surface is now 87 tests, and the change stayed within the existing pronunciation-ordering/time-alignment architecture rather than adding a separate caching subsystem.

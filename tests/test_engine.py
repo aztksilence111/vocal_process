@@ -1195,6 +1195,25 @@ class ModelRuntimeTests(unittest.TestCase):
 
         self.assertEqual(cache_root, fallback)
 
+    def test_default_material_cache_dir_uses_work_root_not_source_folder(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            work_root = root / "work"
+            material_dir = root / "materials"
+            other_dir = root / "other-materials"
+            material_dir.mkdir()
+            other_dir.mkdir()
+
+            cache_dir = model_runtime._default_material_cache_dir(work_root, material_dir, "cpu")
+            other_cache_dir = model_runtime._default_material_cache_dir(work_root, other_dir, "cpu")
+            cache_path = model_runtime._material_cache_path(material_dir, cache_dir)
+
+        self.assertEqual(cache_dir.parent.parent, work_root)
+        self.assertEqual(cache_path.parent, cache_dir)
+        self.assertEqual(cache_path.name, model_runtime.MATERIAL_CACHE_FILE)
+        self.assertNotIn(str(material_dir), str(cache_dir))
+        self.assertNotEqual(cache_dir, other_cache_dir)
+
     def test_model_cache_snapshot_reuses_matching_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

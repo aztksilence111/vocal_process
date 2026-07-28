@@ -162,6 +162,11 @@ def build_model_ordering(
         raise AudioProcessorError("Material directory does not contain supported audio files")
 
     _raise_if_cancelled(should_cancel)
+    resolved_material_cache_dir = material_cache_dir or _default_material_cache_dir(
+        work_root,
+        material_directory,
+        device,
+    )
     notes: list[str] = [f"compute device resolved: {device}"]
     backend_summary = backend_availability()
     _raise_if_cancelled(should_cancel)
@@ -182,7 +187,7 @@ def build_model_ordering(
     library = analyze_material_library(
         material_directory,
         work_dir=work_root,
-        material_cache_dir=material_cache_dir,
+        material_cache_dir=resolved_material_cache_dir,
         compute_device=device,
         on_progress=on_progress,
         notes=notes,
@@ -245,7 +250,7 @@ def build_model_ordering(
         "reference": render_reference_analysis(reference),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
         "material_cache": {
-            "path": str(_material_cache_path(material_directory, material_cache_dir)),
+            "path": str(_material_cache_path(material_directory, resolved_material_cache_dir)),
             "notes": [note for note in library.notes if "material analysis cache" in note],
         },
         "ordering_strategy": ordering_plan.strategy,
@@ -1568,6 +1573,17 @@ def _write_material_library_cache(
 def _material_cache_path(material_directory: Path, material_cache_dir: Path | None) -> Path:
     base = material_cache_dir.expanduser() if material_cache_dir is not None else material_directory.expanduser()
     return base / MATERIAL_CACHE_FILE
+
+
+def _default_material_cache_dir(work_root: Path, material_directory: Path, compute_device: str) -> Path:
+    payload = {
+        "material_directory": str(material_directory.expanduser().resolve()),
+        "asr_model": DEFAULT_ASR_MODEL,
+        "asr_backend": os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower(),
+        "compute_device": compute_device,
+    }
+    key = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return work_root / "material_analysis_cache" / key
 
 
 def _reference_cache_path(

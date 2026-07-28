@@ -68,7 +68,7 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 7. 生成结构化 `.diagnostics.jsonl`，用于定位无报错失败、模型转写失败、FFprobe 元数据失败等问题。
 8. 输出普通 WAV，或导出 REAPER `.rpp`、`timeline.json`、`timeline.csv` 和独立素材片段 WAV，方便在 DAW 中继续编辑每个素材 item。
 9. 提供 `batch` 命令，便于在便携包里直接跑一条真实模型辅助输出。
-10. 素材集会生成 `.vocalprocess_material_cache.json`，同一文件夹未变化时复用素材分析结果。
+10. 素材分析缓存默认写入工作缓存目录，同一素材目录未变化时复用分析结果；如需定向缓存，可由调用方单独指定。
 11. 原音频分析会生成参考缓存，同一原音频、歌词、计算设备和人声分离策略不变时复用 Demucs/ASR/声纹结果。
 12. GUI 显示运行时长，支持 CPU/GPU 计算设备选择，并提供“自动判断 / 已是人声跳过分离 / 强制分离”按钮。
 13. 完整模型运行时包含 `faster-whisper`、`whisperx` 和 `pyannote.audio`；pyannote 预训练模型仍需要 Hugging Face token 和模型条款授权。
