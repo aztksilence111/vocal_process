@@ -1217,3 +1217,11 @@ Remaining after this continuation:
 2. The explicit `material_cache_dir` override remains available for real-test harnesses and any caller that wants a custom cache location.
 3. GUI text and README guidance were updated to describe work-cache reuse instead of source-folder cache generation.
 4. Verification after this follow-up passed `compileall` and `unittest discover` with 87 tests.
+
+### Maintenance Session Runner
+
+1. Added `audio_processor.maintenance` plus a `maintenance` CLI subcommand so long-lived developer work can run with a persisted plan, heartbeat, state file, event log, and per-task stdout/stderr captures.
+2. Added `scripts/start_maintenance_session.ps1` as a hidden launcher that starts the runner in a separate process and writes the session under `.tmp\maintenance_sessions\...`.
+3. Added `scripts/maintenance_plan.example.json` so the runner has a ready-made repeatable plan for compile/test/check/status cycles.
+4. Smoke-tested the hidden launcher with a one-task plan; it completed successfully and wrote `state.json`, `heartbeat.json`, `events.jsonl`, and task logs under `.tmp\maintenance_sessions\20260728-193128-smoke\`.
+5. Verification passed `compileall`, `unittest discover` with 90 tests, `audio_processor maintenance --template`, and `audio_processor maintenance --contract`.

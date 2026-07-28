@@ -1,0 +1,66 @@
+{
+  "format": "vocal_process_maintenance_plan_v1",
+  "name": "development-maintenance",
+  "repeat": true,
+  "cycle_pause_seconds": 900,
+  "tasks": [
+    {
+      "name": "compileall",
+      "command": ".venv311\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "compileall",
+        "-q",
+        "audio_processor",
+        "tests"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1200,
+      "continue_on_failure": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 0
+    },
+    {
+      "name": "unit-tests",
+      "command": ".venv311\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "unittest",
+        "discover"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 5400,
+      "continue_on_failure": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 0
+    },
+    {
+      "name": "audio-check",
+      "command": ".venv311\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "audio_processor",
+        "check"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 1800,
+      "continue_on_failure": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 0
+    },
+    {
+      "name": "git-status",
+      "command": "git",
+      "args": [
+        "status",
+        "--short",
+        "--branch"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 120,
+      "continue_on_failure": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 0
+    }
+  ]
+}

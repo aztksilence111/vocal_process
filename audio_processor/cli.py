@@ -21,6 +21,12 @@ from .handoff import (
     export_vegas_handoff_with_progress,
     open_melodyne_handoff,
 )
+from .maintenance import (
+    MAINTENANCE_SESSION_FORMAT,
+    maintenance_contract,
+    maintenance_plan_template,
+    run_maintenance_session,
+)
 from .model_assist import build_model_assisted_pipeline_plan, list_model_candidates
 from .preflight import build_preflight_report
 from .model_runtime import backend_availability, get_model_runtime_report
@@ -224,6 +230,43 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SOURCE_SEPARATION_OPTIONS,
         default="auto",
         help="reference vocal separation strategy: auto, always, or never",
+    )
+
+    maintenance_parser = subparsers.add_parser(
+        "maintenance",
+        help="run a long-lived maintenance session with heartbeat and task logs",
+    )
+    maintenance_parser.add_argument("--plan", type=Path, help="maintenance plan JSON file")
+    maintenance_parser.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=Path.cwd(),
+        help="workspace root used to resolve relative task paths",
+    )
+    maintenance_parser.add_argument("--session-dir", type=Path, help="session output directory")
+    maintenance_parser.add_argument(
+        "--duration-hours",
+        type=float,
+        default=10.0,
+        help="maximum session length in hours",
+    )
+    maintenance_parser.add_argument(
+        "--poll-ms",
+        type=int,
+        default=5000,
+        help="heartbeat polling interval in milliseconds",
+    )
+    maintenance_parser.add_argument("--once", action="store_true", help="run one maintenance cycle and exit")
+    maintenance_parser.add_argument("--stop-file", type=Path, help="optional stop file path")
+    maintenance_parser.add_argument(
+        "--contract",
+        action="store_true",
+        help="print the maintenance session contract instead of running it",
+    )
+    maintenance_parser.add_argument(
+        "--template",
+        action="store_true",
+        help="print the default maintenance plan template instead of running it",
     )
 
     bridge_parser = subparsers.add_parser(
@@ -439,6 +482,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Wrote {args.output}")
             else:
                 print(payload)
+            return 0
+
+        if args.command == "maintenance":
+            if args.contract:
+                print(json.dumps(maintenance_contract(), ensure_ascii=False, indent=2))
+                return 0
+            if args.template:
+                print(json.dumps(maintenance_plan_template(), ensure_ascii=False, indent=2))
+                return 0
+            if args.plan is None:
+                parser.error("maintenance requires --plan unless --template or --contract is used")
+                return 2
+            result = run_maintenance_session(
+                args.plan,
+                workspace_root=args.workspace_root,
+                session_dir=args.session_dir,
+                duration_hours=args.duration_hours,
+                poll_interval_seconds=max(args.poll_ms, 50) / 1000.0,
+                once=args.once,
+                stop_file=args.stop_file,
+            )
+            print(
+                json.dumps(
+                    {
+                        "format": MAINTENANCE_SESSION_FORMAT,
+                        "status": result.status,
+                        "session_dir": str(result.session_dir),
+                        "state_path": str(result.state_path),
+                        "heartbeat_path": str(result.heartbeat_path),
+                        "events_path": str(result.events_path),
+                        "started_at": result.started_at,
+                        "finished_at": result.finished_at,
+                        "cycles_completed": result.cycles_completed,
+                        "task_runs": result.task_runs,
+                        "task_failures": result.task_failures,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             return 0
 
         if args.command == "vst3-bridge":

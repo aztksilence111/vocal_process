@@ -1182,3 +1182,11 @@ Next architecture direction:
 2. The explicit cache-directory override remains in place for the `tests_real` harness and other controlled cases, so cache placement can still be forced when a caller wants it.
 3. The user-facing copy was updated to match the new behavior, which reduces the risk that the GUI or README implies source-folder mutation where none should happen.
 4. The current regression surface is now 87 tests, and the change stayed within the existing pronunciation-ordering/time-alignment architecture rather than adding a separate caching subsystem.
+
+### 2026-07-28 Maintenance Session Runner
+
+1. A single chat/API turn cannot be treated as a reliable 10-hour daemon because the model call has a bounded request lifecycle. Durable autonomy needs an external local process plus resumable state.
+2. The repository now includes a maintenance-session runner that uses a JSON plan, heartbeat, state file, event log, task stdout/stderr logs, and a stop-file contract. This gives future long work a local process that can keep running after the chat turn ends.
+3. `scripts/start_maintenance_session.ps1` launches that runner with `Start-Process -WindowStyle Hidden`, satisfying the local hidden-background-service requirement while keeping all state under ignored `.tmp\maintenance_sessions`.
+4. This does not make the model itself reason unattended for 10 hours; it creates the missing process-supervision layer so long deterministic checks, real-test loops, and future resumable agent orchestration have a stable substrate.
+5. The runner is covered by maintenance-plan and one-cycle execution tests, and the full regression suite now passes with 90 tests.

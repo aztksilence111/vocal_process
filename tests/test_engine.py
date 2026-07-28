@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import unittest
 import wave
 from pathlib import Path
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from audio_processor import model_runtime, preflight
+from audio_processor import maintenance
 from audio_processor import real_eval
 from audio_processor.batch import BatchSummary, create_queue, run_batch_queue
 from audio_processor.cli import build_parser
@@ -824,11 +826,88 @@ class RealEvalTests(unittest.TestCase):
         self.assertEqual({entry["language"] for entry in manifest["cases"]}, {"CN"})
 
 
+class MaintenanceRunnerTests(unittest.TestCase):
+    def test_loads_maintenance_plan_template(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = root / "maintenance.plan.json"
+            plan_path.write_text(
+                json.dumps(maintenance.maintenance_plan_template(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            plan = maintenance.load_maintenance_plan(plan_path)
+
+        self.assertEqual(plan.name, "development-maintenance")
+        self.assertTrue(plan.repeat)
+        self.assertGreaterEqual(len(plan.tasks), 3)
+        self.assertEqual(plan.tasks[0].name, "compileall")
+
+    def test_runs_one_maintenance_cycle_and_records_state(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = root / "maintenance.plan.json"
+            session_dir = root / "session"
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "format": maintenance.MAINTENANCE_PLAN_FORMAT,
+                        "name": "smoke",
+                        "repeat": True,
+                        "cycle_pause_seconds": 0,
+                        "tasks": [
+                            {
+                                "name": "echo",
+                                "command": sys.executable,
+                                "args": ["-c", "print('hello from maintenance')"],
+                                "cwd": ".",
+                                "timeout_seconds": 10,
+                                "continue_on_failure": True,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = maintenance.run_maintenance_session(
+                plan_path,
+                workspace_root=root,
+                session_dir=session_dir,
+                duration_hours=0.001,
+                poll_interval_seconds=0.01,
+                once=True,
+            )
+            state = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+            heartbeat = json.loads((session_dir / "heartbeat.json").read_text(encoding="utf-8"))
+            events = (session_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            stdout_texts = [
+                path.read_text(encoding="utf-8")
+                for path in (session_dir / "task-logs").glob("*.stdout.txt")
+            ]
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.cycles_completed, 1)
+            self.assertEqual(result.task_runs, 1)
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(heartbeat["status"], "completed")
+            self.assertTrue(any("\"task.completed\"" in line for line in events))
+            self.assertTrue(any("hello from maintenance" in text for text in stdout_texts))
+
+
 class CliTests(unittest.TestCase):
     def test_gui_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["gui"])
 
         self.assertEqual(args.command, "gui")
+
+    def test_maintenance_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(["maintenance", "--template"])
+
+        self.assertEqual(args.command, "maintenance")
+        self.assertTrue(args.template)
 
     def test_export_daw_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["export-daw", "reference.wav", "materials", "song.rpp"])

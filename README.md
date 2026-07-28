@@ -364,7 +364,10 @@ powershell -ExecutionPolicy Bypass -File scripts\host_test_reaper_vst3.ps1
 powershell -ExecutionPolicy Bypass -File scripts\host_test_flstudio_vst3.ps1
 powershell -ExecutionPolicy Bypass -File scripts\check_melodyne_context.ps1
 powershell -ExecutionPolicy Bypass -File scripts\test_melodyne_3x.ps1
+powershell -ExecutionPolicy Bypass -File scripts\start_maintenance_session.ps1
 ```
+
+The maintenance session helper writes heartbeat, state, and task logs under `.tmp\maintenance_sessions\<timestamp>-<name>\`, and it can be pointed at a custom plan file when you want a longer background run.
 
 Current local host results:
 
