@@ -9,7 +9,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from audio_processor import model_runtime
+from audio_processor import model_runtime, preflight
+from audio_processor import real_eval
 from audio_processor.batch import BatchSummary, create_queue, run_batch_queue
 from audio_processor.cli import build_parser
 from audio_processor.cli import main as cli_main
@@ -22,6 +23,10 @@ from audio_processor.daw import (
     plan_daw_timeline,
     render_reaper_project,
 )
+from audio_processor.handoff import (
+    export_melodyne_handoff_with_progress,
+    export_vegas_handoff_with_progress,
+)
 from audio_processor.engine import (
     AudioProcessorError,
     ProcessOptions,
@@ -30,6 +35,7 @@ from audio_processor.engine import (
     build_material_assembly_args,
     build_material_clip_args,
     build_process_args,
+    ensure_runtime_tool_paths,
     get_audio_duration_seconds,
     list_audio_files,
     plan_material_stretch_clips,
@@ -392,6 +398,116 @@ class DawTimelineTests(unittest.TestCase):
         self.assertIn('FILE "audio/0002_b.wav"', project)
 
 
+class TimelineHandoffTests(unittest.TestCase):
+    def _fake_daw_result(self, output_directory: Path) -> DawExportResult:
+        audio_directory = output_directory / "audio"
+        return DawExportResult(
+            project_path=output_directory / "timeline.rpp",
+            manifest_path=output_directory / "timeline.json",
+            csv_path=output_directory / "timeline.csv",
+            audio_directory=audio_directory,
+            clips=[
+                DawTimelineClip(
+                    index=1,
+                    source_path=Path("materials") / "first.wav",
+                    rendered_path=audio_directory / "0001_first.wav",
+                    start_seconds=0.0,
+                    source_duration_seconds=1.0,
+                    target_duration_seconds=1.5,
+                    actual_duration_seconds=1.5,
+                    text_hint="first",
+                ),
+                DawTimelineClip(
+                    index=2,
+                    source_path=Path("materials") / "second.wav",
+                    rendered_path=audio_directory / "0002_second.wav",
+                    start_seconds=1.5,
+                    source_duration_seconds=1.0,
+                    target_duration_seconds=2.5,
+                    actual_duration_seconds=2.5,
+                    text_hint="second",
+                ),
+            ],
+        )
+
+    def test_melodyne_handoff_renders_full_timeline_lanes(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        output_directory = root / "melodyne"
+        fake_result = self._fake_daw_result(output_directory)
+
+        with patch(
+            "audio_processor.handoff.probe_audio",
+            return_value={
+                "format": {"duration": "4.0"},
+                "streams": [{"codec_type": "audio", "sample_rate": "44100", "channels": 2}],
+            },
+        ), patch(
+            "audio_processor.handoff.export_daw_timeline_with_progress",
+            return_value=fake_result,
+        ), patch("audio_processor.handoff.run_command") as run_mock:
+            result = export_melodyne_handoff_with_progress(
+                Path("reference.wav"),
+                Path("materials"),
+                output_directory,
+                ProcessOptions(
+                    input_path=Path("reference.wav"),
+                    output_path=output_directory / "melodyne_full.wav",
+                    overwrite=True,
+                ),
+            )
+
+        manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(result.target, "melodyne")
+        self.assertEqual(result.full_mix_path.name, "melodyne_full.wav")
+        self.assertEqual(len(result.lanes), 2)
+        self.assertIsNone(result.bwf_directory)
+        self.assertEqual(manifest["format"], "vocal_process_timeline_handoff_v1")
+        self.assertEqual(manifest["target"], "melodyne")
+        self.assertEqual(run_mock.call_count, 3)
+        second_lane_command = " ".join(str(part) for part in run_mock.call_args_list[1].args[0])
+        self.assertIn("adelay=delays=1500:all=1", second_lane_command)
+        self.assertIn("atrim=duration=4.000000", second_lane_command)
+
+    def test_vegas_handoff_writes_bwf_timestamp_metadata(self) -> None:
+        temp_dir = TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        output_directory = root / "vegas"
+        fake_result = self._fake_daw_result(output_directory)
+
+        with patch(
+            "audio_processor.handoff.probe_audio",
+            return_value={
+                "format": {"duration": "4.0"},
+                "streams": [{"codec_type": "audio", "sample_rate": "44100", "channels": 2}],
+            },
+        ), patch(
+            "audio_processor.handoff.export_daw_timeline_with_progress",
+            return_value=fake_result,
+        ), patch("audio_processor.handoff.run_command") as run_mock:
+            result = export_vegas_handoff_with_progress(
+                Path("reference.wav"),
+                Path("materials"),
+                output_directory,
+                ProcessOptions(
+                    input_path=Path("reference.wav"),
+                    output_path=output_directory / "vegas_full.wav",
+                    overwrite=True,
+                ),
+            )
+
+        manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(result.target, "vegas")
+        self.assertEqual(len(result.bwf_clips), 2)
+        self.assertEqual(result.bwf_clips[1].time_reference_samples, 66150)
+        self.assertEqual(manifest["bwf_clips"][1]["time_reference_samples"], 66150)
+        bwf_commands = [call.args[0] for call in run_mock.call_args_list if "-write_bext" in call.args[0]]
+        self.assertEqual(len(bwf_commands), 2)
+        self.assertIn("time_reference=66150", bwf_commands[1])
+
+
 class ToolResolutionTests(unittest.TestCase):
     def test_resolve_tool_prefers_portable_bin(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -403,6 +519,21 @@ class ToolResolutionTests(unittest.TestCase):
             with patch("audio_processor.engine._runtime_tool_roots", return_value=[root]):
                 with patch("shutil.which", return_value=None):
                     self.assertEqual(resolve_tool("ffmpeg"), str(portable_tool))
+
+    def test_runtime_tool_paths_expose_portable_bin_to_child_libraries(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            portable_bin = root / "bin"
+            portable_bin.mkdir()
+            (portable_bin / "ffmpeg.exe").write_bytes(b"")
+
+            with patch("audio_processor.engine._runtime_tool_roots", return_value=[root]):
+                with patch.dict(os.environ, {"PATH": r"C:\Windows"}, clear=False):
+                    tool_dirs = ensure_runtime_tool_paths()
+                    path_parts = os.environ["PATH"].split(os.pathsep)
+
+        self.assertEqual(tool_dirs, [portable_bin.resolve()])
+        self.assertEqual(path_parts[0], str(portable_bin.resolve()))
 
 
 class ProbeSummaryTests(unittest.TestCase):
@@ -667,6 +798,32 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("batch.item.failed", [record["stage"] for record in records])
 
 
+class RealEvalTests(unittest.TestCase):
+    def test_discovers_cross_product_real_cases_without_tracking_audio_assets(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set"
+            lyrics = root / "lyrics"
+            origin.mkdir()
+            lyrics.mkdir()
+            (material_root / "vmzCN").mkdir(parents=True)
+            (material_root / "vmzJP").mkdir(parents=True)
+            _write_test_wave(origin / "song_CN.wav")
+            _write_test_wave(material_root / "vmzCN" / "wo.wav")
+            _write_test_wave(material_root / "vmzJP" / "a.wav")
+            (lyrics / "song_CN.lrc").write_text("[00:00.00]\u6211\n", encoding="utf-8")
+
+            cases = real_eval.discover_real_cases(root)
+            manifest_path = real_eval.write_manifest_template(root, root / "cases.generated.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual([case.name for case in cases], ["song_CN__vmzCN", "song_CN__vmzJP"])
+        self.assertTrue(all(case.language == "CN" for case in cases))
+        self.assertEqual(len(manifest["cases"]), 2)
+        self.assertEqual({entry["language"] for entry in manifest["cases"]}, {"CN"})
+
+
 class CliTests(unittest.TestCase):
     def test_gui_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["gui"])
@@ -678,6 +835,18 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.command, "export-daw")
         self.assertEqual(args.reference, Path("reference.wav"))
+
+    def test_export_melodyne_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(["export-melodyne", "reference.wav", "materials", "handoff"])
+
+        self.assertEqual(args.command, "export-melodyne")
+        self.assertEqual(args.output_directory, Path("handoff"))
+
+    def test_export_vegas_subcommand_is_registered(self) -> None:
+        args = build_parser().parse_args(["export-vegas", "reference.wav", "materials", "handoff"])
+
+        self.assertEqual(args.command, "export-vegas")
+        self.assertEqual(args.output_directory, Path("handoff"))
 
     def test_models_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["models", "--json"])
@@ -892,10 +1061,125 @@ class ModelAssistTests(unittest.TestCase):
 
         self.assertEqual(decisions[0].material_path.name, "right.wav")
         self.assertGreater(decisions[0].phonetic_score, 0.8)
-        self.assertEqual(decisions[0].reason, "phonetic_similarity")
+        self.assertEqual(decisions[0].reason, "reference_text_position")
+
+    def test_orders_pinyin_filenames_by_chinese_reference_phonetic_position(self) -> None:
+        reference_segments = [VoiceSegment(0.0, 3.0, "\u6211\u662f\u4f60")]
+        materials = [
+            MaterialAnalysis(Path("ni.wav"), transcript="", filename_text="ni", duration_seconds=1.0),
+            MaterialAnalysis(Path("wo.wav"), transcript="", filename_text="wo", duration_seconds=1.0),
+            MaterialAnalysis(Path("shi.wav"), transcript="", filename_text="shi", duration_seconds=1.0),
+        ]
+        decisions = order_materials_for_reference(reference_segments, materials)
+        plan = plan_material_ordering(reference_segments, materials)
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["wo.wav", "shi.wav", "ni.wav"])
+        self.assertEqual([decision.text_position for decision in decisions], [0, 1, 2])
+        self.assertTrue(all(decision.reason == "reference_text_position" for decision in decisions))
+        self.assertTrue(all(decision.phonetic_score > 0.8 for decision in decisions))
+        self.assertEqual([score.phonetic_position for score in plan.score_matrix[0]], [2, 0, 1])
+        self.assertEqual(plan.score_matrix[0][1].reference_phonetic_units, ("wo", "shi", "ni"))
+        self.assertEqual(plan.score_matrix[0][1].material_phonetic_units, ("wo",))
+
+    def test_orders_tone_number_pinyin_filenames_by_phonetic_position(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 3.0, "\u6211\u662f\u4f60")],
+            [
+                MaterialAnalysis(Path("ni3.wav"), transcript="", filename_text="ni3", duration_seconds=1.0),
+                MaterialAnalysis(Path("shi4.wav"), transcript="", filename_text="shi4", duration_seconds=1.0),
+                MaterialAnalysis(Path("wo3.wav"), transcript="", filename_text="wo3", duration_seconds=1.0),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["wo3.wav", "shi4.wav", "ni3.wav"])
+        self.assertEqual([decision.text_position for decision in decisions], [0, 1, 2])
+        self.assertTrue(all(decision.phonetic_score > 0.8 for decision in decisions))
+
+    def test_orders_number_prefixed_pinyin_filenames_by_phonetic_position(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 3.0, "\u6211\u662f\u4f60")],
+            [
+                MaterialAnalysis(Path("003_ni3.wav"), transcript="", filename_text="003 ni3", duration_seconds=1.0),
+                MaterialAnalysis(Path("001_wo3.wav"), transcript="", filename_text="001 wo3", duration_seconds=1.0),
+                MaterialAnalysis(Path("002_shi4.wav"), transcript="", filename_text="002 shi4", duration_seconds=1.0),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["001_wo3.wav", "002_shi4.wav", "003_ni3.wav"])
+        self.assertEqual([decision.text_position for decision in decisions], [0, 1, 2])
+        self.assertTrue(all(decision.phonetic_score > 0.8 for decision in decisions))
+
+    def test_tone_marks_disambiguate_homophone_positions(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 2.0, "\u8bd7\u662f")],
+            [MaterialAnalysis(Path("shi4.wav"), transcript="", filename_text="shi4", duration_seconds=1.0)],
+        )
+        score = plan_material_ordering(
+            [VoiceSegment(0.0, 2.0, "\u8bd7\u662f")],
+            [MaterialAnalysis(Path("shi4.wav"), transcript="", filename_text="shi4", duration_seconds=1.0)],
+        ).score_matrix[0][0]
+
+        self.assertEqual(decisions[0].text_position, 1)
+        self.assertEqual(decisions[0].phonetic_position, 1)
+        self.assertEqual(decisions[0].phonetic_tone_position_count, 1)
+        self.assertGreater(decisions[0].phonetic_tone_score, 0.9)
+        self.assertEqual(score.phonetic_tone_position, 1)
+
+    def test_orders_japanese_kana_and_romaji_filenames_by_phonetic_position(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 4.0, "\u3042\u3044\u3057\u3066")],
+            [
+                MaterialAnalysis(Path("te.wav"), transcript="", filename_text="te", duration_seconds=1.0),
+                MaterialAnalysis(Path("shi.wav"), transcript="", filename_text="shi", duration_seconds=1.0),
+                MaterialAnalysis(Path("a.wav"), transcript="", filename_text="a", duration_seconds=1.0),
+                MaterialAnalysis(Path("i.wav"), transcript="", filename_text="i", duration_seconds=1.0),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["a.wav", "i.wav", "shi.wav", "te.wav"])
+        self.assertEqual([decision.text_position for decision in decisions], [0, 1, 2, 3])
+        self.assertTrue(all(decision.phonetic_score > 0.8 for decision in decisions))
+
+    def test_repeated_phonetic_positions_are_diagnosed_and_downweighted(self) -> None:
+        plan = plan_material_ordering(
+            [VoiceSegment(0.0, 2.0, "\u662f\u4e8b")],
+            [MaterialAnalysis(Path("shi.wav"), transcript="", filename_text="shi", duration_seconds=1.0)],
+        )
+        score = plan.score_matrix[0][0]
+
+        self.assertEqual(score.phonetic_position, 0)
+        self.assertEqual(score.phonetic_position_count, 2)
+        self.assertGreater(score.phonetic_score, 0.6)
+        self.assertLess(score.phonetic_score, 0.92)
+
+    def test_phonetic_span_units_follow_multi_syllable_filename_phrases(self) -> None:
+        plan = plan_material_ordering(
+            [VoiceSegment(0.0, 3.0, "\u6211\u662f\u8c01")],
+            [
+                MaterialAnalysis(Path("wo-shi.wav"), transcript="", filename_text="wo shi", duration_seconds=2.0),
+                MaterialAnalysis(Path("shui.wav"), transcript="", filename_text="shui", duration_seconds=1.0),
+            ],
+        )
+
+        first = plan.score_matrix[0][0]
+        second = plan.score_matrix[0][1]
+        self.assertEqual([decision.material_path.name for decision in plan_material_ordering(
+            [VoiceSegment(0.0, 3.0, "\u6211\u662f\u8c01")],
+            [
+                MaterialAnalysis(Path("wo-shi.wav"), transcript="", filename_text="wo shi", duration_seconds=2.0),
+                MaterialAnalysis(Path("shui.wav"), transcript="", filename_text="shui", duration_seconds=1.0),
+            ],
+        ).decisions], ["wo-shi.wav", "shui.wav"])
+        self.assertEqual(first.phonetic_span_units, 2)
+        self.assertEqual(second.phonetic_span_units, 1)
 
 
 class ModelRuntimeTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        model_runtime._module_status.cache_clear()
+        model_runtime._prepare_native_dependency_paths.cache_clear()
+        super().tearDown()
+
     def test_model_cache_root_falls_back_when_candidate_is_not_creatable(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -955,6 +1239,125 @@ class ModelRuntimeTests(unittest.TestCase):
         transcribe_mock.assert_not_called()
         vad_mock.assert_not_called()
         speaker_mock.assert_not_called()
+
+    def test_material_analysis_can_write_cache_outside_source_directory(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            material_dir = root / "materials"
+            cache_root = root / "analysis-cache"
+            material_dir.mkdir()
+            material_path = material_dir / "001.wav"
+            _write_test_wave(material_path)
+
+            with patch(
+                "audio_processor.model_runtime._transcribe_audio",
+                return_value={"backend": "fake", "text": "alpha", "segments": [], "notes": []},
+            ):
+                with patch("audio_processor.model_runtime._detect_vad_segments", return_value=()):
+                    with patch("audio_processor.model_runtime._speaker_embedding", return_value=None):
+                        library = model_runtime.analyze_material_library(
+                            material_dir,
+                            material_cache_dir=cache_root,
+                        )
+
+            self.assertEqual(library.materials[0].transcript, "alpha")
+            self.assertFalse((material_dir / ".vocalprocess_material_cache.json").exists())
+            self.assertTrue((cache_root / ".vocalprocess_material_cache.json").exists())
+
+    def test_material_analysis_cancellation_stops_before_vad_and_speaker_work(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            first = material_dir / "001.wav"
+            second = material_dir / "002.wav"
+            _write_test_wave(first)
+            _write_test_wave(second)
+            cancel_state = {"cancelled": False}
+
+            def cancel_after_transcribe(*args: object, **kwargs: object) -> dict[str, object]:
+                cancel_state["cancelled"] = True
+                return {"backend": "fake", "text": "alpha", "segments": [], "notes": []}
+
+            with patch("audio_processor.model_runtime._transcribe_audio", side_effect=cancel_after_transcribe):
+                with patch("audio_processor.model_runtime._detect_vad_segments") as vad_mock:
+                    with patch("audio_processor.model_runtime._speaker_embedding") as speaker_mock:
+                        with self.assertRaisesRegex(AudioProcessorError, "Processing cancelled"):
+                            model_runtime.analyze_material_library(
+                                material_dir,
+                                should_cancel=lambda: cancel_state["cancelled"],
+                            )
+
+        vad_mock.assert_not_called()
+        speaker_mock.assert_not_called()
+
+    def test_pinyin_positioned_decisions_split_single_segment_target_duration(self) -> None:
+        reference_segments = [VoiceSegment(0.0, 3.0, "\u6211\u662f\u4f60")]
+        decisions = order_materials_for_reference(
+            reference_segments,
+            [
+                MaterialAnalysis(Path("ni.wav"), transcript="", filename_text="ni", duration_seconds=0.7),
+                MaterialAnalysis(Path("wo.wav"), transcript="", filename_text="wo", duration_seconds=0.8),
+                MaterialAnalysis(Path("shi.wav"), transcript="", filename_text="shi", duration_seconds=0.9),
+            ],
+        )
+
+        target_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=3.0,
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["wo.wav", "shi.wav", "ni.wav"])
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (1.0, 1.0, 1.0))
+        summary = model_runtime._render_timeline_alignment_summary(reference_segments, decisions, target_durations)
+        self.assertEqual(summary["mode"], "phonetic_or_text_position_split")
+        self.assertEqual(summary["split_reference_segment_indices"], [0])
+
+    def test_preflight_warns_when_filename_pronunciation_matches_multiple_positions(self) -> None:
+        decision = model_runtime.OrderingDecision(
+            rank=1,
+            source_path=Path("shi.wav"),
+            score=0.42,
+            transcript_score=0.0,
+            filename_score=0.0,
+            duration_score=0.8,
+            speaker_score=0.0,
+            vad_score=1.0,
+            phonetic_score=0.74,
+            evidence_count=3,
+            confidence_label="medium",
+            reference_text="\u662f\u4e8b",
+            material_text="shi",
+            reason="reference_text_position",
+            reference_segment_index=0,
+            text_position=0,
+            phonetic_position_count=2,
+            target_duration_seconds=1.0,
+        )
+        ordering = model_runtime.ModelOrderingResult(
+            reference=model_runtime.ReferenceAnalysis(
+                source_path=Path("reference.wav"),
+                vocal_path=Path("reference.wav"),
+                transcript="\u662f\u4e8b",
+                segments=(VoiceSegment(0.0, 2.0, "\u662f\u4e8b"),),
+                speaker_embedding=None,
+                backend="test",
+            ),
+            library=model_runtime.MaterialLibraryAnalysis(
+                material_directory=Path("materials"),
+                materials=(),
+                backend_summary={},
+            ),
+            ordered_paths=(Path("shi.wav"),),
+            target_durations=(1.0,),
+            decisions=(decision,),
+            analysis_report={},
+        )
+
+        warnings = preflight._preflight_warnings(ordering, [])
+
+        self.assertTrue(any(warning["kind"] == "ambiguous_phonetic_position" for warning in warnings))
 
     def test_reference_analysis_cache_reuses_matching_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1033,6 +1436,48 @@ class ModelRuntimeTests(unittest.TestCase):
         faster_mock.assert_not_called()
         whisperx_mock.assert_not_called()
         whisper_mock.assert_called_once()
+
+    def test_torch_availability_requires_native_extension(self) -> None:
+        model_runtime._module_status.cache_clear()
+
+        def fake_import(module_name: str) -> object:
+            if module_name == "torch":
+                return object()
+            if module_name == "torch._C":
+                raise ModuleNotFoundError("No module named 'torch._C'")
+            return object()
+
+        with patch("audio_processor.model_runtime._prepare_native_dependency_paths"):
+            with patch("audio_processor.model_runtime.importlib.import_module", side_effect=fake_import):
+                available = model_runtime._module_available("torch")
+                reason = model_runtime._module_unavailable_reason("torch")
+
+        self.assertFalse(available)
+        self.assertIn("torch._C", reason)
+        self.assertIn("full portable package", reason)
+
+    def test_speech_runtime_issue_reports_incomplete_torch(self) -> None:
+        with patch("audio_processor.model_runtime._module_available", return_value=False):
+            with patch(
+                "audio_processor.model_runtime._module_unavailable_reason",
+                return_value="ModuleNotFoundError: No module named 'torch._C'",
+            ):
+                issue = model_runtime._speech_runtime_issue("auto", allow_model_download=False)
+
+        self.assertIn("Speech recognition runtime is unavailable", issue)
+        self.assertIn("torch._C", issue)
+        self.assertIn("full portable package", issue)
+
+    def test_ffmpeg_start_failure_message_points_to_portable_bin(self) -> None:
+        with patch(
+            "audio_processor.model_runtime.ensure_runtime_tool_paths",
+            return_value=[Path("VocalProcess") / "bin"],
+        ):
+            message = model_runtime._ffmpeg_start_failure_message("Whisper", Path("song.wav"))
+
+        self.assertIn("FFmpeg executable could not be started", message)
+        self.assertIn("bin\\ffmpeg.exe", message)
+        self.assertIn("VocalProcess", message)
 
 
 class DawRenderReuseTests(unittest.TestCase):

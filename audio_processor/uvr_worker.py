@@ -6,10 +6,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 DEFAULT_UVR_ARCH = "demucs"
@@ -20,6 +21,7 @@ RUNNER_MODULES = {
     "mdx": "mdx_headless_runner",
     "vr": "vr_headless_runner",
 }
+CancelCallback = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -136,8 +138,13 @@ def separate_vocals_with_uvr(
     *,
     compute_device: str = "cpu",
     notes: list[str] | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> Path | None:
     note_sink = notes if notes is not None else []
+    if should_cancel is not None and should_cancel():
+        note_sink.append("uvr headless runner skipped because processing was cancelled")
+        return None
+
     runner = locate_uvr_runner()
     if runner is None:
         note_sink.append("uvr headless worker unavailable; install it with scripts\\bootstrap_uvr_worker.ps1")
@@ -163,17 +170,10 @@ def separate_vocals_with_uvr(
     timeout_seconds = _uvr_timeout_seconds()
 
     try:
-        result = subprocess.run(
+        result = _run_uvr_command(
             [str(arg) for arg in command],
-            check=False,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout_seconds,
-            creationflags=_subprocess_creationflags(),
+            timeout_seconds=timeout_seconds,
+            should_cancel=should_cancel,
         )
     except subprocess.TimeoutExpired as exc:
         _write_uvr_log(log_path, _timeout_output(exc))
@@ -184,6 +184,9 @@ def separate_vocals_with_uvr(
         return None
 
     _write_uvr_log(log_path, result.stdout or "")
+    if result.returncode == _UVR_CANCELLED_RETURN_CODE and should_cancel is not None and should_cancel():
+        note_sink.append(f"uvr headless runner cancelled; see {log_path}")
+        return None
     if result.returncode != 0:
         note_sink.append(f"uvr headless runner exited with code {result.returncode}; see {log_path}")
         return None
@@ -381,6 +384,61 @@ def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
         elif part:
             text_parts.append(str(part))
     return "\n".join(text_parts)
+
+
+_UVR_CANCELLED_RETURN_CODE = -15
+
+
+def _run_uvr_command(
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    should_cancel: CancelCallback | None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        creationflags=_subprocess_creationflags(),
+    )
+    started_at = time.monotonic()
+    while True:
+        if should_cancel is not None and should_cancel():
+            return _stop_uvr_process(process, command, return_code=_UVR_CANCELLED_RETURN_CODE)
+
+        elapsed = time.monotonic() - started_at
+        remaining = timeout_seconds - elapsed
+        if remaining <= 0:
+            output = _stop_uvr_process(process, command, return_code=-9).stdout
+            raise subprocess.TimeoutExpired(command, timeout_seconds, output=output)
+
+        try:
+            stdout, _ = process.communicate(timeout=min(0.2, remaining))
+            return subprocess.CompletedProcess(command, int(process.returncode or 0), stdout or "")
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _stop_uvr_process(
+    process: subprocess.Popen[str],
+    command: list[str],
+    *,
+    return_code: int,
+) -> subprocess.CompletedProcess[str]:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            stdout, _ = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, _ = process.communicate(timeout=5)
+    else:
+        stdout, _ = process.communicate()
+    return subprocess.CompletedProcess(command, return_code, stdout or "")
 
 
 def _subprocess_creationflags() -> int:

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import hashlib
+import threading
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, TextIO
 
 
 class AudioProcessorError(RuntimeError):
@@ -73,6 +77,7 @@ CancelCallback = Callable[[], bool]
 
 
 def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    ensure_runtime_tool_paths()
     command_args = _resolve_command_args(args)
     try:
         return subprocess.run(
@@ -98,6 +103,7 @@ def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.Com
 
 
 def resolve_tool(name: str) -> str:
+    ensure_runtime_tool_paths()
     for path in _candidate_tool_paths(name):
         if path.is_file():
             return str(path)
@@ -119,12 +125,36 @@ def get_tool_info(name: str) -> ToolInfo:
 
 
 def get_environment_report() -> list[str]:
+    ensure_runtime_tool_paths()
     lines = [f"Python: {sys.version.split()[0]} ({sys.executable})"]
     for tool in ("ffmpeg", "ffprobe"):
         info = get_tool_info(tool)
         lines.append(f"{tool}: {info.path}")
         lines.append(f"  {info.version_line}")
     return lines
+
+
+def ensure_runtime_tool_paths() -> list[Path]:
+    """Expose bundled FFmpeg tools to child libraries that invoke ffmpeg by name."""
+
+    tool_dirs: list[Path] = []
+    for root in _runtime_tool_roots():
+        for candidate in (root / "bin", root):
+            if _contains_runtime_tool(candidate):
+                resolved = candidate.resolve()
+                if resolved not in tool_dirs:
+                    tool_dirs.append(resolved)
+
+    if not tool_dirs:
+        return []
+
+    current_path = os.environ.get("PATH", "")
+    existing_parts = [part for part in current_path.split(os.pathsep) if part]
+    existing_normalized = {_normalize_env_path(part) for part in existing_parts}
+    prepend = [str(path) for path in tool_dirs if _normalize_env_path(path) not in existing_normalized]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join(prepend + existing_parts)
+    return tool_dirs
 
 
 def list_audio_files(directory: Path) -> list[Path]:
@@ -955,6 +985,17 @@ def _candidate_tool_paths(name: str) -> list[Path]:
     return candidates
 
 
+def _contains_runtime_tool(path: Path) -> bool:
+    return any((path / _tool_executable_name(name)).is_file() for name in ("ffmpeg", "ffprobe"))
+
+
+def _normalize_env_path(path: str | Path) -> str:
+    try:
+        return str(Path(path).resolve()).casefold()
+    except OSError:
+        return str(path).casefold()
+
+
 def _runtime_tool_roots() -> list[Path]:
     roots: list[Path] = []
     if getattr(sys, "frozen", False):
@@ -1150,15 +1191,45 @@ def _run_progress_process(
     should_cancel: CancelCallback | None = None,
 ) -> None:
     process = _open_progress_process(args)
-    stderr = ""
+    stderr_parts: list[str] = []
+    stdout_queue: queue.Queue[str | None] = queue.Queue()
+    stdout_done = False
+    return_code: int | None = None
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_thread = threading.Thread(
+        target=_read_stream_lines,
+        args=(process.stdout, stdout_queue),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_collect_stream_text,
+        args=(process.stderr, stderr_parts),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
 
     try:
         last_progress = 0.0
-        assert process.stdout is not None
-        for line in process.stdout:
+        while True:
             if should_cancel is not None and should_cancel():
-                process.terminate()
+                _stop_progress_process(process)
                 raise AudioProcessorError("Processing cancelled")
+
+            try:
+                line = stdout_queue.get(timeout=0.1)
+            except queue.Empty:
+                if process.poll() is not None and stdout_done:
+                    break
+                continue
+
+            if line is None:
+                stdout_done = True
+                if process.poll() is not None:
+                    break
+                continue
 
             key, value = _split_progress_line(line)
             if key is None:
@@ -1174,18 +1245,46 @@ def _run_progress_process(
                 _notify_progress(on_progress, 1.0, "Complete")
 
         return_code = process.wait()
-        if process.stderr is not None:
-            stderr = process.stderr.read().strip()
     finally:
         if process.poll() is None:
             process.kill()
+        stdout_thread.join(timeout=1.0)
+        stderr_thread.join(timeout=1.0)
+
+    if return_code is None:
+        return_code = process.returncode
 
     if return_code != 0:
         command = subprocess.list2cmdline([str(arg) for arg in args])
         message = f"Command failed with exit code {return_code}: {command}"
+        stderr = "".join(stderr_parts).strip()
         if stderr:
             message = f"{message}\n{stderr}"
         raise AudioProcessorError(message)
+
+
+def _read_stream_lines(stream: TextIO, output: queue.Queue[str | None]) -> None:
+    try:
+        for line in stream:
+            output.put(line)
+    finally:
+        output.put(None)
+
+
+def _collect_stream_text(stream: TextIO, output: list[str]) -> None:
+    for line in stream:
+        output.append(line)
+
+
+def _stop_progress_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    deadline = time.monotonic() + 2.0
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if process.poll() is None:
+        process.kill()
 
 
 def _split_progress_line(line: str) -> tuple[str | None, str]:

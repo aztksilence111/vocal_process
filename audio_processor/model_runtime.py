@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from xml.etree import ElementTree
 
-from .engine import AudioProcessorError, get_audio_duration_seconds, list_audio_files, probe_audio
+from .engine import AudioProcessorError, ensure_runtime_tool_paths, get_audio_duration_seconds, list_audio_files, probe_audio
 from .model_assist import (
     MaterialAnalysis,
     MaterialOrderDecision,
@@ -40,6 +40,7 @@ from .uvr_worker import (
 
 
 ProgressCallback = Callable[[float, str], None]
+CancelCallback = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,12 @@ class OrderingDecision:
     reason: str
     reference_segment_index: int | None = None
     text_position: int | None = None
+    phonetic_position: int | None = None
+    phonetic_position_count: int = 0
+    phonetic_span_units: int = 0
+    phonetic_tone_score: float = 0.0
+    phonetic_tone_position: int | None = None
+    phonetic_tone_position_count: int = 0
     target_duration_seconds: float | None = None
 
 
@@ -125,6 +132,13 @@ MATERIAL_CACHE_FILE = ".vocalprocess_material_cache.json"
 REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v1"
 PYANNOTE_DIA_MODEL = "pyannote/speaker-diarization-community-1"
 SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+TORCH_NATIVE_RUNTIME_HINT = (
+    "PyTorch native runtime is incomplete or not loadable. Use the full portable package, "
+    "extract the whole ZIP directory, and verify _internal\\torch\\_C.cp311-win_amd64.pyd "
+    "and _internal\\torch\\lib exist beside VocalProcess.exe."
+)
+IMPORT_PROBE_MODULES = {"torch", "torchaudio"}
+_DLL_DIRECTORY_HANDLES: list[Any] = []
 
 
 def build_model_ordering(
@@ -133,10 +147,13 @@ def build_model_ordering(
     *,
     lyrics_file: Path | None = None,
     work_dir: Path | None = None,
+    material_cache_dir: Path | None = None,
     compute_device: str = "auto",
     source_separation: str = "auto",
     on_progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> ModelOrderingResult:
+    _raise_if_cancelled(should_cancel)
     work_root = _prepare_work_root(work_dir)
     device = _resolve_compute_device(compute_device)
     material_directory = material_directory.expanduser()
@@ -144,8 +161,10 @@ def build_model_ordering(
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
 
+    _raise_if_cancelled(should_cancel)
     notes: list[str] = [f"compute device resolved: {device}"]
     backend_summary = backend_availability()
+    _raise_if_cancelled(should_cancel)
     _notify_progress(on_progress, 0.02, "Preparing reference analysis")
     reference = analyze_reference(
         reference_path,
@@ -155,17 +174,22 @@ def build_model_ordering(
         source_separation=source_separation,
         on_progress=on_progress,
         notes=notes,
+        should_cancel=should_cancel,
     )
 
+    _raise_if_cancelled(should_cancel)
     _notify_progress(on_progress, 0.25, "Preparing material analysis")
     library = analyze_material_library(
         material_directory,
         work_dir=work_root,
+        material_cache_dir=material_cache_dir,
         compute_device=device,
         on_progress=on_progress,
         notes=notes,
+        should_cancel=should_cancel,
     )
 
+    _raise_if_cancelled(should_cancel)
     reference_segments = reference.segments
     if not reference_segments and reference.transcript.strip():
         reference_segments = (
@@ -205,6 +229,7 @@ def build_model_ordering(
         material_analyses,
         reference_embedding=reference.speaker_embedding,
     )
+    _raise_if_cancelled(should_cancel)
     decisions = list(ordering_plan.decisions)
     ordered_paths = tuple(decision.material_path for decision in decisions)
     target_durations = _target_durations_for_decisions(
@@ -220,7 +245,7 @@ def build_model_ordering(
         "reference": render_reference_analysis(reference),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
         "material_cache": {
-            "path": str(material_directory / MATERIAL_CACHE_FILE),
+            "path": str(_material_cache_path(material_directory, material_cache_dir)),
             "notes": [note for note in library.notes if "material analysis cache" in note],
         },
         "ordering_strategy": ordering_plan.strategy,
@@ -240,6 +265,12 @@ def build_model_ordering(
                 "confidence_label": decision.confidence_label,
                 "reference_segment_index": decision.reference_segment_index,
                 "text_position": decision.text_position,
+                "phonetic_position": decision.phonetic_position,
+                "phonetic_position_count": decision.phonetic_position_count,
+                "phonetic_span_units": decision.phonetic_span_units,
+                "phonetic_tone_score": decision.phonetic_tone_score,
+                "phonetic_tone_position": decision.phonetic_tone_position,
+                "phonetic_tone_position_count": decision.phonetic_tone_position_count,
                 "reference_text": decision.reference_text,
                 "material_text": decision.material_text,
                 "reason": decision.reason,
@@ -247,6 +278,11 @@ def build_model_ordering(
             }
             for index, decision in enumerate(decisions)
         ],
+        "timeline_alignment": _render_timeline_alignment_summary(
+            reference_segments,
+            decisions,
+            target_durations,
+        ),
         "backend_summary": backend_summary,
         "notes": notes,
     }
@@ -271,6 +307,12 @@ def build_model_ordering(
                 confidence_label=decision.confidence_label,
                 reference_segment_index=decision.reference_segment_index,
                 text_position=decision.text_position,
+                phonetic_position=decision.phonetic_position,
+                phonetic_position_count=decision.phonetic_position_count,
+                phonetic_span_units=decision.phonetic_span_units,
+                phonetic_tone_score=decision.phonetic_tone_score,
+                phonetic_tone_position=decision.phonetic_tone_position,
+                phonetic_tone_position_count=decision.phonetic_tone_position_count,
                 reference_text=decision.reference_text,
                 material_text=decision.material_text,
                 reason=decision.reason,
@@ -291,16 +333,20 @@ def analyze_reference(
     source_separation: str = "auto",
     on_progress: ProgressCallback | None = None,
     notes: list[str] | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> ReferenceAnalysis:
+    _raise_if_cancelled(should_cancel)
     notes = notes if notes is not None else []
     normalized_reference = reference_path.expanduser()
     if not normalized_reference.exists():
         raise AudioProcessorError(f"Reference audio does not exist: {normalized_reference}")
 
+    _raise_if_cancelled(should_cancel)
     work_root = _prepare_work_root(work_dir)
     cache_path = _reference_cache_path(work_root, normalized_reference, lyrics_file, compute_device, source_separation)
     cached = _load_reference_analysis_cache(cache_path, normalized_reference=normalized_reference)
     if cached is not None:
+        _raise_if_cancelled(should_cancel)
         cache_note = f"reference analysis cache reused: {cache_path}"
         notes.append(cache_note)
         _notify_progress(on_progress, 0.2, "Reference analysis cache reused")
@@ -320,9 +366,23 @@ def analyze_reference(
         compute_device=compute_device,
         source_separation=source_separation,
         notes=notes,
+        should_cancel=should_cancel,
     )
-    transcript_result = _transcribe_audio(vocal_path, work_dir=work_root, compute_device=compute_device)
-    reference_embedding = _speaker_embedding(vocal_path, work_dir=work_root, compute_device=compute_device)
+    _raise_if_cancelled(should_cancel)
+    transcript_result = _transcribe_audio(
+        vocal_path,
+        work_dir=work_root,
+        compute_device=compute_device,
+        should_cancel=should_cancel,
+    )
+    _raise_if_cancelled(should_cancel)
+    reference_embedding = _speaker_embedding(
+        vocal_path,
+        work_dir=work_root,
+        compute_device=compute_device,
+        should_cancel=should_cancel,
+    )
+    _raise_if_cancelled(should_cancel)
     notes.extend(_lyric_timing_notes(lyrics_file, transcript_result["segments"]))
     segments = _segments_from_transcript(transcript_result["segments"], lyrics_file=lyrics_file)
     if not segments:
@@ -346,6 +406,7 @@ def analyze_reference(
         notes=tuple(notes),
     )
     _write_reference_analysis_cache(cache_path, reference)
+    _raise_if_cancelled(should_cancel)
     _notify_progress(on_progress, 0.2, "Reference analysis complete")
     return reference
 
@@ -354,17 +415,23 @@ def analyze_material_library(
     material_directory: Path,
     *,
     work_dir: Path | None = None,
+    material_cache_dir: Path | None = None,
     compute_device: str = DEFAULT_DEVICE,
     on_progress: ProgressCallback | None = None,
     notes: list[str] | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> MaterialLibraryAnalysis:
+    _raise_if_cancelled(should_cancel)
     notes = notes if notes is not None else []
     material_directory = material_directory.expanduser()
     material_paths = list_audio_files(material_directory)
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
 
-    cache_path = material_directory / MATERIAL_CACHE_FILE
+    _raise_if_cancelled(should_cancel)
+    cache_path = _material_cache_path(material_directory, material_cache_dir)
+    if material_cache_dir is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot = _material_snapshot(material_paths)
     cached_library = _load_material_library_cache(
         cache_path,
@@ -372,6 +439,7 @@ def analyze_material_library(
         snapshot=snapshot,
     )
     if cached_library is not None:
+        _raise_if_cancelled(should_cancel)
         notes.append(f"material analysis cache reused: {cache_path}")
         _notify_progress(on_progress, 0.9, "Material analysis cache reused")
         return cached_library
@@ -379,11 +447,26 @@ def analyze_material_library(
     analyses: list[AudioAnalysis] = []
     total = len(material_paths)
     for index, path in enumerate(material_paths):
+        _raise_if_cancelled(should_cancel)
         progress = 0.25 + ((index + 1) / max(total, 1)) * 0.65
         _notify_progress(on_progress, progress, f"Analyzing material {index + 1}/{total}: {path.name}")
-        transcript_result = _transcribe_audio(path, work_dir=work_dir, compute_device=compute_device)
-        vad_segments = _detect_vad_segments(path, compute_device=compute_device)
-        speaker_embedding = _speaker_embedding(path, work_dir=work_dir, compute_device=compute_device)
+        _raise_if_cancelled(should_cancel)
+        transcript_result = _transcribe_audio(
+            path,
+            work_dir=work_dir,
+            compute_device=compute_device,
+            should_cancel=should_cancel,
+        )
+        _raise_if_cancelled(should_cancel)
+        vad_segments = _detect_vad_segments(path, compute_device=compute_device, should_cancel=should_cancel)
+        _raise_if_cancelled(should_cancel)
+        speaker_embedding = _speaker_embedding(
+            path,
+            work_dir=work_dir,
+            compute_device=compute_device,
+            should_cancel=should_cancel,
+        )
+        _raise_if_cancelled(should_cancel)
         duration = get_audio_duration_seconds(probe_audio(path))
         analyses.append(
             AudioAnalysis(
@@ -485,9 +568,36 @@ def backend_availability() -> dict[str, bool]:
     return availability
 
 
+def speech_runtime_preflight_report(compute_device: str = "auto") -> dict[str, Any]:
+    tool_dirs = ensure_runtime_tool_paths()
+    ffmpeg_on_path = shutil.which("ffmpeg")
+    preferred_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower()
+    allow_model_download = os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") == "1"
+    issue = _speech_runtime_issue(preferred_backend, allow_model_download)
+    return {
+        "preferred_backend": preferred_backend,
+        "allow_model_download": allow_model_download,
+        "requested_compute_device": compute_device,
+        "resolved_compute_device": _resolve_compute_device(compute_device),
+        "available": not bool(issue),
+        "issue": issue,
+        "runtime_tool_directories": [str(path) for path in tool_dirs],
+        "ffmpeg_on_path": ffmpeg_on_path or "",
+        "torch_native_available": _module_available("torch"),
+        "torch_native_detail": "" if _module_available("torch") else _module_unavailable_reason("torch"),
+        "faster_whisper_module": _module_available("faster_whisper"),
+        "faster_whisper_model_cached": _faster_whisper_model_cached(),
+        "whisperx_module": _module_available("whisperx"),
+        "whisperx_model_cached": _whisperx_model_cached(),
+        "openai_whisper_module": _module_available("whisper"),
+        "openai_whisper_model_cached": _whisper_model_cached(),
+    }
+
+
 def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
     cache_root = _model_cache_root()
     availability = backend_availability()
+    dependency_by_name = {candidate["name"]: candidate["optional_dependency"] for candidate in list_model_candidates()}
     resolved_device = _resolve_compute_device(compute_device)
     lines = [
         "Model runtime: local pretrained models",
@@ -512,6 +622,10 @@ def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
     ):
         status = "available" if availability.get(name) else "not installed"
         lines.append(f"{name}: {status}")
+        if not availability.get(name):
+            reason = _module_unavailable_reason(dependency_by_name.get(name, name))
+            if reason:
+                lines.append(f"  Runtime detail: {reason}")
     lines.append(f"Whisper model cached: {_whisper_model_cached()}")
     lines.append(f"Faster Whisper model cached: {_faster_whisper_model_cached()}")
     lines.append(f"WhisperX model cached: {_whisperx_model_cached()}")
@@ -832,7 +946,9 @@ def _maybe_separate_vocals(
     compute_device: str = DEFAULT_DEVICE,
     source_separation: str = "auto",
     notes: list[str],
+    should_cancel: CancelCallback | None = None,
 ) -> Path:
+    _raise_if_cancelled(should_cancel)
     mode = source_separation if source_separation in {"auto", "always", "never"} else "auto"
     if mode == "never":
         notes.append("source separation skipped by user setting; using reference audio as vocals")
@@ -843,9 +959,11 @@ def _maybe_separate_vocals(
     separator_backend = _source_separator_backend()
 
     if separator_backend in {"auto", "uvr", "uvr-only"}:
+        _raise_if_cancelled(should_cancel)
         uvr_root = make_uvr_output_dir(work_root, path)
         cached_uvr = find_uvr_vocal_output(uvr_root)
         if cached_uvr is not None:
+            _raise_if_cancelled(should_cancel)
             notes.append(f"reference vocals reused from uvr cache: {cached_uvr}")
             return cached_uvr
 
@@ -854,7 +972,9 @@ def _maybe_separate_vocals(
             uvr_root,
             compute_device=compute_device,
             notes=notes,
+            should_cancel=should_cancel,
         )
+        _raise_if_cancelled(should_cancel)
         if uvr_candidate is not None:
             return uvr_candidate
         if separator_backend == "uvr-only":
@@ -870,13 +990,16 @@ def _maybe_separate_vocals(
         notes.append("demucs unavailable; using original reference audio")
         return path
 
+    _raise_if_cancelled(should_cancel)
     separated_root = work_root / "demucs"
     separated_root.mkdir(parents=True, exist_ok=True)
     candidate = separated_root / "htdemucs" / path.stem / "vocals.wav"
     if candidate.exists():
+        _raise_if_cancelled(should_cancel)
         notes.append(f"reference vocals reused from demucs cache: {candidate}")
         return candidate
 
+    _raise_if_cancelled(should_cancel)
     try:
         import demucs.separate  # type: ignore
     except Exception as exc:
@@ -894,6 +1017,7 @@ def _maybe_separate_vocals(
         str(separated_root),
         str(path),
     ]
+    _raise_if_cancelled(should_cancel)
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             demucs.separate.main(cmd)
@@ -905,11 +1029,14 @@ def _maybe_separate_vocals(
         notes.append(f"demucs separation failed: {exc}")
         return path
 
+    _raise_if_cancelled(should_cancel)
     if candidate.exists():
+        _raise_if_cancelled(should_cancel)
         notes.append(f"reference vocals separated with demucs: {candidate}")
         return candidate
 
     for found in separated_root.rglob("vocals.wav"):
+        _raise_if_cancelled(should_cancel)
         notes.append(f"reference vocals separated with demucs: {found}")
         return found
 
@@ -922,41 +1049,59 @@ def _transcribe_audio(
     *,
     work_dir: Path | None = None,
     compute_device: str = DEFAULT_DEVICE,
+    should_cancel: CancelCallback | None = None,
 ) -> dict[str, Any]:
+    _raise_if_cancelled(should_cancel)
+    ensure_runtime_tool_paths()
     work_root = _prepare_work_root(work_dir)
     device = _resolve_compute_device(compute_device)
     preferred_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower()
     fallback_notes: list[str] = []
     allow_model_download = os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") == "1"
+    runtime_issue = _speech_runtime_issue(preferred_backend, allow_model_download)
+    if runtime_issue:
+        raise AudioProcessorError(runtime_issue)
 
+    _raise_if_cancelled(should_cancel)
     if preferred_backend in {"auto", "faster-whisper", "faster_whisper"} and _module_available("faster_whisper"):
         if preferred_backend == "auto" and not allow_model_download and not _faster_whisper_model_cached():
             fallback_notes.append("faster-whisper skipped: local model cache not found and downloads are not enabled")
         else:
             try:
-                return _transcribe_with_faster_whisper(path, compute_device=device)
+                return _transcribe_with_faster_whisper(
+                    path,
+                    compute_device=device,
+                    should_cancel=should_cancel,
+                )
             except Exception as exc:
                 if preferred_backend in {"faster-whisper", "faster_whisper"}:
                     raise AudioProcessorError(f"Faster Whisper transcription failed for {path}: {exc}") from exc
                 fallback_notes.append(f"faster-whisper failed: {exc}")
 
+    _raise_if_cancelled(should_cancel)
     if preferred_backend in {"auto", "whisperx"} and _module_available("whisperx"):
         if preferred_backend == "auto" and not allow_model_download and not _whisperx_model_cached():
             fallback_notes.append("whisperx skipped: local model cache not found and downloads are not enabled")
         else:
             try:
+                _raise_if_cancelled(should_cancel)
                 _prepare_torchaudio_legacy_api()
                 import whisperx  # type: ignore
 
+                _raise_if_cancelled(should_cancel)
                 model = _load_whisperx_model(
                     DEFAULT_ASR_MODEL,
                     device,
                 )
+                _raise_if_cancelled(should_cancel)
                 audio = whisperx.load_audio(str(path))
+                _raise_if_cancelled(should_cancel)
                 result = model.transcribe(audio, batch_size=4)
+                _raise_if_cancelled(should_cancel)
                 align_model, metadata = whisperx.load_align_model(
                     language_code=result["language"], device=device
                 )
+                _raise_if_cancelled(should_cancel)
                 aligned = whisperx.align(
                     result["segments"],
                     align_model,
@@ -965,31 +1110,42 @@ def _transcribe_audio(
                     device,
                     return_char_alignments=False,
                 )
-                segments = [
-                    TranscriptSegment(
-                        start_seconds=float(segment.get("start", 0.0) or 0.0),
-                        end_seconds=float(segment.get("end", 0.0) or 0.0),
-                        text=str(segment.get("text", "")).strip(),
-                        confidence=_segment_confidence(segment),
-                        speaker_id=segment.get("speaker"),
-                        timing_source="whisperx_alignment",
+                _raise_if_cancelled(should_cancel)
+                segments: list[TranscriptSegment] = []
+                for segment in aligned.get("segments", []):
+                    _raise_if_cancelled(should_cancel)
+                    if not str(segment.get("text", "")).strip():
+                        continue
+                    segments.append(
+                        TranscriptSegment(
+                            start_seconds=float(segment.get("start", 0.0) or 0.0),
+                            end_seconds=float(segment.get("end", 0.0) or 0.0),
+                            text=str(segment.get("text", "")).strip(),
+                            confidence=_segment_confidence(segment),
+                            speaker_id=segment.get("speaker"),
+                            timing_source="whisperx_alignment",
+                        )
                     )
-                    for segment in aligned.get("segments", [])
-                    if str(segment.get("text", "")).strip()
-                ]
                 text = " ".join(segment.text for segment in segments).strip()
                 return {"backend": "whisperx", "text": text, "segments": segments, "notes": fallback_notes}
+            except FileNotFoundError as exc:
+                message = _ffmpeg_start_failure_message("WhisperX", path)
+                if preferred_backend == "whisperx":
+                    raise AudioProcessorError(message) from exc
+                fallback_notes.append(message)
             except Exception as exc:
                 if preferred_backend == "whisperx":
                     raise AudioProcessorError(f"WhisperX transcription failed for {path}: {exc}") from exc
                 # Fall through to Whisper if WhisperX is unavailable or fails on a specific file.
                 fallback_notes.append(f"whisperx failed: {exc}")
 
+    _raise_if_cancelled(should_cancel)
     return _transcribe_with_whisper(
         path,
         work_dir=work_root,
         compute_device=device,
         fallback_note="; ".join(fallback_notes) if fallback_notes else "accelerated ASR backend unavailable",
+        should_cancel=should_cancel,
     )
 
 
@@ -997,29 +1153,36 @@ def _transcribe_with_faster_whisper(
     path: Path,
     *,
     compute_device: str,
+    should_cancel: CancelCallback | None = None,
 ) -> dict[str, Any]:
+    _raise_if_cancelled(should_cancel)
     from faster_whisper import WhisperModel  # type: ignore
 
     device = _resolve_compute_device(compute_device)
+    _raise_if_cancelled(should_cancel)
     model = _load_faster_whisper_model(DEFAULT_ASR_MODEL, device, _compute_type_for_device(device))
+    _raise_if_cancelled(should_cancel)
     raw_segments, info = model.transcribe(
         str(path),
         beam_size=5,
         vad_filter=True,
         word_timestamps=False,
     )
-    segments = [
-        TranscriptSegment(
-            start_seconds=float(getattr(segment, "start", 0.0) or 0.0),
-            end_seconds=float(getattr(segment, "end", 0.0) or 0.0),
-            text=str(getattr(segment, "text", "") or "").strip(),
-            confidence=None,
-            speaker_id=None,
-            timing_source="faster_whisper_segment",
+    segments: list[TranscriptSegment] = []
+    for segment in raw_segments:
+        _raise_if_cancelled(should_cancel)
+        if not str(getattr(segment, "text", "") or "").strip():
+            continue
+        segments.append(
+            TranscriptSegment(
+                start_seconds=float(getattr(segment, "start", 0.0) or 0.0),
+                end_seconds=float(getattr(segment, "end", 0.0) or 0.0),
+                text=str(getattr(segment, "text", "") or "").strip(),
+                confidence=None,
+                speaker_id=None,
+                timing_source="faster_whisper_segment",
+            )
         )
-        for segment in raw_segments
-        if str(getattr(segment, "text", "") or "").strip()
-    ]
     text = " ".join(segment.text for segment in segments).strip()
     language = str(getattr(info, "language", "") or "")
     notes = [f"language={language}"] if language else []
@@ -1032,66 +1195,102 @@ def _transcribe_with_whisper(
     work_dir: Path,
     compute_device: str,
     fallback_note: str,
+    should_cancel: CancelCallback | None = None,
 ) -> dict[str, Any]:
+    _raise_if_cancelled(should_cancel)
     if not _module_available("whisper"):
+        reason = _module_unavailable_reason("whisper") or _module_unavailable_reason("torch")
+        detail = f" Runtime detail: {reason}" if reason else ""
         raise AudioProcessorError(
             "Model-assisted ordering requires a speech recognition backend, but none is installed. "
             "Install openai-whisper or whisperx before running material assembly."
+            f"{detail}"
         )
 
     try:
+        _raise_if_cancelled(should_cancel)
         import whisper  # type: ignore
 
         device = _resolve_compute_device(compute_device)
+        _raise_if_cancelled(should_cancel)
         model = _load_openai_whisper_model(DEFAULT_ASR_MODEL, device)
+        _raise_if_cancelled(should_cancel)
         result = model.transcribe(str(path), fp16=device == "cuda", verbose=None)
-        segments = [
-            TranscriptSegment(
-                start_seconds=float(segment.get("start", 0.0) or 0.0),
-                end_seconds=float(segment.get("end", 0.0) or 0.0),
-                text=str(segment.get("text", "")).strip(),
-                confidence=None,
-                speaker_id=None,
-                timing_source="whisper_segment",
+        _raise_if_cancelled(should_cancel)
+        segments: list[TranscriptSegment] = []
+        for segment in result.get("segments", []):
+            _raise_if_cancelled(should_cancel)
+            if not str(segment.get("text", "")).strip():
+                continue
+            segments.append(
+                TranscriptSegment(
+                    start_seconds=float(segment.get("start", 0.0) or 0.0),
+                    end_seconds=float(segment.get("end", 0.0) or 0.0),
+                    text=str(segment.get("text", "")).strip(),
+                    confidence=None,
+                    speaker_id=None,
+                    timing_source="whisper_segment",
+                )
             )
-            for segment in result.get("segments", [])
-            if str(segment.get("text", "")).strip()
-        ]
         text = " ".join(segment.text for segment in segments).strip()
         notes = [fallback_note] if fallback_note else []
         return {"backend": "whisper", "text": text, "segments": segments, "notes": notes}
+    except FileNotFoundError as exc:
+        raise AudioProcessorError(_ffmpeg_start_failure_message("Whisper", path)) from exc
     except Exception as exc:
         raise AudioProcessorError(f"Whisper transcription failed for {path}: {exc}") from exc
+
+
+def _ffmpeg_start_failure_message(backend_name: str, path: Path) -> str:
+    tool_dirs = ", ".join(str(path) for path in ensure_runtime_tool_paths()) or "no bundled tool directory found"
+    return (
+        f"{backend_name} transcription failed for {path}: FFmpeg executable could not be started. "
+        "For the portable package, keep the whole VocalProcess folder together and verify "
+        f"`bin\\ffmpeg.exe` exists. Runtime tool directories: {tool_dirs}"
+    )
 
 
 def _detect_vad_segments(
     path: Path,
     *,
     compute_device: str = DEFAULT_DEVICE,
+    should_cancel: CancelCallback | None = None,
 ) -> tuple[tuple[float, float], ...]:
-    pyannote_segments = _detect_pyannote_segments(path)
+    _raise_if_cancelled(should_cancel)
+    pyannote_segments = _detect_pyannote_segments(path, should_cancel=should_cancel)
     if pyannote_segments:
         return pyannote_segments
 
+    _raise_if_cancelled(should_cancel)
     if not _module_available("silero_vad"):
-        torch_hub_segments = _detect_vad_segments_with_torch_hub(path, compute_device=compute_device)
+        torch_hub_segments = _detect_vad_segments_with_torch_hub(
+            path,
+            compute_device=compute_device,
+            should_cancel=should_cancel,
+        )
         if torch_hub_segments:
             return torch_hub_segments
+        _raise_if_cancelled(should_cancel)
         return ((0.0, get_audio_duration_seconds(probe_audio(path))),)
 
     try:
+        _raise_if_cancelled(should_cancel)
         from silero_vad import get_speech_timestamps, load_silero_vad, read_audio  # type: ignore
 
         device = _resolve_compute_device(compute_device)
+        _raise_if_cancelled(should_cancel)
         model = _load_silero_vad_model(device)
         if device == "cuda" and hasattr(model, "to"):
             model = model.to(device)
+        _raise_if_cancelled(should_cancel)
         wav = read_audio(str(path))
         if device == "cuda" and hasattr(wav, "to"):
             wav = wav.to(device)
+        _raise_if_cancelled(should_cancel)
         timestamps = get_speech_timestamps(wav, model, return_seconds=True)
         segments = []
         for entry in timestamps:
+            _raise_if_cancelled(should_cancel)
             start = float(entry.get("start", 0.0) or 0.0)
             end = float(entry.get("end", 0.0) or 0.0)
             if end > start:
@@ -1101,19 +1300,28 @@ def _detect_vad_segments(
     except Exception:
         pass
 
+    _raise_if_cancelled(should_cancel)
     return ((0.0, get_audio_duration_seconds(probe_audio(path))),)
 
 
-def _detect_pyannote_segments(path: Path) -> tuple[tuple[float, float], ...]:
+def _detect_pyannote_segments(
+    path: Path,
+    *,
+    should_cancel: CancelCallback | None = None,
+) -> tuple[tuple[float, float], ...]:
+    _raise_if_cancelled(should_cancel)
     token = os.environ.get("PYANNOTE_AUTH_TOKEN") or os.environ.get("HF_TOKEN")
     if not token or not _module_available("pyannote.audio"):
         return ()
 
     try:
+        _raise_if_cancelled(should_cancel)
         pipeline = _load_pyannote_pipeline(token)
+        _raise_if_cancelled(should_cancel)
         diarization = pipeline(str(path))
         segments: list[tuple[float, float]] = []
         for turn, _, _speaker in diarization.itertracks(yield_label=True):
+            _raise_if_cancelled(should_cancel)
             start = float(turn.start)
             end = float(turn.end)
             if end > start:
@@ -1127,11 +1335,14 @@ def _detect_vad_segments_with_torch_hub(
     path: Path,
     *,
     compute_device: str = DEFAULT_DEVICE,
+    should_cancel: CancelCallback | None = None,
 ) -> tuple[tuple[float, float], ...]:
+    _raise_if_cancelled(should_cancel)
     if not _module_available("torch"):
         return ()
 
     try:
+        _raise_if_cancelled(should_cancel)
         import torch  # type: ignore
 
         model_root = _model_cache_root() / "torch" / "hub"
@@ -1146,12 +1357,15 @@ def _detect_vad_segments_with_torch_hub(
         device = _resolve_compute_device(compute_device)
         if device == "cuda" and hasattr(model, "to"):
             model = model.to(device)
+        _raise_if_cancelled(should_cancel)
         wav = read_audio(str(path))
         if device == "cuda" and hasattr(wav, "to"):
             wav = wav.to(device)
+        _raise_if_cancelled(should_cancel)
         timestamps = get_speech_timestamps(wav, model, return_seconds=True)
         segments = []
         for entry in timestamps:
+            _raise_if_cancelled(should_cancel)
             start = float(entry.get("start", 0.0) or 0.0)
             end = float(entry.get("end", 0.0) or 0.0)
             if end > start:
@@ -1166,11 +1380,14 @@ def _speaker_embedding(
     *,
     work_dir: Path | None = None,
     compute_device: str = DEFAULT_DEVICE,
+    should_cancel: CancelCallback | None = None,
 ) -> tuple[float, ...] | None:
+    _raise_if_cancelled(should_cancel)
     if not _module_available("speechbrain"):
         return None
 
     try:
+        _raise_if_cancelled(should_cancel)
         import torch  # type: ignore
         from speechbrain.dataio.dataio import read_audio  # type: ignore
 
@@ -1179,13 +1396,17 @@ def _speaker_embedding(
             return None
 
         device = _resolve_compute_device(compute_device)
+        _raise_if_cancelled(should_cancel)
         classifier = _load_speechbrain_classifier(str(savedir), device)
+        _raise_if_cancelled(should_cancel)
         waveform = read_audio(str(path))
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         waveform = waveform.to(device)
+        _raise_if_cancelled(should_cancel)
         with torch.no_grad():
             embedding = classifier.encode_batch(waveform)
+        _raise_if_cancelled(should_cancel)
         vector = embedding.squeeze().detach().cpu().flatten().tolist()
         return tuple(float(value) for value in vector)
     except Exception:
@@ -1342,6 +1563,11 @@ def _write_material_library_cache(
     except OSError:
         return False
     return True
+
+
+def _material_cache_path(material_directory: Path, material_cache_dir: Path | None) -> Path:
+    base = material_cache_dir.expanduser() if material_cache_dir is not None else material_directory.expanduser()
+    return base / MATERIAL_CACHE_FILE
 
 
 def _reference_cache_path(
@@ -1581,6 +1807,10 @@ def _target_durations_for_decisions(
     if reference_duration <= 0:
         return tuple(None for _ in decisions)
 
+    positioned_targets = _positioned_target_durations(reference_segments, decisions)
+    if positioned_targets and all(target is not None for target in positioned_targets):
+        return positioned_targets
+
     normalized_reference_texts = {
         _compact_bridge_text(decision.reference_text)
         for decision in decisions
@@ -1590,11 +1820,19 @@ def _target_durations_for_decisions(
     if len(decisions) > 1 and len(normalized_reference_texts) <= 1 and not has_segment_indices:
         return _weighted_target_durations(decisions, reference_duration=reference_duration)
 
-    targets: list[float | None] = [None for _ in decisions]
-    used_segments: set[int] = set()
+    targets: list[float | None] = list(positioned_targets) if positioned_targets else [None for _ in decisions]
+    used_segments: set[int] = {
+        decision.reference_segment_index
+        for index, decision in enumerate(decisions)
+        if targets[index] is not None and decision.reference_segment_index is not None
+    }
     for decision_index, decision in enumerate(decisions):
+        if targets[decision_index] is not None:
+            continue
         if decision.reference_segment_index is not None:
             segment_index = decision.reference_segment_index
+            if segment_index in used_segments:
+                continue
             if 0 <= segment_index < len(reference_segments):
                 segment = reference_segments[segment_index]
                 if segment.duration_seconds > 0:
@@ -1621,6 +1859,109 @@ def _target_durations_for_decisions(
     return _weighted_target_durations(decisions, reference_duration=reference_duration)
 
 
+def _render_timeline_alignment_summary(
+    reference_segments: Sequence[VoiceSegment],
+    decisions: Sequence[MaterialOrderDecision],
+    target_durations: Sequence[float | None],
+) -> dict[str, Any]:
+    positioned_decisions = [
+        decision
+        for decision in decisions
+        if decision.reference_segment_index is not None and _decision_position(decision) is not None
+    ]
+    split_segment_indices = sorted(
+        segment_index
+        for segment_index, count in _positioned_decision_count_by_segment(decisions).items()
+        if count > 1
+    )
+    return {
+        "format": "vocal_process_timeline_alignment_summary_v1",
+        "reference_segment_count": len(reference_segments),
+        "decision_count": len(decisions),
+        "positioned_decision_count": len(positioned_decisions),
+        "split_reference_segment_indices": split_segment_indices,
+        "resolved_target_duration_count": sum(1 for duration in target_durations if duration is not None),
+        "target_duration_total_seconds": sum(float(duration or 0.0) for duration in target_durations),
+        "phonetic_positioned_decision_count": sum(
+            1 for decision in decisions if decision.phonetic_position is not None
+        ),
+        "tone_disambiguated_decision_count": sum(
+            1 for decision in decisions if decision.phonetic_tone_score > 0 and decision.phonetic_tone_position_count == 1
+        ),
+        "ambiguous_phonetic_decision_count": sum(
+            1 for decision in decisions if decision.phonetic_position_count > 1
+        ),
+        "mode": "phonetic_or_text_position_split" if split_segment_indices else "segment_or_weighted_duration",
+    }
+
+
+def _positioned_decision_count_by_segment(
+    decisions: Sequence[MaterialOrderDecision],
+) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for decision in decisions:
+        if decision.reference_segment_index is None or _decision_position(decision) is None:
+            continue
+        counts[decision.reference_segment_index] = counts.get(decision.reference_segment_index, 0) + 1
+    return counts
+
+
+def _positioned_target_durations(
+    reference_segments: Sequence[VoiceSegment],
+    decisions: Sequence[MaterialOrderDecision],
+) -> tuple[float | None, ...]:
+    if len(decisions) <= 1:
+        return tuple(None for _ in decisions)
+
+    targets: list[float | None] = [None for _ in decisions]
+    groups: dict[int, list[tuple[int, MaterialOrderDecision]]] = {}
+    for decision_index, decision in enumerate(decisions):
+        segment_index = decision.reference_segment_index
+        if segment_index is None or _decision_position(decision) is None:
+            continue
+        if not 0 <= segment_index < len(reference_segments):
+            continue
+        groups.setdefault(segment_index, []).append((decision_index, decision))
+
+    for segment_index, group in groups.items():
+        if len(group) <= 1:
+            continue
+        segment = reference_segments[segment_index]
+        if segment.duration_seconds <= 0:
+            continue
+
+        max_position = max(max(_decision_position(decision) or 0, 0) for _, decision in group)
+        unit_count = max(len(_timeline_units(segment.text)), max_position + 1, len(group), 1)
+        complete_position_cover = len(group) >= unit_count
+        ordered_group = sorted(group, key=lambda item: (_decision_position(item[1]) or 0, item[1].rank))
+        for group_index, (decision_index, decision) in enumerate(ordered_group):
+            start_unit = min(max(_decision_position(decision) or 0, 0), unit_count - 1)
+            next_start = None
+            if group_index + 1 < len(ordered_group):
+                next_position = _decision_position(ordered_group[group_index + 1][1])
+                if next_position is not None and next_position > start_unit:
+                    next_start = min(next_position, unit_count)
+
+            material_units = _decision_timeline_unit_count(decision)
+            if next_start is not None:
+                end_unit = next_start
+            elif complete_position_cover and group_index == len(ordered_group) - 1:
+                end_unit = unit_count
+            else:
+                end_unit = start_unit + material_units
+
+            span_units = max(min(end_unit, unit_count) - start_unit, 1)
+            targets[decision_index] = segment.duration_seconds * (span_units / unit_count)
+
+    return tuple(targets)
+
+
+def _decision_position(decision: MaterialOrderDecision) -> int | None:
+    if decision.text_position is not None:
+        return decision.text_position
+    return decision.phonetic_position
+
+
 def _weighted_target_durations(
     decisions: Sequence[MaterialOrderDecision],
     *,
@@ -1634,9 +1975,26 @@ def _weighted_target_durations(
 
 
 def _decision_text_weight(decision: MaterialOrderDecision) -> float:
-    text = decision.material_text or decision.material_path.stem
-    units = re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", text.lower())
-    return float(max(len(units), 1))
+    return float(_decision_timeline_unit_count(decision))
+
+
+def _decision_timeline_unit_count(decision: MaterialOrderDecision) -> int:
+    if decision.phonetic_span_units > 0:
+        return decision.phonetic_span_units
+    counts = [
+        len(units)
+        for units in (
+            _timeline_units(decision.material_path.stem),
+            _timeline_units(decision.material_text),
+        )
+        if units
+    ]
+    return max(min(counts), 1) if counts else 1
+
+
+def _timeline_units(text: str) -> list[str]:
+    normalized = text.replace("_", " ").replace("-", " ").lower()
+    return re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", normalized)
 
 
 def _compact_bridge_text(text: str) -> str:
@@ -1759,23 +2117,117 @@ def _silero_model_cached() -> bool:
     return (root / "snakers4_silero-vad_master").exists() or any((root / "checkpoints").glob("*.th"))
 
 
+def _speech_runtime_issue(preferred_backend: str, allow_model_download: bool) -> str:
+    attempted: list[str] = []
+
+    if preferred_backend in {"auto", "faster-whisper", "faster_whisper"}:
+        if _module_available("faster_whisper"):
+            if preferred_backend != "auto" or allow_model_download or _faster_whisper_model_cached():
+                return ""
+            attempted.append("faster-whisper skipped: local model cache not found and downloads are not enabled")
+        else:
+            attempted.append(f"faster-whisper not loadable: {_module_unavailable_reason('faster_whisper')}")
+
+    if preferred_backend in {"auto", "whisperx"}:
+        if _module_available("whisperx"):
+            torch_issue = _torch_dependent_backend_issue("whisperx")
+            if torch_issue:
+                attempted.append(torch_issue)
+            elif preferred_backend != "auto" or allow_model_download or _whisperx_model_cached():
+                return ""
+            else:
+                attempted.append("whisperx skipped: local model cache not found and downloads are not enabled")
+        else:
+            attempted.append(f"whisperx not loadable: {_module_unavailable_reason('whisperx')}")
+
+    if preferred_backend in {"auto", "whisper", "openai-whisper", "openai_whisper"}:
+        if _module_available("whisper"):
+            torch_issue = _torch_dependent_backend_issue("openai-whisper")
+            if torch_issue:
+                attempted.append(torch_issue)
+            else:
+                return ""
+        else:
+            attempted.append(f"openai-whisper not loadable: {_module_unavailable_reason('whisper')}")
+
+    if preferred_backend not in {"auto", "faster-whisper", "faster_whisper", "whisperx", "whisper", "openai-whisper", "openai_whisper"}:
+        attempted.append(f"unsupported ASR backend setting: {preferred_backend}")
+
+    reason = " | ".join(part for part in attempted if part)
+    hint = f" {TORCH_NATIVE_RUNTIME_HINT}" if "torch._C" in reason or "PyTorch native" in reason else ""
+    return f"Speech recognition runtime is unavailable before rendering. {reason}.{hint}".strip()
+
+
+def _torch_dependent_backend_issue(backend_name: str) -> str:
+    if not _module_available("torch"):
+        return f"{backend_name} not loadable: {_module_unavailable_reason('torch')}"
+    if backend_name == "whisperx" and not _module_available("torchaudio"):
+        return f"{backend_name} not loadable: {_module_unavailable_reason('torchaudio')}"
+    return ""
+
+
 def _maybe_module_available(module_name: str) -> bool:
+    return _module_status(module_name)[0]
+
+
+def _module_unavailable_reason(module_name: str) -> str:
+    return _module_status(module_name)[1]
+
+
+@lru_cache(maxsize=None)
+def _module_status(module_name: str) -> tuple[bool, str]:
     try:
-        if module_name in {"pyannote.audio", "whisperx"}:
+        _prepare_native_dependency_paths()
+        if module_name == "torch":
+            importlib.import_module("torch")
+            importlib.import_module("torch._C")
+            return True, ""
+        if module_name == "torchaudio":
             _prepare_torchaudio_legacy_api()
+            importlib.import_module("torchaudio")
+            return True, ""
+        if module_name in IMPORT_PROBE_MODULES:
             importlib.import_module(module_name)
-            return True
-        return importlib.util.find_spec(module_name) is not None
+            return True, ""
+        available = importlib.util.find_spec(module_name) is not None
+        return available, "" if available else "module spec not found"
     except (ModuleNotFoundError, ValueError):
-        return False
-    except Exception:
-        return False
+        return False, _format_module_import_error(sys.exc_info()[1])
+    except Exception as exc:
+        return False, _format_module_import_error(exc)
 
 
 def _module_available(module_name: str) -> bool:
     if module_name == "silero_vad":
         return _maybe_module_available(module_name)
     return _maybe_module_available(module_name)
+
+
+@lru_cache(maxsize=1)
+def _prepare_native_dependency_paths() -> None:
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            roots.append(Path(meipass))
+        roots.append(Path(sys.executable).resolve().parent / "_internal")
+    roots.append(Path(sys.prefix))
+
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    for root in roots:
+        for dll_directory in (root / "torch" / "lib", root / "torchaudio" / "lib", root):
+            if dll_directory.exists() and add_dll_directory is not None:
+                with contextlib.suppress(OSError):
+                    _DLL_DIRECTORY_HANDLES.append(add_dll_directory(str(dll_directory)))
+
+
+def _format_module_import_error(exc: BaseException | None) -> str:
+    if exc is None:
+        return "unknown import error"
+    text = f"{type(exc).__name__}: {exc}"
+    if "torch._C" in text:
+        return f"{text}. {TORCH_NATIVE_RUNTIME_HINT}"
+    return text
 
 
 @lru_cache(maxsize=1)
@@ -1879,3 +2331,8 @@ def _segment_confidence(segment: dict[str, Any]) -> float | None:
 def _notify_progress(callback: ProgressCallback | None, progress: float, message: str) -> None:
     if callback is not None:
         callback(progress, message)
+
+
+def _raise_if_cancelled(should_cancel: CancelCallback | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise AudioProcessorError("Processing cancelled")

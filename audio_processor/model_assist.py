@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Sequence
 
 
+KANA_PATTERN = re.compile(r"^[\u3040-\u30ff\u31f0-\u31ff]+$")
+
+
 @dataclass(frozen=True)
 class ModelCandidate:
     name: str
@@ -67,6 +70,12 @@ class MaterialOrderDecision:
     confidence_label: str = "low"
     reference_segment_index: int | None = None
     text_position: int | None = None
+    phonetic_position: int | None = None
+    phonetic_position_count: int = 0
+    phonetic_span_units: int = 0
+    phonetic_tone_score: float = 0.0
+    phonetic_tone_position: int | None = None
+    phonetic_tone_position_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,6 +97,35 @@ class MaterialScoreBreakdown:
     reason: str
     short_reference: bool
     text_position: int | None = None
+    phonetic_position: int | None = None
+    phonetic_position_count: int = 0
+    reference_phonetic_units: tuple[str, ...] = ()
+    material_phonetic_units: tuple[str, ...] = ()
+    reference_phonetic_tone_units: tuple[str, ...] = ()
+    material_phonetic_tone_units: tuple[str, ...] = ()
+    phonetic_span_units: int = 0
+    phonetic_tone_score: float = 0.0
+    phonetic_tone_position: int | None = None
+    phonetic_tone_position_count: int = 0
+
+
+@dataclass(frozen=True)
+class _PhoneticMatch:
+    position: int | None = None
+    position_count: int = 0
+    span_units: int = 0
+    tone_position: int | None = None
+    tone_position_count: int = 0
+    tone_span_units: int = 0
+    tone_score: float = 0.0
+
+
+@dataclass(frozen=True)
+class _RawPhoneticMatch:
+    positions: tuple[int, ...] = ()
+    span_units: int = 0
+    tone_positions: tuple[int, ...] = ()
+    tone_span_units: int = 0
 
 
 @dataclass(frozen=True)
@@ -409,6 +447,16 @@ def render_ordering_score_matrix(plan: MaterialOrderingPlan) -> list[list[dict[s
                 "reason": score.reason,
                 "short_reference": score.short_reference,
                 "text_position": score.text_position,
+                "phonetic_position": score.phonetic_position,
+                "phonetic_position_count": score.phonetic_position_count,
+                "reference_phonetic_units": list(score.reference_phonetic_units),
+                "material_phonetic_units": list(score.material_phonetic_units),
+                "reference_phonetic_tone_units": list(score.reference_phonetic_tone_units),
+                "material_phonetic_tone_units": list(score.material_phonetic_tone_units),
+                "phonetic_span_units": score.phonetic_span_units,
+                "phonetic_tone_score": score.phonetic_tone_score,
+                "phonetic_tone_position": score.phonetic_tone_position,
+                "phonetic_tone_position_count": score.phonetic_tone_position_count,
             }
             for score in row
         ]
@@ -452,11 +500,19 @@ def _score_material_against_reference(
     reference_duration = reference_segment.duration_seconds or reference_duration_hint
     transcript_score = text_similarity(reference_segment.text, material.transcript)
     filename_score = text_similarity(reference_segment.text, material.filename_text)
-    phonetic_score = phonetic_similarity(reference_segment.text, _material_search_text(material))
+    phonetic_match = _material_phonetic_match(reference_segment.text, material)
+    phonetic_score = max(
+        phonetic_similarity(reference_segment.text, _material_search_text(material)),
+        _material_phonetic_position_score(reference_segment.text, material, phonetic_match=phonetic_match),
+    )
+    if phonetic_match.tone_score > 0:
+        phonetic_score = max(phonetic_score, phonetic_match.tone_score)
     duration_score = _duration_similarity(reference_duration, material.duration_seconds)
     speaker_score = max(_speaker_similarity(reference_segment, material, reference_embedding=reference_embedding), 0.0)
     vad_score = material.vad_coverage or 0.0
     text_position = _material_text_position(reference_segment.text, material)
+    phonetic_position = phonetic_match.position
+    phonetic_position_count = phonetic_match.position_count
     score = _candidate_score(
         transcript_score=transcript_score,
         filename_score=filename_score,
@@ -502,6 +558,16 @@ def _score_material_against_reference(
         reason=reason,
         short_reference=short_reference,
         text_position=text_position,
+        phonetic_position=phonetic_position,
+        phonetic_position_count=phonetic_position_count,
+        reference_phonetic_units=tuple(_phonetic_units(reference_segment.text)),
+        material_phonetic_units=tuple(_phonetic_units(_material_search_text(material))),
+        reference_phonetic_tone_units=tuple(_phonetic_tone_units(reference_segment.text)),
+        material_phonetic_tone_units=tuple(_phonetic_tone_units(_material_search_text(material))),
+        phonetic_span_units=phonetic_match.span_units,
+        phonetic_tone_score=phonetic_match.tone_score,
+        phonetic_tone_position=phonetic_match.tone_position,
+        phonetic_tone_position_count=phonetic_match.tone_position_count,
     )
 
 
@@ -573,6 +639,12 @@ def _decision_from_score(rank: int, score: MaterialScoreBreakdown) -> MaterialOr
         confidence_label=score.confidence_label,
         reference_segment_index=score.reference_index,
         text_position=score.text_position,
+        phonetic_position=score.phonetic_position,
+        phonetic_position_count=score.phonetic_position_count,
+        phonetic_span_units=score.phonetic_span_units,
+        phonetic_tone_score=score.phonetic_tone_score,
+        phonetic_tone_position=score.phonetic_tone_position,
+        phonetic_tone_position_count=score.phonetic_tone_position_count,
     )
 
 
@@ -673,10 +745,79 @@ def _material_text_position(reference_text: str, material: MaterialAnalysis) -> 
         for position in (
             _text_position(reference_text, material.transcript),
             _text_position(reference_text, material.filename_text),
+            _material_phonetic_position(reference_text, material),
         )
         if position is not None
     ]
     return min(positions) if positions else None
+
+
+def _material_phonetic_position(reference_text: str, material: MaterialAnalysis) -> int | None:
+    return _material_phonetic_match(reference_text, material).position
+
+
+def _material_phonetic_position_count(reference_text: str, material: MaterialAnalysis) -> int:
+    return _material_phonetic_match(reference_text, material).position_count
+
+
+def _material_phonetic_position_score(
+    reference_text: str,
+    material: MaterialAnalysis,
+    *,
+    phonetic_match: _PhoneticMatch | None = None,
+) -> float:
+    reference_units = _phonetic_units(reference_text)
+    if not reference_units:
+        return 0.0
+
+    match = phonetic_match or _material_phonetic_match(reference_text, material)
+    if match.position_count <= 0:
+        return 0.0
+
+    ambiguity_count = match.tone_position_count if match.tone_position_count else match.position_count
+    ambiguity_penalty = 0.18 if ambiguity_count > 1 else 0.0
+    span_units = max(match.span_units, match.tone_span_units, 1)
+    if len(reference_units) <= span_units:
+        base = 1.0
+    else:
+        base = 0.92
+    if span_units > 1:
+        base = min(base + 0.03, 1.0)
+    return max(base - ambiguity_penalty, match.tone_score)
+
+
+def _material_phonetic_match(reference_text: str, material: MaterialAnalysis) -> _PhoneticMatch:
+    positions: set[int] = set()
+    tone_positions: set[int] = set()
+    span_units = 0
+    tone_span_units = 0
+    for text in (material.transcript, material.filename_text):
+        match = _phonetic_match(reference_text, text)
+        positions.update(match.positions)
+        tone_positions.update(match.tone_positions)
+        span_units = max(span_units, match.span_units)
+        tone_span_units = max(tone_span_units, match.tone_span_units)
+
+    tone_position_count = len(tone_positions)
+    tone_score = 0.0
+    if tone_position_count > 0:
+        tone_score = 0.98 if tone_position_count == 1 else 0.80
+
+    resolved_position = None
+    if tone_position_count == 1:
+        resolved_position = min(tone_positions)
+    elif positions:
+        resolved_position = min(positions)
+
+    return _PhoneticMatch(
+        position=resolved_position,
+        position_count=len(positions),
+        span_units=span_units,
+        tone_position=min(tone_positions) if tone_positions else None,
+        tone_position_count=tone_position_count,
+        tone_span_units=tone_span_units,
+        tone_score=tone_score,
+    )
 
 
 def _material_search_text(material: MaterialAnalysis) -> str:
@@ -730,22 +871,143 @@ def _text_units(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", text.lower())
 
 
+def _group_kana_units(units: Sequence[str]) -> list[str]:
+    grouped: list[str] = []
+    buffer: list[str] = []
+    for unit in units:
+        if KANA_PATTERN.fullmatch(unit):
+            buffer.append(unit)
+            continue
+        if buffer:
+            grouped.append("".join(buffer))
+            buffer.clear()
+        grouped.append(unit)
+    if buffer:
+        grouped.append("".join(buffer))
+    return grouped
+
+
 def _compact_text(text: str) -> str:
     return "".join(_text_units(text))
 
 
 def _phonetic_text(text: str) -> str:
-    units = _text_units(_strip_accents(text))
+    return " ".join(_phonetic_units(text))
+
+
+def _phonetic_units(text: str) -> list[str]:
+    units = _group_kana_units(_text_units(_strip_accents(text)))
     if not units:
-        return ""
+        return []
 
     result: list[str] = []
     for unit in units:
+        if unit.isdigit():
+            continue
         if re.fullmatch(r"[\u4e00-\u9fff]+", unit):
             result.extend(_pinyin_units(unit))
+        elif KANA_PATTERN.fullmatch(unit):
+            result.extend(_kana_romaji_units(unit))
         else:
-            result.append(unit)
-    return " ".join(result)
+            result.append(_normalize_phonetic_unit(unit))
+    return [unit for unit in result if unit]
+
+
+def _phonetic_tone_units(text: str) -> list[str]:
+    units = _group_kana_units(_text_units(_strip_accents(text)))
+    if not units:
+        return []
+
+    result: list[str] = []
+    for unit in units:
+        if unit.isdigit():
+            continue
+        if re.fullmatch(r"[\u4e00-\u9fff]+", unit):
+            result.extend(_pinyin_tone_units(unit))
+        elif KANA_PATTERN.fullmatch(unit):
+            result.extend(_kana_romaji_units(unit))
+        else:
+            result.append(_normalize_phonetic_tone_unit(unit))
+    return [unit for unit in result if unit]
+
+
+def _phonetic_position(reference_text: str, material_text: str) -> int | None:
+    positions = _phonetic_positions(reference_text, material_text)
+    return positions[0] if positions else None
+
+
+def _phonetic_positions(reference_text: str, material_text: str) -> list[int]:
+    return list(_phonetic_match(reference_text, material_text).positions)
+
+
+def _phonetic_match(reference_text: str, material_text: str) -> _RawPhoneticMatch:
+    reference_units = _phonetic_units(reference_text)
+    material_units = _phonetic_units(material_text)
+    if not reference_units or not material_units:
+        return _RawPhoneticMatch()
+
+    positions, span_units = _phonetic_positions_for_units(reference_units, material_units)
+    tone_positions: list[int] = []
+    tone_span_units = 0
+    reference_tone_units = _phonetic_tone_units(reference_text)
+    material_tone_units = _phonetic_tone_units(material_text)
+    if _has_tone_evidence(material_tone_units):
+        tone_positions, tone_span_units = _phonetic_positions_for_units(reference_tone_units, material_tone_units)
+
+    return _RawPhoneticMatch(
+        positions=tuple(positions),
+        span_units=span_units,
+        tone_positions=tuple(tone_positions),
+        tone_span_units=tone_span_units,
+    )
+
+
+def _phonetic_positions_for_units(
+    reference_units: Sequence[str],
+    material_units: Sequence[str],
+) -> tuple[list[int], int]:
+    material_count = len(material_units)
+    positions: list[int] = []
+    for start in range(0, len(reference_units) - material_count + 1):
+        if reference_units[start : start + material_count] == material_units:
+            positions.append(start)
+    if positions:
+        return positions, material_count
+
+    reference_compact = "".join(reference_units)
+    material_compact = "".join(material_units)
+    if not reference_compact or not material_compact:
+        return [], 0
+
+    exact_positions: list[int] = []
+    search_start = 0
+    while True:
+        exact = reference_compact.find(material_compact, search_start)
+        if exact < 0:
+            break
+        exact_positions.append(exact)
+        search_start = exact + 1
+    if not exact_positions:
+        return [], 0
+
+    resolved_positions: list[int] = []
+    resolved_spans: list[int] = []
+    offset = 0
+    for index, unit in enumerate(reference_units):
+        next_offset = offset + len(unit)
+        starts_here = [exact for exact in exact_positions if offset <= exact < next_offset]
+        if starts_here:
+            resolved_positions.append(index)
+            start_offset = starts_here[0]
+            end_offset = start_offset + len(material_compact)
+            end_index = index
+            running_end = next_offset
+            while end_index + 1 < len(reference_units) and running_end < end_offset:
+                end_index += 1
+                running_end += len(reference_units[end_index])
+            resolved_spans.append(max(end_index - index + 1, 1))
+        offset = next_offset
+    return resolved_positions, max(resolved_spans, default=0)
 
 
 def _pinyin_units(text: str) -> list[str]:
@@ -755,10 +1017,316 @@ def _pinyin_units(text: str) -> list[str]:
         return list(text)
 
     return [
-        _strip_accents(unit).lower()
+        _normalize_phonetic_unit(unit)
         for unit in lazy_pinyin(text, style=Style.NORMAL, errors="default")
         if unit
     ]
+
+
+def _pinyin_tone_units(text: str) -> list[str]:
+    try:
+        from pypinyin import Style, lazy_pinyin  # type: ignore
+    except Exception:
+        return list(text)
+
+    return [
+        _normalize_phonetic_tone_unit(unit)
+        for unit in lazy_pinyin(text, style=Style.TONE3, neutral_tone_with_five=True, errors="default")
+        if unit
+    ]
+
+
+def _kana_romaji_units(text: str) -> list[str]:
+    normalized = _strip_accents(text)
+    units: list[str] = []
+    index = 0
+    while index < len(normalized):
+        pair = normalized[index : index + 2]
+        triple = normalized[index : index + 3]
+        if triple in _KANA_ROMAJI_MAP:
+            units.append(_KANA_ROMAJI_MAP[triple])
+            index += 3
+            continue
+        if pair in _KANA_ROMAJI_MAP:
+            units.append(_KANA_ROMAJI_MAP[pair])
+            index += 2
+            continue
+        char = normalized[index]
+        units.append(_KANA_ROMAJI_MAP.get(char, char))
+        index += 1
+    return [unit for unit in units if unit]
+
+
+_KANA_ROMAJI_MAP: dict[str, str] = {
+    "きゃ": "kya",
+    "きゅ": "kyu",
+    "きょ": "kyo",
+    "しゃ": "sha",
+    "しゅ": "shu",
+    "しょ": "sho",
+    "ちゃ": "cha",
+    "ちゅ": "chu",
+    "ちょ": "cho",
+    "にゃ": "nya",
+    "にゅ": "nyu",
+    "にょ": "nyo",
+    "ひゃ": "hya",
+    "ひゅ": "hyu",
+    "ひょ": "hyo",
+    "みゃ": "mya",
+    "みゅ": "myu",
+    "みょ": "myo",
+    "りゃ": "rya",
+    "りゅ": "ryu",
+    "りょ": "ryo",
+    "ぎゃ": "gya",
+    "ぎゅ": "gyu",
+    "ぎょ": "gyo",
+    "じゃ": "ja",
+    "じゅ": "ju",
+    "じょ": "jo",
+    "びゃ": "bya",
+    "びゅ": "byu",
+    "びょ": "byo",
+    "ぴゃ": "pya",
+    "ぴゅ": "pyu",
+    "ぴょ": "pyo",
+    "キャ": "kya",
+    "キュ": "kyu",
+    "キョ": "kyo",
+    "シャ": "sha",
+    "シュ": "shu",
+    "ショ": "sho",
+    "チャ": "cha",
+    "チュ": "chu",
+    "チョ": "cho",
+    "ニャ": "nya",
+    "ニュ": "nyu",
+    "ニョ": "nyo",
+    "ヒャ": "hya",
+    "ヒュ": "hyu",
+    "ヒョ": "hyo",
+    "ミャ": "mya",
+    "ミュ": "myu",
+    "ミョ": "myo",
+    "リャ": "rya",
+    "リュ": "ryu",
+    "リョ": "ryo",
+    "ギャ": "gya",
+    "ギュ": "gyu",
+    "ギョ": "gyo",
+    "ジャ": "ja",
+    "ジュ": "ju",
+    "ジョ": "jo",
+    "ビャ": "bya",
+    "ビュ": "byu",
+    "ビョ": "byo",
+    "ピャ": "pya",
+    "ピュ": "pyu",
+    "ピョ": "pyo",
+    "あ": "a",
+    "い": "i",
+    "う": "u",
+    "え": "e",
+    "お": "o",
+    "か": "ka",
+    "き": "ki",
+    "く": "ku",
+    "け": "ke",
+    "こ": "ko",
+    "さ": "sa",
+    "し": "shi",
+    "す": "su",
+    "せ": "se",
+    "そ": "so",
+    "た": "ta",
+    "ち": "chi",
+    "つ": "tsu",
+    "て": "te",
+    "と": "to",
+    "な": "na",
+    "に": "ni",
+    "ぬ": "nu",
+    "ね": "ne",
+    "の": "no",
+    "は": "ha",
+    "ひ": "hi",
+    "ふ": "fu",
+    "へ": "he",
+    "ほ": "ho",
+    "ま": "ma",
+    "み": "mi",
+    "む": "mu",
+    "め": "me",
+    "も": "mo",
+    "や": "ya",
+    "ゆ": "yu",
+    "よ": "yo",
+    "ら": "ra",
+    "り": "ri",
+    "る": "ru",
+    "れ": "re",
+    "ろ": "ro",
+    "わ": "wa",
+    "を": "wo",
+    "ん": "n",
+    "が": "ga",
+    "ぎ": "gi",
+    "ぐ": "gu",
+    "げ": "ge",
+    "ご": "go",
+    "ざ": "za",
+    "じ": "ji",
+    "ず": "zu",
+    "ぜ": "ze",
+    "ぞ": "zo",
+    "だ": "da",
+    "ぢ": "ji",
+    "づ": "zu",
+    "で": "de",
+    "ど": "do",
+    "ば": "ba",
+    "び": "bi",
+    "ぶ": "bu",
+    "べ": "be",
+    "ぼ": "bo",
+    "ぱ": "pa",
+    "ぴ": "pi",
+    "ぷ": "pu",
+    "ぺ": "pe",
+    "ぽ": "po",
+    "ゃ": "ya",
+    "ゅ": "yu",
+    "ょ": "yo",
+    "ぁ": "a",
+    "ぃ": "i",
+    "ぅ": "u",
+    "ぇ": "e",
+    "ぉ": "o",
+    "っ": "",
+    "ー": "",
+    "ア": "a",
+    "イ": "i",
+    "ウ": "u",
+    "エ": "e",
+    "オ": "o",
+    "カ": "ka",
+    "キ": "ki",
+    "ク": "ku",
+    "ケ": "ke",
+    "コ": "ko",
+    "サ": "sa",
+    "シ": "shi",
+    "ス": "su",
+    "セ": "se",
+    "ソ": "so",
+    "タ": "ta",
+    "チ": "chi",
+    "ツ": "tsu",
+    "テ": "te",
+    "ト": "to",
+    "ナ": "na",
+    "ニ": "ni",
+    "ヌ": "nu",
+    "ネ": "ne",
+    "ノ": "no",
+    "ハ": "ha",
+    "ヒ": "hi",
+    "フ": "fu",
+    "ヘ": "he",
+    "ホ": "ho",
+    "マ": "ma",
+    "ミ": "mi",
+    "ム": "mu",
+    "メ": "me",
+    "モ": "mo",
+    "ヤ": "ya",
+    "ユ": "yu",
+    "ヨ": "yo",
+    "ラ": "ra",
+    "リ": "ri",
+    "ル": "ru",
+    "レ": "re",
+    "ロ": "ro",
+    "ワ": "wa",
+    "ヲ": "wo",
+    "ン": "n",
+    "ガ": "ga",
+    "ギ": "gi",
+    "グ": "gu",
+    "ゲ": "ge",
+    "ゴ": "go",
+    "ザ": "za",
+    "ジ": "ji",
+    "ズ": "zu",
+    "ゼ": "ze",
+    "ゾ": "zo",
+    "ダ": "da",
+    "ヂ": "ji",
+    "ヅ": "zu",
+    "デ": "de",
+    "ド": "do",
+    "バ": "ba",
+    "ビ": "bi",
+    "ブ": "bu",
+    "ベ": "be",
+    "ボ": "bo",
+    "パ": "pa",
+    "ピ": "pi",
+    "プ": "pu",
+    "ペ": "pe",
+    "ポ": "po",
+    "ャ": "ya",
+    "ュ": "yu",
+    "ョ": "yo",
+    "ァ": "a",
+    "ィ": "i",
+    "ゥ": "u",
+    "ェ": "e",
+    "ォ": "o",
+    "ッ": "",
+    "ー": "",
+}
+
+
+_ROMAJI_VARIANTS: dict[str, str] = {
+    "jya": "ja",
+    "jyu": "ju",
+    "jyo": "jo",
+    "sya": "sha",
+    "syu": "shu",
+    "syo": "sho",
+    "tya": "cha",
+    "tyu": "chu",
+    "tyo": "cho",
+    "zya": "ja",
+    "zyu": "ju",
+    "zyo": "jo",
+    "thi": "shi",
+    "ti": "chi",
+    "tu": "tsu",
+    "du": "zu",
+}
+
+
+def _normalize_phonetic_unit(unit: str) -> str:
+    normalized = _strip_accents(unit)
+    normalized = re.sub(r"[1-5]", "", normalized)
+    normalized = normalized.replace("u:", "u").replace("v", "u")
+    return _ROMAJI_VARIANTS.get(normalized, normalized)
+
+
+def _normalize_phonetic_tone_unit(unit: str) -> str:
+    normalized = _strip_accents(unit)
+    normalized = normalized.replace("u:", "u").replace("v", "u")
+    match = re.fullmatch(r"([a-z]+)([1-5])", normalized)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    return _normalize_phonetic_unit(normalized)
+
+
+def _has_tone_evidence(units: Sequence[str]) -> bool:
+    return any(re.search(r"[1-5]$", unit) for unit in units)
 
 
 def _strip_accents(text: str) -> str:

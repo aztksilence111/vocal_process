@@ -19,6 +19,7 @@ def build_preflight_report(
     *,
     lyrics_file: Path | None = None,
     work_dir: Path | None = None,
+    material_cache_dir: Path | None = None,
     compute_device: str = "auto",
     source_separation: str = "auto",
 ) -> dict[str, Any]:
@@ -27,6 +28,7 @@ def build_preflight_report(
         material_directory,
         lyrics_file=lyrics_file,
         work_dir=work_dir,
+        material_cache_dir=material_cache_dir,
         compute_device=compute_device,
         source_separation=source_separation,
     )
@@ -126,6 +128,35 @@ def _preflight_warnings(
                     "score": decision.score,
                     "phonetic_score": decision.phonetic_score,
                     "message": "Short material has weak pronunciation evidence; verify the one-to-one order before rendering.",
+                }
+            )
+
+        if decision.phonetic_position_count > 1 and decision.phonetic_tone_position_count == 1:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "kind": "tone_disambiguated_phonetic_position",
+                    "rank": decision.rank,
+                    "material_path": str(decision.source_path),
+                    "score": decision.score,
+                    "phonetic_score": decision.phonetic_score,
+                    "phonetic_tone_score": decision.phonetic_tone_score,
+                    "phonetic_tone_position": decision.phonetic_tone_position,
+                    "phonetic_position_count": decision.phonetic_position_count,
+                    "message": "Tone-marked filename narrows an otherwise ambiguous pronunciation match; still verify if acoustic evidence is weak.",
+                }
+            )
+        elif decision.phonetic_position_count > 1:
+            warnings.append(
+                {
+                    "severity": "warning",
+                    "kind": "ambiguous_phonetic_position",
+                    "rank": decision.rank,
+                    "material_path": str(decision.source_path),
+                    "score": decision.score,
+                    "phonetic_score": decision.phonetic_score,
+                    "phonetic_position_count": decision.phonetic_position_count,
+                    "message": "Filename pronunciation matches multiple positions in the reference; verify the selected character timing before rendering.",
                 }
             )
 

@@ -16,6 +16,11 @@ from .engine import (
     process_audio,
     summarize_probe,
 )
+from .handoff import (
+    export_melodyne_handoff_with_progress,
+    export_vegas_handoff_with_progress,
+    open_melodyne_handoff,
+)
 from .model_assist import build_model_assisted_pipeline_plan, list_model_candidates
 from .preflight import build_preflight_report
 from .model_runtime import backend_availability, get_model_runtime_report
@@ -145,6 +150,60 @@ def build_parser() -> argparse.ArgumentParser:
     daw_parser.add_argument("--lowpass-hz", type=float, help="low-pass cutoff")
     daw_parser.add_argument("--sample-rate", type=int, help="output sample rate")
     daw_parser.add_argument("--channels", type=int, help="output channel count")
+
+    melodyne_parser = subparsers.add_parser(
+        "export-melodyne",
+        help="export full-timeline WAV handoff files for Melodyne",
+    )
+    melodyne_parser.add_argument("reference", type=Path, help="reference/original audio file")
+    melodyne_parser.add_argument("material_directory", type=Path, help="folder containing material audio")
+    melodyne_parser.add_argument("output_directory", type=Path, help="target handoff directory")
+    melodyne_parser.add_argument(
+        "-y",
+        "--overwrite",
+        action="store_true",
+        help="overwrite generated handoff files if they already exist",
+    )
+    melodyne_parser.add_argument("--gain-db", type=float, help="gain adjustment in dB")
+    melodyne_parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="apply EBU R128 loudness normalization to each clip",
+    )
+    melodyne_parser.add_argument("--highpass-hz", type=float, help="high-pass cutoff")
+    melodyne_parser.add_argument("--lowpass-hz", type=float, help="low-pass cutoff")
+    melodyne_parser.add_argument("--sample-rate", type=int, help="output sample rate")
+    melodyne_parser.add_argument("--channels", type=int, help="output channel count")
+    melodyne_parser.add_argument("--melodyne-exe", type=Path, help="optional Melodyne executable path")
+    melodyne_parser.add_argument(
+        "--open-melodyne",
+        action="store_true",
+        help="open the generated full-timeline WAV in Melodyne after export",
+    )
+
+    vegas_parser = subparsers.add_parser(
+        "export-vegas",
+        help="export VEGAS handoff files with Broadcast Wave timestamps",
+    )
+    vegas_parser.add_argument("reference", type=Path, help="reference/original audio file")
+    vegas_parser.add_argument("material_directory", type=Path, help="folder containing material audio")
+    vegas_parser.add_argument("output_directory", type=Path, help="target handoff directory")
+    vegas_parser.add_argument(
+        "-y",
+        "--overwrite",
+        action="store_true",
+        help="overwrite generated handoff files if they already exist",
+    )
+    vegas_parser.add_argument("--gain-db", type=float, help="gain adjustment in dB")
+    vegas_parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="apply EBU R128 loudness normalization to each clip",
+    )
+    vegas_parser.add_argument("--highpass-hz", type=float, help="high-pass cutoff")
+    vegas_parser.add_argument("--lowpass-hz", type=float, help="low-pass cutoff")
+    vegas_parser.add_argument("--sample-rate", type=int, help="output sample rate")
+    vegas_parser.add_argument("--channels", type=int, help="output channel count")
 
     analyze_parser = subparsers.add_parser(
         "analyze",
@@ -310,6 +369,59 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Wrote {result.project_path}")
             print(f"Wrote {result.manifest_path}")
             print(f"Wrote {result.csv_path}")
+            return 0
+
+        if args.command == "export-melodyne":
+            result = export_melodyne_handoff_with_progress(
+                args.reference,
+                args.material_directory,
+                args.output_directory,
+                ProcessOptions(
+                    input_path=args.reference,
+                    output_path=args.output_directory / "melodyne_full.wav",
+                    overwrite=args.overwrite,
+                    gain_db=args.gain_db,
+                    normalize=args.normalize,
+                    highpass_hz=args.highpass_hz,
+                    lowpass_hz=args.lowpass_hz,
+                    sample_rate=args.sample_rate,
+                    channels=args.channels,
+                    codec=None,
+                ),
+            )
+            print(f"Wrote {result.full_mix_path}")
+            print(f"Wrote {result.manifest_path}")
+            print(f"Wrote {result.csv_path}")
+            print(f"Wrote {result.lanes_directory}")
+            if args.open_melodyne:
+                process = open_melodyne_handoff(result.full_mix_path, args.melodyne_exe)
+                print(f"Started Melodyne: {process.pid}")
+            return 0
+
+        if args.command == "export-vegas":
+            result = export_vegas_handoff_with_progress(
+                args.reference,
+                args.material_directory,
+                args.output_directory,
+                ProcessOptions(
+                    input_path=args.reference,
+                    output_path=args.output_directory / "vegas_full.wav",
+                    overwrite=args.overwrite,
+                    gain_db=args.gain_db,
+                    normalize=args.normalize,
+                    highpass_hz=args.highpass_hz,
+                    lowpass_hz=args.lowpass_hz,
+                    sample_rate=args.sample_rate,
+                    channels=args.channels,
+                    codec=None,
+                ),
+            )
+            print(f"Wrote {result.full_mix_path}")
+            print(f"Wrote {result.manifest_path}")
+            print(f"Wrote {result.csv_path}")
+            print(f"Wrote {result.lanes_directory}")
+            if result.bwf_directory:
+                print(f"Wrote {result.bwf_directory}")
             return 0
 
         if args.command == "analyze":

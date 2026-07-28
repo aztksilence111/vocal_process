@@ -1,0 +1,23 @@
+{
+  "format": "vocal_process_real_cases_v1",
+  "cases": [
+    {
+      "name": "example_cn",
+      "split": "calibration",
+      "reference": "origin_vocal/AiRenTongZhi_CN.wav",
+      "material_directory": "material_set/vmzCN",
+      "lyrics_file": "",
+      "output_directory": "output/example_cn",
+      "expected_order": []
+    },
+    {
+      "name": "example_jp",
+      "split": "regression",
+      "reference": "origin_vocal/PlasticLove_JP.wav",
+      "material_directory": "material_set/vmzJP",
+      "lyrics_file": "",
+      "output_directory": "output/example_jp",
+      "expected_order": []
+    }
+  ]
+}

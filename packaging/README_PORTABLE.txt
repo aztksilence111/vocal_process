@@ -37,6 +37,8 @@ VocalProcess Portable
 Troubleshooting:
 
 - If the app cannot find FFmpeg, make sure `bin\ffmpeg.exe` and `bin\ffprobe.exe` still exist beside `VocalProcess.exe`.
+- If diagnostics reports `系统找不到指定的文件` during Whisper/ASR, it usually means a third-party ASR library could not start FFmpeg. Keep the full `VocalProcess` folder together; do not launch a copied EXE by itself; verify `bin\ffmpeg.exe` exists.
+- If diagnostics or the console reports `No module named 'torch._C'`, the model runtime is incomplete or was not extracted correctly. Use the full package, not a `-lite` package; extract the whole ZIP; keep `_internal\torch`, `models`, and `uvr-worker` beside `VocalProcess.exe`; then run `scripts\check_portable_runtime.ps1 -PortableRoot <解压目录>\VocalProcess` from the source repo when available.
 - If Windows SmartScreen warns about the app, it is because this local build is not code-signed.
 - If processing fails or the output is not meaningful, send the `.diagnostics.jsonl` file together with the original audio, material folder description, and screenshots of the selected settings.
 

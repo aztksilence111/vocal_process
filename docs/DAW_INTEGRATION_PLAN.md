@@ -42,7 +42,7 @@ This phase solves the immediate editing requirement: after import, each material
 
 ## Phase 2: Broader DAW Interchange
 
-Next target after user testing:
+Status: started.
 
 1. Add more host-specific project exporters where practical.
 2. Keep the timeline manifest as the internal source of truth.
@@ -53,7 +53,18 @@ Candidate formats:
 
 1. REAPER `.rpp`: practical first format because it is text-based and easy to generate.
 2. Generic `timeline.json` and `timeline.csv`: useful for debugging, scripts, and future converters.
-3. AAF/OMF: possible later, but higher risk and needs dedicated library/tooling and DAW validation.
+3. Full-length timeline lane WAVs: practical host-agnostic fallback for tools that can import audio but do not read clip offsets.
+4. Broadcast Wave timestamp WAVs: practical for VEGAS-style handoff when the host supports timestamp placement.
+5. AAF/OMF: possible later, but higher risk and needs dedicated library/tooling and DAW validation.
+
+Current interchange progress:
+
+1. `audio_processor.handoff` is the shared handoff layer for host-specific exports.
+2. `audio-processor export-melodyne` writes `melodyne_full.wav`, per-clip full-timeline lane WAVs, `melodyne_handoff.json`, `melodyne_handoff.csv`, and a parallel REAPER `.rpp` timeline.
+3. `audio-processor export-vegas` writes `vegas_full.wav`, full-timeline lane WAVs, manifest/CSV, and BWF timestamp WAV clips under `vegas_bwf`.
+4. The handoff manifest records clip start seconds, target duration, rendered clip path, lane path, BWF path when applicable, stretch strategy, and text hint.
+5. Melodyne is handled as a manual pitch-edit/import target. The robust path is a full continuous WAV or full-length lane WAVs, not treating Melodyne as a VST3 host.
+6. VEGAS is handled through file import semantics first. Direct VEGAS project/session manipulation is deferred until there is a stable local automation path and manual host validation.
 
 ## Phase 3: VST3 Bridge
 
@@ -96,7 +107,8 @@ Host validation status on this machine:
 1. JUCE headless probe: passed. The probe found one VST3 description for `VocalProcess Bridge`, instantiated it, and confirmed 2 inputs / 2 outputs.
 2. REAPER 7.33 x64: passed. `scripts\host_test_reaper_vst3.ps1` launched REAPER with an isolated config and confirmed `VocalProcess Bridge (VocalProcess)` in `reaper-vstplugins64.ini`.
 3. FL Studio 2024: partial. The bridge is installed under `C:\Program Files\Common Files\VST3`, and Plugin Manager launches, but no documented non-interactive scan command is available. Final FL registration should be done with Plugin Manager > Find installed plugins rather than editing FL's database files by hand.
-4. Melodyne/Celemony: considered as an import/edit workflow target. This machine's practical compatibility target is Melodyne 3.2 at `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe`. Use exported PCM WAV or DAW timeline output with Melodyne/ARA inside a compatible DAW.
+4. Melodyne/Celemony: considered as an import/edit workflow target. This machine's practical compatibility target is Melodyne 3.2 at `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe`. The standalone launch smoke passed, and generated full-timeline WAV handoff can be opened by argument. Use exported PCM WAV, full-length timeline lanes, or DAW timeline output with Melodyne/ARA inside a compatible DAW.
+5. VEGAS: current support is a generated file handoff. `export-vegas` writes Broadcast Wave timestamp clips and full-length fallback lanes; manual VEGAS import validation remains the next host-side check.
 
 Runtime optimization status:
 
@@ -115,6 +127,7 @@ Risks:
 ## Immediate Next Work
 
 1. Run the FL Studio Plugin Manager manual scan and confirm the bridge appears in the verified plug-in database.
-2. Test the bridge in the next available 64-bit hosts from the user list, prioritizing hosts that support normal VST3 scanning.
-3. Keep Melodyne support focused on rendered WAV/DAW timeline handoff unless a current Melodyne 3.x or 5.x ARA/SDK path becomes an explicit requirement.
-4. Add project exporters for confirmed hosts only.
+2. Manually import `export-vegas` BWF clips into VEGAS and confirm timestamp placement behavior in the installed VEGAS version.
+3. Continue testing the bridge in the next available 64-bit hosts from the user list, prioritizing hosts that support normal VST3 scanning.
+4. Keep Melodyne support focused on rendered WAV/DAW timeline handoff unless a current Melodyne 3.x or 5.x ARA/SDK path becomes an explicit requirement.
+5. Add project exporters for confirmed hosts only.

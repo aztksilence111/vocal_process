@@ -196,6 +196,33 @@ function Copy-DirectoryWithRobocopy {
     }
 }
 
+function Assert-FullModelRuntimeFiles {
+    param([string]$InternalRoot)
+
+    $RequiredFiles = @(
+        "torch\_C.cp311-win_amd64.pyd",
+        "torch\lib\c10.dll",
+        "torch\lib\torch.dll",
+        "torch\lib\torch_cpu.dll",
+        "torch\lib\torch_python.dll",
+        "torchaudio\__init__.py",
+        "whisper\__init__.py",
+        "faster_whisper\__init__.py"
+    )
+
+    $Missing = @()
+    foreach ($Relative in $RequiredFiles) {
+        $Path = Join-Path $InternalRoot $Relative
+        if (-not (Test-Path -LiteralPath $Path)) {
+            $Missing += $Relative
+        }
+    }
+
+    if ($Missing.Count -gt 0) {
+        throw "Full portable model runtime is incomplete. Missing: $($Missing -join ', ')"
+    }
+}
+
 $FfmpegRoot = Join-Path $env:ProgramData "chocolatey\lib\ffmpeg\tools\ffmpeg"
 $FfmpegBin = Join-Path $FfmpegRoot "bin"
 $FfmpegExe = Join-Path $FfmpegBin "ffmpeg.exe"
@@ -317,6 +344,7 @@ if ($BundleModelRuntime) {
         throw "PyInstaller internal directory not found: $InternalDir"
     }
     Copy-DirectoryWithRobocopy $SitePackages $InternalDir "Python site-packages"
+    Assert-FullModelRuntimeFiles $InternalDir
     $BundledSitePackages = $true
 }
 

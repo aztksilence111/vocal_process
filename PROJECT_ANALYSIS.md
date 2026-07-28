@@ -1000,3 +1000,178 @@ WhisperX and pyannote should be included in the default full Python 3.11 runtime
 
 1. Keep Melodyne smoke tests pointed at the 3.x executable path.
 2. Treat Melodyne as an editor/ARA workflow target rather than a generic host for the VST3 bridge.
+
+## 2026-07-27: Timeline Handoff Export for Melodyne and VEGAS
+
+### Decision
+
+The user clarified that the required Melodyne support is not using Melodyne as a VST3 host, but importing rendered audio while preserving the original time-axis relationship. The durable architecture is a shared timeline handoff layer, with host-specific output profiles generated from the same clip timeline data.
+
+### Implementation
+
+1. Added `audio_processor.handoff` as a common host handoff module.
+2. Added `export-melodyne`, which renders:
+   - `melodyne_full.wav` as the continuous timeline reference;
+   - full-length per-clip lane WAVs with leading silence before each clip;
+   - `melodyne_handoff.json` and `melodyne_handoff.csv`;
+   - the existing REAPER `.rpp`, `timeline.json`, `timeline.csv`, and stretched clip audio for deeper DAW editing.
+3. Added `export-vegas`, which renders the same complete reference/lane/manifest outputs and also writes Broadcast Wave timestamp clips under `vegas_bwf`.
+4. The BWF `time_reference` value is computed as `round(start_seconds * sample_rate)`, so timestamp placement remains tied to audio sample positions rather than approximate frame labels.
+
+### Verification
+
+1. Added unit tests for Melodyne lane rendering command construction, full-timeline duration trimming, VEGAS BWF timestamp metadata, and CLI command registration.
+2. Targeted unit tests passed for `TimelineHandoffTests` and `CliTests`.
+
+### Remaining Host-Side Work
+
+1. Manually import the generated `vegas_bwf` clips into VEGAS and confirm that the installed version places Broadcast Wave audio by timestamp as expected.
+2. Manually review Melodyne full-timeline/lane import behavior in Melodyne 3.2 after real user audio is available.
+
+## 2026-07-27: Portable Runtime Failure From Manual Test
+
+### User Report
+
+A remote/manual test on another machine failed during model-assisted material ordering. The first report's console and `.diagnostics.jsonl` both show the same fatal path:
+
+1. `inputs.reference.metadata_failed` appeared first as a warning. This means reference metadata probing failed but the batch was still allowed to continue.
+2. The actual fatal failure occurred during reference ASR: `Whisper transcription failed ... No module named 'torch._C'`.
+3. The material folder metadata collection had progressed, so the immediate failure was not material discovery; it was the bundled speech-recognition runtime.
+
+The second remote/manual test failed with a bare Windows message: `系统找不到指定的文件`. The diagnostics screenshot shows material metadata had been collected and the GUI displayed a raw system-level file-not-found message, which indicates an unwrapped external process start failure.
+
+### Root Cause Assessment
+
+`torch._C` is PyTorch's native extension. If Python can find the `torch` package but cannot import `torch._C`, the practical causes are:
+
+1. an incomplete portable package;
+2. using a `-lite` package for full model testing;
+3. copying only `VocalProcess.exe` without `_internal`;
+4. an extraction/antivirus failure that removed `_internal\torch\_C.cp311-win_amd64.pyd` or `torch\lib` DLLs.
+
+The local freshly rebuilt full package contains `_internal\torch\_C.cp311-win_amd64.pyd` and `torch\lib`, and the extracted no-VST3 full package passed the real portable model smoke test.
+
+The second failure is most consistent with OpenAI Whisper or WhisperX internally invoking `ffmpeg` by executable name. That call does not use `audio_processor.engine.resolve_tool()`. If a tester's machine has no FFmpeg on system PATH, Whisper can fail with a bare Windows `FileNotFoundError` even though the portable package contains `bin\ffmpeg.exe`.
+
+### Fixes
+
+1. Runtime availability now validates PyTorch's native extension, not just the presence of the `torch` package directory.
+2. ASR starts with a speech-runtime preflight. If all usable ASR backends are blocked by a broken native runtime, the batch fails before rendering with a direct portable-runtime message.
+3. Batch diagnostics now include `model.runtime.preflight`, recording ASR backend availability, torch native status, and model-cache state.
+4. `scripts\build_portable.ps1` now fails full-package builds if required torch/Whisper files are missing.
+5. Added `scripts\check_portable_runtime.ps1` for quick ZIP or extracted-directory validation before manual testing.
+6. The application now prepends bundled runtime tool directories such as `VocalProcess\bin` to process `PATH`, so third-party ASR libraries can start the packaged FFmpeg.
+7. Whisper/WhisperX `FileNotFoundError` is now rewritten as an explicit FFmpeg startup failure with a portable-folder check hint.
+
+### Remaining Validation
+
+1. Rebuild the full no-VST3 and VST3 packages after these changes.
+2. Run portable runtime check and model smoke against the rebuilt package.
+3. Upload refreshed Release assets so testers do not keep using a package that can produce the `torch._C` failure.
+
+## 2026-07-28: Cancel Semantics and Pronunciation-First Matching Target
+
+### Manual Test Finding
+
+The GUI can show "cancellation requested" while underlying work keeps running. The architectural issue is that cancellation was only reliably checked at queue boundaries and during FFmpeg progress loops. Long model phases, including reference transcription, material transcription, VAD, speaker embedding, and cached ordering preparation, did not receive a shared cancellation signal. FFmpeg progress processing also depended on progress stdout producing another line before the cancellation check ran.
+
+### Correction
+
+Cancellation must be treated as a cross-layer cooperative control signal:
+
+1. GUI owns the cancellation event.
+2. Batch passes `should_cancel` into every stage.
+3. Model runtime checks before and after expensive operations and while looping material clips.
+4. FFmpeg child processes are actively terminated/killed on cancellation.
+5. Diagnostics must record `batch.item.cancelled` rather than leaving users with an apparent running task.
+
+### Pronunciation Matching Direction
+
+The current v2 ordering engine already has score matrices, global assignment, and a phonetic score using `pypinyin`, but it is not strict enough for one-character/one-syllable materials. The next architecture target is pronunciation-first matching:
+
+1. Treat material filenames as high-value human labels. Chinese characters, pinyin, and romanized filenames must be converted to pronunciation units before scoring.
+2. Match pinyin/romanized filename units against the reference's Chinese text phonetic sequence, not only against literal transcript text.
+3. Use phonetic position as an ordering signal, so filenames like `wo.wav`, `shi.wav`, `ni.wav` can align to reference text `我是你`.
+4. Keep acoustic timing, duration, VAD, and speaker similarity as independent evidence. Filename pronunciation can be strong evidence, but low or conflicting acoustic evidence should still produce review diagnostics.
+5. Do not claim true 100% automatic accuracy. The implementation target is to make failures visible as `review_required` when the evidence is insufficient; real 100% requires manual confirmation or a stronger forced-alignment backend.
+
+### Open-Source Reference Assessment
+
+Typeless/OpenTypeless-like systems are relevant as speech-input product references, especially provider orchestration, personal vocabulary, and post-processing. They are not enough for this project's core because the project needs character-level audio-to-timeline alignment, not only speech-to-text.
+
+More directly relevant references are Chinese ASR and forced-alignment systems:
+
+1. FunASR / Paraformer-style timestamped Chinese ASR for character or sentence timing.
+2. Qwen3 ForcedAligner and CTC forced-alignment approaches for aligning known text to audio.
+3. Montreal Forced Aligner for dictionary/phoneme-aware forced alignment and confidence boundaries.
+4. WeNet-style CTC ASR as a future local Chinese recognition/alignment candidate.
+5. WhisperX and Faster Whisper as already-integrated multilingual ASR/alignment backends.
+
+### Active Implementation Plan
+
+1. Complete cancellation propagation through model runtime.
+2. Add pronunciation-position scoring for Chinese reference text versus pinyin/romanized material filenames.
+3. Raise the weight of filename pronunciation for short references while still requiring corroborating evidence for a strong confidence label.
+4. Extend diagnostics and tests around cancellation and pinyin filename ordering.
+5. Continue toward forced-alignment integration after this cancellation/matching reliability pass.
+
+### Implementation Result
+
+This pass treated cancellation reliability as required infrastructure for the two long-term core metrics: pronunciation-first material ordering and pronunciation-level stretch alignment to the reference timeline.
+
+Completed changes:
+
+1. Cancellation is now a shared cooperative signal across batch, model runtime, ASR, VAD, speaker embedding, source separation, and external FFmpeg/UVR subprocess boundaries.
+2. FFmpeg progress processes and UVR headless worker processes are actively terminated when cancellation is requested. In-process third-party model calls still cannot be interrupted mid-call, but every practical boundary before and after those calls now checks the signal.
+3. Material filename pronunciation evidence was upgraded from general phonetic similarity to phonetic position matching. Chinese reference text is converted to pinyin units and matched against Chinese, pinyin, or romanized material filename hints.
+4. Pinyin/romanized filename units are normalized by removing tone numbers and accepting common `v/u-umlaut/u` variants.
+5. The ordering diagnostics continue to expose `phonetic_score`, `text_position`, `reference_segment_index`, confidence labels, and target durations. A pinyin filename can now provide both a pronunciation match and an ordering position.
+6. Single reference segments matched to multiple per-character/per-syllable materials now produce split target durations based on their text/phonetic positions. This is the first durable bridge from ordering accuracy to pronunciation-level stretch alignment.
+7. Score-matrix diagnostics now include exact pinyin/phonetic units, phonetic positions, and pronunciation-position candidate counts. Repeated or homophone positions are downweighted instead of being treated as unique strong matches.
+8. Preflight warnings now include `ambiguous_phonetic_position` when a filename pronunciation matches multiple reference positions.
+9. Ordering reports include a `timeline_alignment` summary that identifies split reference segments.
+10. Added regression tests for:
+   - pinyin filename ordering against Chinese reference text;
+   - tone-number pinyin filename ordering;
+   - repeated/homophone phonetic position downweighting;
+   - ambiguous phonetic preflight warnings;
+   - cancellation stopping material analysis before VAD/speaker embedding continues;
+   - per-syllable target duration splitting from one reference segment;
+   - phonetic position/unit diagnostics and timeline split summaries.
+
+Verification:
+
+1. `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging` passed.
+2. `.venv311\Scripts\python.exe -m unittest discover` passed with 80 tests.
+3. `.venv311\Scripts\python.exe -m audio_processor check` passed and reported FFmpeg, UVR Headless Runner, Demucs, Faster Whisper, OpenAI Whisper, Silero VAD, SpeechBrain, WhisperX, pyannote.audio, and Librosa availability in the local Python 3.11 runtime.
+4. `git diff --check` reported no whitespace errors, only CRLF conversion warnings.
+5. Git commit is blocked in the active runtime because Git cannot create `.git\index.lock` even though a simple `.git` root write probe succeeds.
+6. The refreshed no-VST3 portable package was rebuilt and passed:
+   - portable runtime check;
+   - extracted startup smoke;
+   - model-assisted smoke with source separation skipped;
+   - bundled UVR worker smoke.
+7. The first VST3 portable ZIP build was interrupted by the 30-minute tool timeout after producing an incomplete about-234-MB ZIP. That file was renamed to `dist\VocalProcess-portable-vst3.broken-20260728-061407.zip` and must not be published.
+8. A later VST3-only portable build completed and produced `dist\VocalProcess-portable-vst3.zip`; that ZIP passed portable runtime check, extracted startup smoke, model smoke, and bundled UVR worker smoke.
+9. Native VST3 bridge probing is still blocked on this machine/session: `scripts\probe_vst3_bridge.ps1` fails during CMake compiler detection because MSBuild `Microsoft.Build.Utilities.FileTracker` raises `UnauthorizedAccessException` / `E_ACCESSDENIED`.
+
+Current architectural limits:
+
+1. Pinyin matching currently normalizes tone information for filename matching, so homophones such as `shi` still require acoustic/ASR/duration evidence or manual review.
+2. Target duration splitting assumes the available reference segment duration should be distributed by recognized text/pronunciation unit spans. This is a useful bridge, but true character start/end accuracy still requires stronger forced alignment.
+3. Third-party in-process ASR/Demucs calls cannot be killed mid-function safely. External FFmpeg and UVR worker processes can now be stopped promptly; future model workers should prefer subprocess or persistent-helper boundaries where cancellation must be hard.
+4. Full VST3 portable packaging has passed package-level runtime/model/UVR smoke, but host/native VST3 probing still needs an MSBuild-permission-clean environment before Release asset replacement.
+
+Next architecture direction:
+
+1. Add a stronger character-timing backend or optional stage, likely CTC/forced-alignment style, for Chinese text-to-audio alignment.
+2. Keep filename pronunciation as high-value human label evidence, but require corroborating acoustic evidence for high-confidence automatic decisions in ambiguous homophone cases.
+3. Expand diagnostics so manual testers can inspect exact pinyin units, position matches, and duration splits before rendering.
+
+### 2026-07-28 Real Test Follow-up
+
+1. The project now has a persistent real-test harness under `tests_real/` with tracked docs/examples and ignored audio/output directories, so real samples can be kept in place without polluting source control.
+2. `audio_processor.real_eval` now treats `origin_vocal` and `material_set` as a cross-product case source, while preserving CN/JP labeling from filenames and keeping caches under per-case output folders.
+3. The cache redirection matters operationally: material analysis cache no longer has to live beside the source audio, which keeps the real test corpus cleaner and makes it easier to swap or refresh audio without incidental cache churn.
+4. A real JP smoke case on `PlasticLove_JP__vmzJP` finished as `review_required`. That is a useful baseline rather than a defect: it shows the pipeline is conservative on live data and still expects review on many homophone-heavy material clips.
+5. The latest verification pass reached 86 unit/integration tests plus one full real smoke run, so the pronunciation-ordering and timeline-splitting changes are now covered by both synthetic and real corpus checks.

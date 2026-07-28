@@ -13,6 +13,20 @@
 
 ## 更新日志
 
+### 2026-07-27: 便携包 torch._C / Whisper FFmpeg 人工测试修复
+
+1. 针对人工测试中 `Whisper transcription failed ... No module named 'torch._C'` 的失败，模型运行时预检现在会真实验证 PyTorch 原生扩展，而不是只检查 `torch` 包目录是否存在。
+2. 批处理 diagnostics 新增 `model.runtime.preflight` 事件；如果便携包不完整、用错轻量包或解压时丢失 `_internal\torch`，日志会在排序前明确提示运行时问题。
+3. 完整便携包构建脚本现在会强制检查 `_internal\torch\_C.cp311-win_amd64.pyd`、`torch_cpu.dll`、`torch_python.dll` 等关键文件；缺失时构建直接失败。
+4. 新增 `scripts\check_portable_runtime.ps1`，用于人工测试前快速检查解压后的便携包或 ZIP 是否包含完整模型运行时。
+5. 便携启动时会把 `VocalProcess\bin` 注入进程 `PATH`，解决 OpenAI Whisper/WhisperX 这类第三方库自行调用 `ffmpeg` 时找不到包内 FFmpeg、只显示“系统找不到指定的文件”的问题。
+
+### 2026-07-27: Melodyne/Vegas 时间轴交接导出
+
+1. 新增 `export-melodyne` 命令，输出可直接打开的完整时间轴 WAV，并生成每个素材独立的全长 lane WAV。lane WAV 从 0 秒开始，素材开始前补静音，用于在 Melodyne 这类不读取外部 clip offset 的流程中保留听感时间轴。
+2. 新增 `export-vegas` 命令，在上述完整 WAV/lane WAV 之外额外写入 Broadcast Wave timestamp 片段，供 VEGAS 按音频时间戳放回原始时间轴位置。
+3. 新增 `audio_processor.handoff` 通用交接层，Melodyne、VEGAS 和后续宿主导出都复用同一套时间轴 manifest、CSV、lane 渲染和完整参考混音逻辑。
+
 ### 2026-07-27: Melodyne 3.x 适配目标
 
 1. Melodyne 验证目标改为本机可用的 Melodyne 3.x，不再把本机未正确安装或删除不完整的 Melodyne 4 当成适配结论。
@@ -59,6 +73,7 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 12. GUI 显示运行时长，支持 CPU/GPU 计算设备选择，并提供“自动判断 / 已是人声跳过分离 / 强制分离”按钮。
 13. 完整模型运行时包含 `faster-whisper`、`whisperx` 和 `pyannote.audio`；pyannote 预训练模型仍需要 Hugging Face token 和模型条款授权。
 14. 排序诊断包含全局评分矩阵、拼音/发音分数、证据计数和低置信度标记，便于人工测试前复核。
+15. 提供 Melodyne 和 VEGAS 时间轴交接导出；可生成完整参考 WAV、全长 lane WAV、manifest/CSV，并为 VEGAS 写入 BWF timestamp 片段。
 
 ## 环境要求
 
@@ -110,6 +125,14 @@ python -m audio_processor export-daw reference.wav materials reference_daw\refer
 python -m audio_processor batch reference.wav output.wav --material-directory materials --compute-device cpu --source-separation never --overwrite
 ```
 
+导出 Melodyne/VEGAS 时间轴交接文件：
+
+```powershell
+python -m audio_processor export-melodyne reference.wav materials handoff_melodyne --overwrite
+python -m audio_processor export-melodyne reference.wav materials handoff_melodyne --overwrite --open-melodyne --melodyne-exe "E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe"
+python -m audio_processor export-vegas reference.wav materials handoff_vegas --overwrite
+```
+
 查看模型候选和状态：
 
 ```powershell
@@ -120,6 +143,7 @@ python -m audio_processor models --json
 便携版真实模型烟测：
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check_portable_runtime.ps1 -ZipPath dist\VocalProcess-portable.zip
 powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_model.ps1
 powershell -ExecutionPolicy Bypass -File scripts\smoke_portable_uvr_worker.ps1
 ```
@@ -222,6 +246,35 @@ reference_daw\
 `reference.rpp` 是 REAPER 工程文件，包含参考音频轨和独立素材片段轨；`timeline.json` 和 `timeline.csv` 记录每个素材片段的源文件、输出文件、开始时间、目标时长和排序依据。
 如果 DAW 导出中出现完全相同的源素材、目标时长、Rubber Band tempo 和渲染参数，后续片段会复用已渲染 WAV，避免重复拉伸计算。
 
+Melodyne 时间轴交接导出会生成：
+
+```text
+handoff_melodyne\
+  melodyne_full.wav
+  melodyne_handoff.json
+  melodyne_handoff.csv
+  timeline.rpp
+  audio\
+    0001_clip.wav
+  melodyne_lanes\
+    0001_clip_melodyne_timeline.wav
+```
+
+`melodyne_full.wav` 是完整连续参考文件，可直接用 Melodyne 打开；`melodyne_lanes` 中的 WAV 是全时间轴长度，每个文件在素材进入前补静音，因此即使 Melodyne 不读取外部 clip offset，导入后也能按听感保留位置。
+
+VEGAS 时间轴交接导出会在同样的完整 WAV、lane WAV、manifest/CSV 之外生成：
+
+```text
+handoff_vegas\
+  vegas_full.wav
+  vegas_handoff.json
+  vegas_handoff.csv
+  vegas_bwf\
+    0001_clip_vegas_timestamp.wav
+```
+
+`vegas_bwf` 中的 WAV 写入 Broadcast Wave `time_reference` 元数据，用于 VEGAS 的按时间戳放置流程；如果宿主或导入设置没有启用该流程，则使用 `vegas_lanes` 作为保留时间轴的兜底导入方式。
+
 ## 已知限制
 
 1. 当前默认 ASR 模型是 Whisper `base`，在复杂歌曲、混响、伴奏很强或非清晰人声素材上仍可能转写不准。
@@ -319,4 +372,5 @@ Current local host results:
 2. REAPER 7.33 x64 scanned the bridge in an isolated config and cached it successfully.
 3. The bridge was installed to `C:\Program Files\Common Files\VST3\VocalProcess Bridge.vst3` for hosts that scan the common VST3 folder.
 4. FL Studio 2024 Plugin Manager can be launched, but no documented non-interactive scan command was found; use Plugin Manager > Find installed plugins for final FL registration.
-5. Melodyne 3.2 at `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe` launches successfully on this machine. Melodyne 3.x is the local compatibility target, and Melodyne remains a WAV/DAW/ARA workflow target rather than a generic host for this 64-bit VST3 bridge.
+5. Melodyne 3.2 at `E:\Program Files (x86)\Celemony\Melodyne.3.2\Melodyne.exe` launches successfully on this machine and can open a generated full-timeline WAV argument. Melodyne 3.x is the local compatibility target, and Melodyne remains a WAV/DAW/ARA workflow target rather than a generic host for this 64-bit VST3 bridge.
+6. VEGAS support is file-handoff based: `export-vegas` writes BWF timestamp clips plus full-length fallback lane WAVs for manual import validation.

@@ -17,7 +17,7 @@ from .engine import (
     process_audio_with_progress,
     render_material_stretch_plan,
 )
-from .model_runtime import build_model_ordering
+from .model_runtime import build_model_ordering, speech_runtime_preflight_report
 from .settings import ProcessingSettings
 
 
@@ -93,6 +93,8 @@ def run_batch_queue(
         )
 
         def progress_callback(progress: float, message: str) -> None:
+            if should_cancel is not None and should_cancel():
+                raise AudioProcessorError("Processing cancelled")
             item.progress = progress
             item.elapsed_seconds = _elapsed_since(item_started_at)
             item.message = message
@@ -102,8 +104,15 @@ def run_batch_queue(
 
         try:
             _log_input_diagnostics(diagnostics, item.input_path, settings)
+            if should_cancel is not None and should_cancel():
+                raise AudioProcessorError("Processing cancelled")
             options = settings.to_process_options(item.input_path, item.output_path)
             if settings.material_directory:
+                diagnostics.event(
+                    "model.runtime.preflight",
+                    "Speech recognition runtime checked before ordering",
+                    report=speech_runtime_preflight_report(settings.compute_device),
+                )
                 ordering = build_model_ordering(
                     item.input_path,
                     Path(settings.material_directory),
@@ -112,6 +121,7 @@ def run_batch_queue(
                     compute_device=settings.compute_device,
                     source_separation=settings.source_separation,
                     on_progress=progress_callback,
+                    should_cancel=should_cancel,
                 )
                 ordered_material_paths = list(ordering.ordered_paths)
                 ordered_material_texts = [decision.material_text for decision in ordering.decisions]

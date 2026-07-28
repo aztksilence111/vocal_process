@@ -11,3 +11,8 @@ venv/
 .venv/
 .venv311/
 .uvr-worker/
+tests_real/**
+!tests_real/
+!tests_real/.gitignore
+!tests_real/README.md
+!tests_real/cases.example.json
