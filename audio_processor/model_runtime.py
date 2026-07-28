@@ -25,6 +25,7 @@ from .model_assist import (
     MaterialAnalysis,
     MaterialOrderDecision,
     VoiceSegment,
+    _phonetic_units,
     list_model_candidates,
     plan_material_ordering,
     render_ordering_score_matrix,
@@ -1890,11 +1891,13 @@ def _render_timeline_alignment_summary(
         for segment_index, count in _positioned_decision_count_by_segment(decisions).items()
         if count > 1
     )
+    decision_details = _render_timeline_alignment_details(reference_segments, decisions, target_durations)
     return {
         "format": "vocal_process_timeline_alignment_summary_v1",
         "reference_segment_count": len(reference_segments),
         "decision_count": len(decisions),
         "positioned_decision_count": len(positioned_decisions),
+        "decision_details": decision_details,
         "split_reference_segment_indices": split_segment_indices,
         "resolved_target_duration_count": sum(1 for duration in target_durations if duration is not None),
         "target_duration_total_seconds": sum(float(duration or 0.0) for duration in target_durations),
@@ -1909,6 +1912,149 @@ def _render_timeline_alignment_summary(
         ),
         "mode": "phonetic_or_text_position_split" if split_segment_indices else "segment_or_weighted_duration",
     }
+
+
+def _render_timeline_alignment_details(
+    reference_segments: Sequence[VoiceSegment],
+    decisions: Sequence[MaterialOrderDecision],
+    target_durations: Sequence[float | None],
+) -> list[dict[str, Any]]:
+    details: list[dict[str, Any] | None] = [None for _ in decisions]
+    groups: dict[int, list[tuple[int, MaterialOrderDecision]]] = {}
+    for decision_index, decision in enumerate(decisions):
+        segment_index = decision.reference_segment_index
+        position = _decision_position(decision)
+        if segment_index is None or position is None:
+            continue
+        if not 0 <= segment_index < len(reference_segments):
+            continue
+        groups.setdefault(segment_index, []).append((decision_index, decision))
+
+    for segment_index, group in groups.items():
+        segment = reference_segments[segment_index]
+        if segment.duration_seconds <= 0:
+            continue
+
+        max_position = max(max(_decision_position(decision) or 0, 0) for _, decision in group)
+        unit_count = max(len(_timeline_units(segment.text)), max_position + 1, len(group), 1)
+        complete_position_cover = len(group) >= unit_count
+        ordered_group = sorted(group, key=lambda item: (_decision_position(item[1]) or 0, item[1].rank))
+        for group_index, (decision_index, decision) in enumerate(ordered_group):
+            decision_path = _decision_path(decision)
+            position = max(_decision_position(decision) or 0, 0)
+            start_unit = min(position, unit_count - 1)
+            next_start = None
+            if group_index + 1 < len(ordered_group):
+                next_position = _decision_position(ordered_group[group_index + 1][1])
+                if next_position is not None and next_position > start_unit:
+                    next_start = min(next_position, unit_count)
+
+            material_units = _decision_timeline_unit_count(decision)
+            if next_start is not None:
+                end_unit = next_start
+            elif complete_position_cover and group_index == len(ordered_group) - 1:
+                end_unit = unit_count
+            else:
+                end_unit = start_unit + material_units
+
+            span_units = max(min(end_unit, unit_count) - start_unit, 1)
+            target_duration = target_durations[decision_index]
+            reference_text_units = list(_timeline_units(segment.text))
+            reference_phonetic_units = list(_phonetic_units(segment.text))
+            material_text = decision.material_text or decision_path.stem
+            material_text_units = list(_timeline_units(material_text))
+            material_phonetic_units = list(_phonetic_units(material_text))
+            details[decision_index] = {
+                "rank": decision.rank,
+                "source_path": str(decision_path),
+                "source_filename": decision_path.name,
+                "reference_segment_index": segment_index,
+                "reference_segment_text": segment.text,
+                "reference_text_units": reference_text_units,
+                "reference_phonetic_units": reference_phonetic_units,
+                "source_filename_units": list(_timeline_units(decision_path.stem)),
+                "source_filename_phonetic_units": list(_phonetic_units(decision_path.stem)),
+                "material_text": decision.material_text,
+                "material_text_units": material_text_units,
+                "material_phonetic_units": material_phonetic_units,
+                "position_mode": "text_position" if decision.text_position is not None else "phonetic_position",
+                "text_position": decision.text_position,
+                "phonetic_position": decision.phonetic_position,
+                "phonetic_position_count": decision.phonetic_position_count,
+                "phonetic_tone_position": decision.phonetic_tone_position,
+                "phonetic_tone_position_count": decision.phonetic_tone_position_count,
+                "phonetic_span_units": decision.phonetic_span_units,
+                "reference_segment_unit_count": unit_count,
+                "position_unit_start": start_unit,
+                "position_unit_end": end_unit,
+                "position_unit_span": span_units,
+                "complete_position_cover": complete_position_cover,
+                "segment_duration_seconds": segment.duration_seconds,
+                "target_duration_seconds": target_duration,
+                "target_duration_ratio": (
+                    float(target_duration) / segment.duration_seconds
+                    if target_duration is not None and segment.duration_seconds > 0
+                    else None
+                ),
+                "score": decision.score,
+                "confidence_label": decision.confidence_label,
+                "reason": decision.reason,
+            }
+
+    for decision_index, decision in enumerate(decisions):
+        if details[decision_index] is not None:
+            continue
+        decision_path = _decision_path(decision)
+        segment = (
+            reference_segments[decision.reference_segment_index]
+            if decision.reference_segment_index is not None
+            and 0 <= decision.reference_segment_index < len(reference_segments)
+            else None
+        )
+        material_text = decision.material_text or decision_path.stem
+        details[decision_index] = {
+            "rank": decision.rank,
+            "source_path": str(decision_path),
+            "source_filename": decision_path.name,
+            "reference_segment_index": decision.reference_segment_index,
+            "reference_segment_text": segment.text if segment is not None else "",
+            "reference_text_units": list(_timeline_units(segment.text)) if segment is not None else [],
+            "reference_phonetic_units": list(_phonetic_units(segment.text)) if segment is not None else [],
+            "source_filename_units": list(_timeline_units(decision_path.stem)),
+            "source_filename_phonetic_units": list(_phonetic_units(decision_path.stem)),
+            "material_text": decision.material_text,
+            "material_text_units": list(_timeline_units(material_text)),
+            "material_phonetic_units": list(_phonetic_units(material_text)),
+            "position_mode": "weighted_duration",
+            "text_position": decision.text_position,
+            "phonetic_position": decision.phonetic_position,
+            "phonetic_position_count": decision.phonetic_position_count,
+            "phonetic_tone_position": decision.phonetic_tone_position,
+            "phonetic_tone_position_count": decision.phonetic_tone_position_count,
+            "phonetic_span_units": decision.phonetic_span_units,
+            "reference_segment_unit_count": len(_timeline_units(segment.text)) if segment is not None else 0,
+            "position_unit_start": None,
+            "position_unit_end": None,
+            "position_unit_span": None,
+            "complete_position_cover": False,
+            "segment_duration_seconds": segment.duration_seconds if segment is not None else None,
+            "target_duration_seconds": target_durations[decision_index],
+            "target_duration_ratio": None,
+            "score": decision.score,
+            "confidence_label": decision.confidence_label,
+            "reason": decision.reason,
+        }
+
+    return [detail for detail in details if detail is not None]
+
+
+def _decision_path(decision: Any) -> Path:
+    path = getattr(decision, "source_path", None)
+    if path is None:
+        path = getattr(decision, "material_path", None)
+    if path is None:
+        raise AttributeError("Decision is missing a source or material path")
+    return Path(path)
 
 
 def _positioned_decision_count_by_segment(

@@ -1411,6 +1411,12 @@ class ModelRuntimeTests(unittest.TestCase):
         summary = model_runtime._render_timeline_alignment_summary(reference_segments, decisions, target_durations)
         self.assertEqual(summary["mode"], "phonetic_or_text_position_split")
         self.assertEqual(summary["split_reference_segment_indices"], [0])
+        self.assertEqual(len(summary["decision_details"]), 3)
+        self.assertEqual(summary["decision_details"][0]["source_filename_phonetic_units"], ["wo"])
+        self.assertEqual(summary["decision_details"][0]["reference_phonetic_units"], ["wo", "shi", "ni"])
+        self.assertEqual(summary["decision_details"][0]["position_mode"], "text_position")
+        self.assertEqual(summary["decision_details"][0]["position_unit_span"], 1)
+        self.assertEqual(summary["decision_details"][0]["target_duration_seconds"], 1.0)
 
     def test_preflight_warns_when_filename_pronunciation_matches_multiple_positions(self) -> None:
         decision = model_runtime.OrderingDecision(
