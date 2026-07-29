@@ -1261,3 +1261,21 @@ Next technical target:
 1. Repair the WhisperX/Faster-Whisper model-cache path or machine certificate trust for Hugging Face access.
 2. Once rendered eval reaches real analysis again, compare `timed_target_duration_ratio`, `aligned_timing_score`, `missing_aligned_unit_timing`, match scores, and group summaries before changing ordering or timing algorithms.
 3. Continue improving pinyin/romanized filename matching and pronunciation-level timeline allocation only against actual rendered-eval evidence, not against infrastructure-blocked summaries.
+
+### 2026-07-29: CN/JP Language Compatibility Boundary
+
+The matching pipeline must not treat Chinese and Japanese material sets as interchangeable evidence. CN/JP material-language compatibility is now a gating condition before expensive material analysis and before real-eval scoring.
+
+Current behavior:
+
+1. `build_model_ordering()` checks reference/material language compatibility before material-library analysis. If both sides are confidently identified as different CN/JP languages, it raises `AudioProcessorError` with a `Language mismatch` message.
+2. Reference language evidence can come from explicit filename markers, lyrics text, ASR language notes, or transcript text. Material-set evidence can come from directory markers, kana/CJK filenames, pinyin tone markers, and distinctive Chinese/Japanese romanized filename patterns.
+3. Unknown language remains allowed instead of being hard-failed, because false positives would block valid custom assets. The hard gate applies only when both sides have confident CN/JP evidence and disagree.
+4. `real_eval` filters automatically discovered mismatches into `skipped_cases` and writes the skip table to the Markdown report, so skipped combinations remain auditable without spending ASR/render time.
+5. Current real corpus discovery result: 13 executable compatible cases, 15 skipped `language_mismatch` cases. This prevents `PlasticLove_JP`, `kamippoina_JP`, `LAB=01_JP`, and `1000nenyikiteru_JP` from being evaluated against Chinese material sets.
+
+Acceptance impact:
+
+1. Future ordering/timing score improvements must be measured on language-compatible groups only.
+2. A user-created mismatch during normal GUI/CLI/batch testing should fail fast with a language mismatch error instead of producing a misleading rendered output.
+3. Long autonomous runs should include skipped-case counts in human-readable reports so reviewers can distinguish intentional filtering from missing test coverage.

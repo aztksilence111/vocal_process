@@ -14,6 +14,7 @@ from unittest.mock import patch
 from audio_processor import model_runtime, preflight
 from audio_processor import maintenance
 from audio_processor import real_eval
+from audio_processor import tls
 from audio_processor.batch import BatchSummary, create_queue, run_batch_queue
 from audio_processor.cli import build_parser
 from audio_processor.cli import main as cli_main
@@ -864,7 +865,7 @@ class DiagnosticsTests(unittest.TestCase):
 
 
 class RealEvalTests(unittest.TestCase):
-    def test_discovers_cross_product_real_cases_without_tracking_audio_assets(self) -> None:
+    def test_discovers_language_compatible_real_cases_without_tracking_audio_assets(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             origin = root / "origin_vocal"
@@ -879,14 +880,50 @@ class RealEvalTests(unittest.TestCase):
             _write_test_wave(material_root / "vmzJP" / "a.wav")
             (lyrics / "song_CN.lrc").write_text("[00:00.00]\u6211\n", encoding="utf-8")
 
-            cases = real_eval.discover_real_cases(root)
+            cases, skipped_cases = real_eval.discover_real_cases_with_skips(root)
             manifest_path = real_eval.write_manifest_template(root, root / "cases.generated.json")
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-        self.assertEqual([case.name for case in cases], ["song_CN__vmzCN", "song_CN__vmzJP"])
+        self.assertEqual([case.name for case in cases], ["song_CN__vmzCN"])
+        self.assertEqual([case.name for case in skipped_cases], ["song_CN__vmzJP"])
+        self.assertEqual(skipped_cases[0].reason, "language_mismatch")
+        self.assertEqual(skipped_cases[0].language_compatibility["reference_language"], "CN")
+        self.assertEqual(skipped_cases[0].language_compatibility["material_set_language"], "JP")
         self.assertTrue(all(case.language == "CN" for case in cases))
-        self.assertEqual(len(manifest["cases"]), 2)
+        self.assertEqual(len(manifest["cases"]), 1)
+        self.assertEqual(len(manifest["skipped_cases"]), 1)
         self.assertEqual({entry["language"] for entry in manifest["cases"]}, {"CN"})
+
+    def test_real_eval_reports_skipped_language_mismatches_without_running_preflight(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzCN"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            _write_test_wave(origin / "song_JP.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "wo.wav", duration_seconds=1.0)
+
+            with patch(
+                "audio_processor.real_eval.speech_runtime_preflight_report",
+                return_value={"preferred_backend": "whisperx", "available": True, "issue": ""},
+            ):
+                with patch("audio_processor.real_eval.build_preflight_report") as preflight_mock:
+                    result = real_eval.run_real_suite(root, render=False, output_root=root / "reports")
+
+            summary_payload = json.loads(result.summary_path.read_text(encoding="utf-8"))
+            markdown = result.markdown_path.read_text(encoding="utf-8")
+
+        preflight_mock.assert_not_called()
+        self.assertEqual(result.cases, ())
+        self.assertEqual(len(result.skipped_cases), 1)
+        self.assertEqual(summary_payload["suite"]["planned_case_count"], 0)
+        self.assertEqual(summary_payload["suite"]["discovered_case_count"], 1)
+        self.assertEqual(summary_payload["suite"]["skipped_case_counts"], {"language_mismatch": 1})
+        self.assertEqual(summary_payload["skipped_cases"][0]["language_compatibility"]["reference_language"], "JP")
+        self.assertEqual(summary_payload["skipped_cases"][0]["language_compatibility"]["material_set_language"], "CN")
+        self.assertIn("Skipped Cases", markdown)
+        self.assertIn("language_mismatch", markdown)
 
     def test_rendered_real_eval_scores_output_duration_and_matching(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1640,6 +1677,188 @@ class ModelRuntimeTests(unittest.TestCase):
                 cache_root = model_runtime._model_cache_root()
 
         self.assertEqual(cache_root, fallback)
+
+    def test_python_https_trust_respects_existing_ca_bundle(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing = root / "existing.pem"
+            existing.write_text("existing", encoding="utf-8")
+
+            with patch.dict(os.environ, {"REQUESTS_CA_BUNDLE": str(existing)}, clear=True):
+                with patch("audio_processor.tls._windows_certificate_entries", side_effect=AssertionError):
+                    result = tls.ensure_python_https_trust(root / "tls")
+
+        self.assertEqual(result, existing)
+
+    def test_python_https_trust_exports_windows_ca_bundle(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("audio_processor.tls._certifi_bundle_bytes", return_value=b"BASE\n"):
+                    with patch("audio_processor.tls._windows_certificate_entries", return_value=(b"one", b"one", b"two")):
+                        result = tls.ensure_python_https_trust(root / "tls")
+                env_snapshot = {
+                    "REQUESTS_CA_BUNDLE": os.environ.get("REQUESTS_CA_BUNDLE"),
+                    "SSL_CERT_FILE": os.environ.get("SSL_CERT_FILE"),
+                    "CURL_CA_BUNDLE": os.environ.get("CURL_CA_BUNDLE"),
+                }
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            bundle_text = result.read_text(encoding="ascii")
+
+        self.assertIn("BASE", bundle_text)
+        self.assertEqual(bundle_text.count("BEGIN CERTIFICATE"), 2)
+        self.assertEqual(env_snapshot["REQUESTS_CA_BUNDLE"], str(result))
+        self.assertEqual(env_snapshot["SSL_CERT_FILE"], str(result))
+        self.assertEqual(env_snapshot["CURL_CA_BUNDLE"], str(result))
+
+    def test_faster_whisper_cache_requires_nonempty_required_files(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot = root / "models--Systran--faster-whisper-base" / "snapshots" / "rev"
+            snapshot.mkdir(parents=True)
+            for filename in ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"):
+                (snapshot / filename).write_text("x", encoding="utf-8")
+
+            self.assertEqual(model_runtime._find_complete_faster_whisper_snapshot(root), snapshot)
+            (snapshot / "model.bin").write_bytes(b"")
+
+            self.assertIsNone(model_runtime._find_complete_faster_whisper_snapshot(root))
+
+    def test_faster_whisper_model_source_uses_complete_local_snapshot(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot = root / "models--Systran--faster-whisper-base" / "snapshots" / "rev"
+            snapshot.mkdir(parents=True)
+            for filename in ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt"):
+                (snapshot / filename).write_text("x", encoding="utf-8")
+
+            with patch.dict(os.environ, {"VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD": "1"}, clear=False):
+                with patch("audio_processor.model_runtime._prepare_faster_whisper_snapshot") as prepare_mock:
+                    source = model_runtime._faster_whisper_model_source("base", root)
+
+        self.assertEqual(source, snapshot)
+        prepare_mock.assert_not_called()
+
+    def test_prepare_faster_whisper_snapshot_cleans_zero_byte_cache_and_prefetches_serially(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            broken = root / "models--Systran--faster-whisper-base" / "snapshots" / "old"
+            broken.mkdir(parents=True)
+            (broken / "config.json").write_bytes(b"")
+            downloaded: list[str] = []
+
+            def fake_download(repo_id: str, filename: str, *, cache_dir: str, local_files_only: bool) -> str:
+                self.assertEqual(repo_id, "Systran/faster-whisper-base")
+                self.assertFalse(local_files_only)
+                downloaded.append(filename)
+                snapshot = Path(cache_dir) / "models--Systran--faster-whisper-base" / "snapshots" / "rev"
+                snapshot.mkdir(parents=True, exist_ok=True)
+                target = snapshot / filename
+                target.write_text("x", encoding="utf-8")
+                return str(target)
+
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("audio_processor.model_runtime._ensure_model_download_tls", return_value=None):
+                    with patch("audio_processor.model_runtime._faster_whisper_repo_id", return_value="Systran/faster-whisper-base"):
+                        with patch("huggingface_hub.list_repo_files", return_value=[
+                            "README.md",
+                            "config.json",
+                            "model.bin",
+                            "tokenizer.json",
+                            "vocabulary.txt",
+                        ]):
+                            with patch("huggingface_hub.hf_hub_download", side_effect=fake_download):
+                                result = model_runtime._prepare_faster_whisper_snapshot("base", root)
+
+        self.assertIsNotNone(result)
+        self.assertFalse((broken / "config.json").exists())
+        self.assertEqual(downloaded, ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"])
+
+    def test_material_set_language_heuristic_detects_chinese_pinyin_assets(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            material_dir = Path(temp_dir) / "materials"
+            material_dir.mkdir()
+            for filename in ("wo3.wav", "zhong1.wav", "guo2.wav", "xiang.wav", "bang.wav"):
+                _write_test_wave(material_dir / filename)
+
+            language = model_runtime.infer_material_set_language(material_dir)
+
+        self.assertEqual(language, "CN")
+
+    def test_build_model_ordering_rejects_explicit_reference_material_language_mismatch(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "song_JP.wav"
+            material_dir = root / "vmzCN"
+            material_dir.mkdir()
+            _write_test_wave(reference)
+            _write_test_wave(material_dir / "wo.wav")
+
+            with patch("audio_processor.model_runtime.analyze_reference") as analyze_reference_mock:
+                with self.assertRaisesRegex(AudioProcessorError, "Language mismatch.*JP.*CN"):
+                    model_runtime.build_model_ordering(
+                        reference,
+                        material_dir,
+                        compute_device="cpu",
+                        source_separation="never",
+                    )
+
+        analyze_reference_mock.assert_not_called()
+
+    def test_build_model_ordering_rejects_lyrics_detected_reference_material_language_mismatch(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            lyrics = root / "reference.lrc"
+            material_dir = root / "vmzCN"
+            material_dir.mkdir()
+            _write_test_wave(reference)
+            _write_test_wave(material_dir / "wo.wav")
+            lyrics.write_text("[00:00.00]\u3053\u3093\u306b\u3061\u306f\n", encoding="utf-8")
+
+            with patch("audio_processor.model_runtime.analyze_reference") as analyze_reference_mock:
+                with self.assertRaisesRegex(AudioProcessorError, "Language mismatch.*JP.*CN"):
+                    model_runtime.build_model_ordering(
+                        reference,
+                        material_dir,
+                        lyrics_file=lyrics,
+                        compute_device="cpu",
+                        source_separation="never",
+                    )
+
+        analyze_reference_mock.assert_not_called()
+
+    def test_build_model_ordering_rejects_asr_detected_reference_material_language_mismatch(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material_dir = root / "vmzCN"
+            material_dir.mkdir()
+            _write_test_wave(reference)
+            _write_test_wave(material_dir / "wo.wav")
+            reference_analysis = model_runtime.ReferenceAnalysis(
+                source_path=reference,
+                vocal_path=reference,
+                transcript="\u3053\u3093\u306b\u3061\u306f",
+                segments=(VoiceSegment(0.0, 1.0, "\u3053\u3093\u306b\u3061\u306f"),),
+                speaker_embedding=None,
+                backend="fake",
+                notes=("language=ja",),
+            )
+
+            with patch("audio_processor.model_runtime.analyze_reference", return_value=reference_analysis):
+                with patch("audio_processor.model_runtime.analyze_material_library") as material_library_mock:
+                    with self.assertRaisesRegex(AudioProcessorError, "Language mismatch.*JP.*CN"):
+                        model_runtime.build_model_ordering(
+                            reference,
+                            material_dir,
+                            compute_device="cpu",
+                            source_separation="never",
+                        )
+
+        material_library_mock.assert_not_called()
 
     def test_default_material_cache_dir_uses_work_root_not_source_folder(self) -> None:
         with TemporaryDirectory() as temp_dir:

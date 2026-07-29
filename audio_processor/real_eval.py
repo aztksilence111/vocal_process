@@ -11,7 +11,11 @@ from typing import Any, Callable, Iterable, Sequence
 from .batch import QueueItem, run_batch_queue
 from .engine import get_audio_duration_seconds, list_audio_files, probe_audio
 from .diagnostics import diagnostic_log_path
-from .model_runtime import speech_runtime_preflight_report
+from .model_runtime import (
+    infer_cn_jp_language_from_name,
+    reference_material_language_compatibility,
+    speech_runtime_preflight_report,
+)
 from .preflight import LOW_MATCH_SCORE, build_preflight_report
 from .settings import ProcessingSettings
 
@@ -52,6 +56,19 @@ class RealCaseResult:
 
 
 @dataclass(frozen=True)
+class SkippedRealCase:
+    name: str
+    reference_path: Path
+    material_directory: Path
+    lyrics_file: Path | None
+    output_directory: Path
+    split: str
+    language: str
+    reason: str
+    language_compatibility: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class RealSuiteResult:
     root: Path
     report_directory: Path
@@ -59,12 +76,22 @@ class RealSuiteResult:
     cases: tuple[RealCaseResult, ...]
     summary_path: Path
     markdown_path: Path
+    skipped_cases: tuple[SkippedRealCase, ...] = ()
 
 
 def discover_real_cases(root: Path, *, manifest_path: Path | None = None) -> list[RealCase]:
+    cases, _skipped_cases = discover_real_cases_with_skips(root, manifest_path=manifest_path)
+    return cases
+
+
+def discover_real_cases_with_skips(
+    root: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> tuple[list[RealCase], list[SkippedRealCase]]:
     root = root.expanduser()
     if manifest_path is not None and manifest_path.exists():
-        return _load_cases_from_manifest(root, manifest_path)
+        return _filter_language_compatible_cases(_load_cases_from_manifest(root, manifest_path))
 
     origin_root = root / "origin_vocal"
     material_root = root / "material_set"
@@ -91,7 +118,7 @@ def discover_real_cases(root: Path, *, manifest_path: Path | None = None) -> lis
                     language=language,
                 )
             )
-    return cases
+    return _filter_language_compatible_cases(cases)
 
 
 def run_real_suite(
@@ -107,13 +134,15 @@ def run_real_suite(
     output_root: Path | None = None,
 ) -> RealSuiteResult:
     root = root.expanduser()
-    cases = discover_real_cases(root, manifest_path=manifest_path)
+    cases, skipped_cases = discover_real_cases_with_skips(root, manifest_path=manifest_path)
     if case_filter:
         lowered = case_filter.lower()
         cases = [case for case in cases if lowered in case.name.lower()]
+        skipped_cases = [case for case in skipped_cases if lowered in case.name.lower()]
     if split_filter:
         lowered_split = split_filter.lower()
         cases = [case for case in cases if case.split.lower() == lowered_split]
+        skipped_cases = [case for case in skipped_cases if case.split.lower() == lowered_split]
     if max_cases is not None:
         cases = cases[: max(0, max_cases)]
 
@@ -133,6 +162,7 @@ def run_real_suite(
         results=results,
         planned_case_count=planned_case_count,
         runtime_preflight=runtime_preflight,
+        skipped_cases=skipped_cases,
     )
     _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
     for case_index, case in enumerate(cases):
@@ -175,6 +205,7 @@ def run_real_suite(
                 results=results,
                 planned_case_count=planned_case_count,
                 runtime_preflight=runtime_preflight,
+                skipped_cases=skipped_cases,
             )
             _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
             if _report_has_infrastructure_blocker(report):
@@ -215,6 +246,7 @@ def run_real_suite(
                     results=results,
                     planned_case_count=planned_case_count,
                     runtime_preflight=runtime_preflight,
+                    skipped_cases=skipped_cases,
                 )
                 _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
                 break
@@ -281,6 +313,7 @@ def run_real_suite(
             results=results,
             planned_case_count=planned_case_count,
             runtime_preflight=runtime_preflight,
+            skipped_cases=skipped_cases,
         )
         _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
 
@@ -291,6 +324,7 @@ def run_real_suite(
         results=results,
         planned_case_count=planned_case_count,
         runtime_preflight=runtime_preflight,
+        skipped_cases=skipped_cases,
     )
     _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
     return RealSuiteResult(
@@ -300,13 +334,14 @@ def run_real_suite(
         cases=tuple(results),
         summary_path=summary_path,
         markdown_path=markdown_path,
+        skipped_cases=tuple(skipped_cases),
     )
 
 
 def write_manifest_template(root: Path, destination: Path) -> Path:
     root = root.expanduser()
     destination = destination.expanduser()
-    cases = discover_real_cases(root)
+    cases, skipped_cases = discover_real_cases_with_skips(root)
     payload = {
         "format": REAL_CASE_FORMAT,
         "cases": [
@@ -322,6 +357,7 @@ def write_manifest_template(root: Path, destination: Path) -> Path:
             }
             for case in cases
         ],
+        "skipped_cases": [_skipped_case_payload(case) for case in skipped_cases],
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -394,6 +430,58 @@ def _load_cases_from_manifest(root: Path, manifest_path: Path) -> list[RealCase]
     return cases
 
 
+def _filter_language_compatible_cases(cases: Sequence[RealCase]) -> tuple[list[RealCase], list[SkippedRealCase]]:
+    compatible_cases: list[RealCase] = []
+    skipped_cases: list[SkippedRealCase] = []
+    material_paths_by_directory: dict[Path, list[Path]] = {}
+    for case in cases:
+        material_key = case.material_directory.expanduser()
+        if material_key not in material_paths_by_directory:
+            try:
+                material_paths_by_directory[material_key] = list_audio_files(case.material_directory)
+            except Exception:
+                material_paths_by_directory[material_key] = []
+        material_paths = material_paths_by_directory[material_key]
+        compatibility = reference_material_language_compatibility(
+            case.reference_path,
+            case.material_directory,
+            lyrics_file=case.lyrics_file,
+            material_paths=material_paths,
+            reference_language=case.language,
+        )
+        if compatibility.get("status") == "mismatch":
+            skipped_cases.append(
+                SkippedRealCase(
+                    name=case.name,
+                    reference_path=case.reference_path,
+                    material_directory=case.material_directory,
+                    lyrics_file=case.lyrics_file,
+                    output_directory=case.output_directory,
+                    split=case.split,
+                    language=case.language,
+                    reason="language_mismatch",
+                    language_compatibility=compatibility,
+                )
+            )
+            continue
+        compatible_cases.append(case)
+    return compatible_cases, skipped_cases
+
+
+def _skipped_case_payload(case: SkippedRealCase) -> dict[str, Any]:
+    return {
+        "name": case.name,
+        "split": case.split,
+        "language": case.language,
+        "reference": str(case.reference_path),
+        "material_directory": str(case.material_directory),
+        "lyrics_file": str(case.lyrics_file) if case.lyrics_file else "",
+        "output_directory": str(case.output_directory),
+        "reason": case.reason,
+        "language_compatibility": case.language_compatibility,
+    }
+
+
 def _resolve_manifest_path(root: Path, value: str) -> Path:
     path = Path(value)
     if path.is_absolute():
@@ -422,8 +510,7 @@ def _find_lyrics_file(lyrics_root: Path, stem: str) -> Path | None:
 
 
 def _infer_language(stem: str) -> str:
-    match = re.search(r"_(CN|JP)$", stem, flags=re.IGNORECASE)
-    return match.group(1).upper() if match else ""
+    return infer_cn_jp_language_from_name(stem)
 
 
 def _suite_summary(
@@ -434,6 +521,7 @@ def _suite_summary(
     results: Sequence[RealCaseResult],
     planned_case_count: int,
     runtime_preflight: dict[str, Any],
+    skipped_cases: Sequence[SkippedRealCase],
 ) -> dict[str, Any]:
     infrastructure_blocker = _suite_infrastructure_blocker(
         results,
@@ -448,6 +536,10 @@ def _suite_summary(
         "case_count": len(results),
         "completed_case_count": len(results),
         "planned_case_count": planned_case_count,
+        "discovered_case_count": planned_case_count + len(skipped_cases),
+        "skipped_case_count": len(skipped_cases),
+        "skipped_case_counts": _count_by((case.reason for case in skipped_cases)),
+        "skipped_cases": [_skipped_case_payload(case) for case in skipped_cases],
         "split_counts": _count_by((result.case.split for result in results)),
         "language_counts": _count_by((result.case.language or "unknown" for result in results)),
         "status_counts": _count_by((result.status for result in results)),
@@ -470,12 +562,14 @@ def _write_suite_outputs(
     suite_summary: dict[str, Any],
     results: Sequence[RealCaseResult],
 ) -> None:
+    skipped_cases = suite_summary.get("skipped_cases", [])
     summary_path.write_text(
         json.dumps(
             {
                 "format": REAL_REPORT_FORMAT,
                 "suite": suite_summary,
                 "cases": [_case_result_payload(result) for result in results],
+                "skipped_cases": skipped_cases if isinstance(skipped_cases, list) else [],
             },
             ensure_ascii=False,
             indent=2,
@@ -617,6 +711,8 @@ def _analysis_failure_warning(exc: Exception) -> dict[str, Any]:
 
 def _analysis_failure_kind(message: str) -> str:
     lowered = message.lower()
+    if "language mismatch" in lowered:
+        return "language_mismatch"
     if "local model cache not found and downloads are not enabled" in lowered:
         return "asr_model_cache_missing"
     if (
@@ -1141,6 +1237,8 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         f"- Render: `{summary['render']}`",
         f"- Completed cases: `{summary.get('completed_case_count', summary['case_count'])}` / "
         f"`{summary.get('planned_case_count', summary['case_count'])}`",
+        f"- Skipped cases: `{summary.get('skipped_case_count', 0)}` / "
+        f"`{summary.get('discovered_case_count', summary.get('planned_case_count', summary['case_count']))}`",
         "",
         "## Counts",
         "",
@@ -1148,10 +1246,13 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         f"- Language counts: `{json.dumps(summary['language_counts'], ensure_ascii=False)}`",
         f"- Status counts: `{json.dumps(summary['status_counts'], ensure_ascii=False)}`",
         f"- Warning counts: `{json.dumps(summary['warning_counts'], ensure_ascii=False)}`",
+        f"- Skipped counts: `{json.dumps(summary.get('skipped_case_counts', {}), ensure_ascii=False)}`",
         f"- Score summary: `{json.dumps(summary.get('score_summary', {}), ensure_ascii=False)}`",
         f"- Infrastructure blocker: `{json.dumps(summary.get('infrastructure_blocker', {}), ensure_ascii=False)}`",
         "",
         *_render_group_score_markdown(summary),
+        "",
+        *_render_skipped_cases_markdown(summary),
         "",
         "## Cases",
         "",
@@ -1185,6 +1286,31 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         )
     lines.append("")
     return "\n".join(lines)
+
+
+def _render_skipped_cases_markdown(summary: dict[str, Any]) -> list[str]:
+    skipped_cases = summary.get("skipped_cases", [])
+    if not isinstance(skipped_cases, list) or not skipped_cases:
+        return []
+    lines = [
+        "## Skipped Cases",
+        "",
+        "| Case | Split | Reference Lang | Material Lang | Reason | Message |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for case in skipped_cases:
+        if not isinstance(case, dict):
+            continue
+        compatibility = case.get("language_compatibility", {})
+        if not isinstance(compatibility, dict):
+            compatibility = {}
+        lines.append(
+            f"| {case.get('name', '')} | {case.get('split', '')} | "
+            f"{compatibility.get('reference_language') or 'unknown'} | "
+            f"{compatibility.get('material_set_language') or 'unknown'} | "
+            f"{case.get('reason', '')} | {_markdown_value(compatibility.get('message', ''))} |"
+        )
+    return lines
 
 
 def _render_group_score_markdown(summary: dict[str, Any]) -> list[str]:

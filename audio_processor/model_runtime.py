@@ -4,6 +4,7 @@ import importlib.util
 import importlib
 import contextlib
 from collections import namedtuple
+import fnmatch
 import hashlib
 import io
 import json
@@ -32,6 +33,7 @@ from .model_assist import (
     render_ordering_score_matrix,
 )
 from .settings import get_config_dir
+from .tls import ensure_python_https_trust
 from .uvr_worker import (
     find_uvr_vocal_output,
     make_uvr_output_dir,
@@ -141,7 +143,379 @@ TORCH_NATIVE_RUNTIME_HINT = (
     "and _internal\\torch\\lib exist beside VocalProcess.exe."
 )
 IMPORT_PROBE_MODULES = {"torch", "torchaudio"}
+FASTER_WHISPER_REQUIRED_FILES = ("config.json", "model.bin", "tokenizer.json")
 _DLL_DIRECTORY_HANDLES: list[Any] = []
+LANGUAGE_COMPATIBILITY_FORMAT = "vocal_process_language_compatibility_v1"
+CN_JP_LANGUAGE_LABELS = {"CN": "Chinese", "JP": "Japanese"}
+_CN_DISTINCTIVE_ROMANIZED_HINTS = (
+    "ang",
+    "eng",
+    "ong",
+    "iong",
+    "iang",
+    "uang",
+    "uan",
+    "ian",
+    "iao",
+    "zh",
+    "qi",
+    "xi",
+    "xu",
+    "qu",
+    "xue",
+    "que",
+    "er",
+)
+_JAPANESE_DISTINCTIVE_ROMANIZED_HINTS = {
+    "tsu",
+    "jya",
+    "jyu",
+    "jyo",
+    "kya",
+    "kyu",
+    "kyo",
+    "gya",
+    "gyu",
+    "gyo",
+    "sha",
+    "shu",
+    "sho",
+    "cha",
+    "chu",
+    "cho",
+    "rya",
+    "ryu",
+    "ryo",
+    "nya",
+    "nyu",
+    "nyo",
+    "hya",
+    "hyu",
+    "hyo",
+    "mya",
+    "myu",
+    "myo",
+    "pya",
+    "pyu",
+    "pyo",
+    "bya",
+    "byu",
+    "byo",
+}
+
+
+def infer_cn_jp_language_from_name(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    if re.search(r"(?:^|[^A-Z0-9])(?:CN|ZH|ZHO|CMN|CHINESE|MANDARIN)(?:$|[^A-Z0-9])", upper):
+        return "CN"
+    if re.search(r"(?:^|[^A-Z0-9])(?:JP|JA|JPN|JAPANESE|NIHONGO)(?:$|[^A-Z0-9])", upper):
+        return "JP"
+    if upper.endswith("CN") or upper.endswith("ZH"):
+        return "CN"
+    if upper.endswith("JP") or upper.endswith("JPN"):
+        return "JP"
+    return ""
+
+
+def infer_reference_language(
+    reference_path: Path,
+    *,
+    lyrics_file: Path | None = None,
+    transcript: str = "",
+    notes: Sequence[str] = (),
+    reference_language: str | None = None,
+) -> str:
+    return str(
+        _reference_language_report(
+            reference_path,
+            lyrics_file=lyrics_file,
+            transcript=transcript,
+            notes=notes,
+            reference_language=reference_language,
+        ).get("language", "")
+    )
+
+
+def infer_material_set_language(
+    material_directory: Path,
+    *,
+    material_paths: Sequence[Path] | None = None,
+) -> str:
+    return str(
+        _material_set_language_report(
+            material_directory,
+            material_paths=material_paths,
+        ).get("language", "")
+    )
+
+
+def reference_material_language_compatibility(
+    reference_path: Path,
+    material_directory: Path,
+    *,
+    lyrics_file: Path | None = None,
+    material_paths: Sequence[Path] | None = None,
+    reference_transcript: str = "",
+    reference_notes: Sequence[str] = (),
+    reference_language: str | None = None,
+) -> dict[str, Any]:
+    reference_report = _reference_language_report(
+        reference_path,
+        lyrics_file=lyrics_file,
+        transcript=reference_transcript,
+        notes=reference_notes,
+        reference_language=reference_language,
+    )
+    material_report = _material_set_language_report(
+        material_directory,
+        material_paths=material_paths,
+    )
+    reference_code = str(reference_report.get("language") or "")
+    material_code = str(material_report.get("language") or "")
+    reference_confidence = float(reference_report.get("confidence") or 0.0)
+    material_confidence = float(material_report.get("confidence") or 0.0)
+    mismatch = (
+        reference_code in CN_JP_LANGUAGE_LABELS
+        and material_code in CN_JP_LANGUAGE_LABELS
+        and reference_code != material_code
+        and reference_confidence >= 0.75
+        and material_confidence >= 0.75
+    )
+    status = "mismatch" if mismatch else ("compatible" if reference_code and material_code else "unknown")
+    message = ""
+    if mismatch:
+        message = (
+            "Language mismatch: reference vocal appears to be "
+            f"{CN_JP_LANGUAGE_LABELS[reference_code]} ({reference_code}), but material set appears to be "
+            f"{CN_JP_LANGUAGE_LABELS[material_code]} ({material_code}). Use a matching material set before "
+            "running model-assisted ordering."
+        )
+    elif status == "unknown":
+        message = "Reference/material language compatibility could not be fully determined."
+    else:
+        message = f"Reference and material set language are compatible: {reference_code}."
+    return {
+        "format": LANGUAGE_COMPATIBILITY_FORMAT,
+        "status": status,
+        "compatible": not mismatch,
+        "reference_language": reference_code,
+        "material_set_language": material_code,
+        "reference": reference_report,
+        "material_set": material_report,
+        "message": message,
+    }
+
+
+def _raise_for_language_mismatch(language_compatibility: dict[str, Any]) -> None:
+    if language_compatibility.get("status") != "mismatch":
+        return
+    raise AudioProcessorError(str(language_compatibility.get("message") or "Language mismatch"))
+
+
+def _language_compatibility_note(language_compatibility: dict[str, Any]) -> str:
+    return (
+        "language_compatibility: "
+        f"status={language_compatibility.get('status', 'unknown')}; "
+        f"reference={language_compatibility.get('reference_language') or 'unknown'}; "
+        f"material_set={language_compatibility.get('material_set_language') or 'unknown'}"
+    )
+
+
+def _reference_language_report(
+    reference_path: Path,
+    *,
+    lyrics_file: Path | None,
+    transcript: str,
+    notes: Sequence[str],
+    reference_language: str | None,
+) -> dict[str, Any]:
+    override_language = _normalize_cn_jp_language(reference_language)
+    if override_language:
+        return _language_report(override_language, "reference_language_override", 1.0)
+
+    name_language = infer_cn_jp_language_from_name(reference_path.stem)
+    if name_language:
+        return _language_report(name_language, "reference_filename", 1.0)
+
+    lyric_text = _read_language_probe_text(lyrics_file) if lyrics_file is not None else ""
+    lyric_report = _language_report_from_text(lyric_text, source="lyrics_text")
+    if lyric_report.get("language") and float(lyric_report.get("confidence") or 0.0) >= 0.75:
+        return lyric_report
+
+    note_language = _language_from_asr_notes(notes)
+    if note_language:
+        return _language_report(note_language, "asr_language", 0.9)
+
+    transcript_report = _language_report_from_text(transcript, source="reference_transcript")
+    if transcript_report.get("language"):
+        return transcript_report
+
+    return _language_report("", "unknown", 0.0)
+
+
+def _material_set_language_report(
+    material_directory: Path,
+    *,
+    material_paths: Sequence[Path] | None,
+) -> dict[str, Any]:
+    name_language = infer_cn_jp_language_from_name(material_directory.name)
+    if name_language:
+        return _language_report(name_language, "material_directory_name", 1.0)
+
+    paths = list(material_paths) if material_paths is not None else []
+    if material_paths is None:
+        try:
+            paths = list_audio_files(material_directory)
+        except AudioProcessorError:
+            paths = []
+    filename_report = _language_report_from_material_filenames(paths)
+    if filename_report.get("language"):
+        return filename_report
+    return _language_report("", "unknown", 0.0, filename_report.get("signals", {}))
+
+
+def _language_report(
+    language: str,
+    source: str,
+    confidence: float,
+    signals: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "language": language,
+        "label": CN_JP_LANGUAGE_LABELS.get(language, ""),
+        "source": source,
+        "confidence": round(max(0.0, min(float(confidence), 1.0)), 3),
+        "signals": signals or {},
+    }
+
+
+def _normalize_cn_jp_language(value: str | None) -> str:
+    normalized = re.sub(r"[^a-z]", "", str(value or "").lower())
+    if normalized in {"cn", "zh", "zho", "cmn", "zhcn", "chinese", "mandarin"}:
+        return "CN"
+    if normalized in {"jp", "ja", "jpn", "japanese", "nihongo"}:
+        return "JP"
+    return ""
+
+
+def _language_from_asr_notes(notes: Sequence[str]) -> str:
+    for note in notes:
+        match = re.search(r"\blanguage=([A-Za-z_-]+)", str(note or ""))
+        if not match:
+            continue
+        language = _normalize_cn_jp_language(match.group(1))
+        if language:
+            return language
+    return ""
+
+
+def _read_language_probe_text(path: Path | None) -> str:
+    if path is None or not path.exists() or path.suffix.lower() not in {".txt", ".lrc", ".srt"}:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:8192]
+    except OSError:
+        return ""
+
+
+def _language_report_from_text(text: str, *, source: str) -> dict[str, Any]:
+    if not text:
+        return _language_report("", source, 0.0)
+    kana_count = len(re.findall(r"[\u3040-\u30ff\u31f0-\u31ff]", text))
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+    if kana_count > 0:
+        return _language_report(
+            "JP",
+            source,
+            0.95,
+            {"kana_count": kana_count, "cjk_count": cjk_count},
+        )
+    if cjk_count > 0:
+        return _language_report(
+            "CN",
+            source,
+            0.7,
+            {"kana_count": kana_count, "cjk_count": cjk_count},
+        )
+    return _language_report("", source, 0.0, {"kana_count": 0, "cjk_count": 0})
+
+
+def _language_report_from_material_filenames(material_paths: Sequence[Path]) -> dict[str, Any]:
+    sample_paths = sorted(material_paths, key=lambda path: path.name.lower())[:500]
+    cn_score = 0.0
+    jp_score = 0.0
+    cn_distinctive_count = 0
+    jp_distinctive_count = 0
+    tone_marker_count = 0
+    kana_count = 0
+    cjk_count = 0
+    token_count = 0
+    for path in sample_paths:
+        for token in _filename_language_tokens(path.stem):
+            token_count += 1
+            if re.fullmatch(r"[\u3040-\u30ff\u31f0-\u31ff]+", token):
+                kana_count += len(token)
+                jp_score += 6.0
+                continue
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+                cjk_count += len(token)
+                cn_score += 6.0
+                continue
+            normalized = re.sub(r"[^a-z0-9]", "", token.lower())
+            base = re.sub(r"[0-9]+$", "", normalized)
+            if not base:
+                continue
+            if re.search(r"[1-5]$", normalized) and _looks_like_pinyin_token(base):
+                tone_marker_count += 1
+                cn_distinctive_count += 1
+                cn_score += 3.0
+            if _is_cn_distinctive_filename_token(base):
+                cn_distinctive_count += 1
+                cn_score += 3.0
+            if base in _JAPANESE_DISTINCTIVE_ROMANIZED_HINTS:
+                jp_distinctive_count += 1
+                jp_score += 3.0
+
+    signals = {
+        "sampled_audio_file_count": len(sample_paths),
+        "token_count": token_count,
+        "cn_score": round(cn_score, 3),
+        "jp_score": round(jp_score, 3),
+        "cn_distinctive_count": cn_distinctive_count,
+        "jp_distinctive_count": jp_distinctive_count,
+        "tone_marker_count": tone_marker_count,
+        "kana_count": kana_count,
+        "cjk_count": cjk_count,
+    }
+    if kana_count > 0 or (jp_distinctive_count >= 4 and jp_score >= cn_score + 4.0):
+        confidence = 0.95 if kana_count > 0 else 0.85
+        return _language_report("JP", "material_filename_heuristic", confidence, signals)
+    if cjk_count > 0:
+        return _language_report("CN", "material_filename_heuristic", 0.9, signals)
+    if tone_marker_count >= 3 or (cn_distinctive_count >= 5 and cn_score >= jp_score + 4.0):
+        return _language_report("CN", "material_filename_heuristic", 0.85, signals)
+    return _language_report("", "material_filename_heuristic", 0.0, signals)
+
+
+def _filename_language_tokens(stem: str) -> list[str]:
+    return re.findall(r"[a-zA-Z]+[0-9]*|[\u3040-\u30ff\u31f0-\u31ff]+|[\u4e00-\u9fff]+", stem)
+
+
+def _looks_like_pinyin_token(token: str) -> bool:
+    if len(token) == 1:
+        return token in {"a", "e", "i", "o", "u"}
+    return bool(re.fullmatch(r"[a-z]{1,6}", token))
+
+
+def _is_cn_distinctive_filename_token(token: str) -> bool:
+    if any(hint in token for hint in _CN_DISTINCTIVE_ROMANIZED_HINTS):
+        return True
+    if token.startswith(("zh", "q", "x")):
+        return True
+    return False
 
 
 def build_model_ordering(
@@ -159,10 +533,20 @@ def build_model_ordering(
     _raise_if_cancelled(should_cancel)
     work_root = _prepare_work_root(work_dir)
     device = _resolve_compute_device(compute_device)
+    normalized_reference = reference_path.expanduser()
+    if not normalized_reference.exists():
+        raise AudioProcessorError(f"Reference audio does not exist: {normalized_reference}")
     material_directory = material_directory.expanduser()
     material_paths = list_audio_files(material_directory)
     if not material_paths:
         raise AudioProcessorError("Material directory does not contain supported audio files")
+    language_compatibility = reference_material_language_compatibility(
+        normalized_reference,
+        material_directory,
+        lyrics_file=lyrics_file,
+        material_paths=material_paths,
+    )
+    _raise_for_language_mismatch(language_compatibility)
 
     _raise_if_cancelled(should_cancel)
     resolved_material_cache_dir = material_cache_dir or _default_material_cache_dir(
@@ -175,7 +559,7 @@ def build_model_ordering(
     _raise_if_cancelled(should_cancel)
     _notify_progress(on_progress, 0.02, "Preparing reference analysis")
     reference = analyze_reference(
-        reference_path,
+        normalized_reference,
         lyrics_file=lyrics_file,
         work_dir=work_root,
         compute_device=device,
@@ -184,6 +568,16 @@ def build_model_ordering(
         notes=notes,
         should_cancel=should_cancel,
     )
+    language_compatibility = reference_material_language_compatibility(
+        normalized_reference,
+        material_directory,
+        lyrics_file=lyrics_file,
+        material_paths=material_paths,
+        reference_transcript=reference.transcript,
+        reference_notes=reference.notes,
+    )
+    _raise_for_language_mismatch(language_compatibility)
+    notes.append(_language_compatibility_note(language_compatibility))
 
     _raise_if_cancelled(should_cancel)
     _notify_progress(on_progress, 0.25, "Preparing material analysis")
@@ -256,6 +650,7 @@ def build_model_ordering(
             "path": str(_material_cache_path(material_directory, resolved_material_cache_dir)),
             "notes": [note for note in library.notes if "material analysis cache" in note],
         },
+        "language_compatibility": language_compatibility,
         "ordering_strategy": ordering_plan.strategy,
         "score_matrix": render_ordering_score_matrix(ordering_plan),
         "ordering": [
@@ -383,6 +778,7 @@ def analyze_reference(
         compute_device=compute_device,
         should_cancel=should_cancel,
     )
+    notes.extend(str(note) for note in transcript_result.get("notes", []) if isinstance(note, str))
     _raise_if_cancelled(should_cancel)
     reference_embedding = _speaker_embedding(
         vocal_path,
@@ -589,6 +985,7 @@ def backend_availability() -> dict[str, bool]:
 
 def speech_runtime_preflight_report(compute_device: str = "auto") -> dict[str, Any]:
     tool_dirs = ensure_runtime_tool_paths()
+    ca_bundle = _ensure_model_download_tls()
     ffmpeg_on_path = shutil.which("ffmpeg")
     preferred_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower()
     allow_model_download = os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") == "1"
@@ -602,6 +999,7 @@ def speech_runtime_preflight_report(compute_device: str = "auto") -> dict[str, A
         "issue": issue,
         "runtime_tool_directories": [str(path) for path in tool_dirs],
         "ffmpeg_on_path": ffmpeg_on_path or "",
+        "python_https_ca_bundle": str(ca_bundle) if ca_bundle else "",
         "torch_native_available": _module_available("torch"),
         "torch_native_detail": "" if _module_available("torch") else _module_unavailable_reason("torch"),
         "faster_whisper_module": _module_available("faster_whisper"),
@@ -650,6 +1048,9 @@ def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
     lines.append(f"WhisperX model cached: {_whisperx_model_cached()}")
     lines.append(f"Silero VAD cached: {_silero_model_cached()}")
     lines.append(f"SpeechBrain cached: {_speechbrain_model_cached(cache_root / 'speechbrain' / 'ecapa')}")
+    ca_bundle = _ensure_model_download_tls()
+    if ca_bundle:
+        lines.append(f"Python HTTPS CA bundle: {ca_bundle}")
     return lines
 
 
@@ -1072,6 +1473,7 @@ def _transcribe_audio(
 ) -> dict[str, Any]:
     _raise_if_cancelled(should_cancel)
     ensure_runtime_tool_paths()
+    _ensure_model_download_tls()
     work_root = _prepare_work_root(work_dir)
     device = _resolve_compute_device(compute_device)
     preferred_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower()
@@ -1151,7 +1553,9 @@ def _transcribe_audio(
                         )
                     )
                 text = " ".join(segment.text for segment in segments).strip()
-                return {"backend": "whisperx", "text": text, "segments": segments, "notes": fallback_notes}
+                language = str(result.get("language") or "")
+                notes = [*fallback_notes, f"language={language}"] if language else fallback_notes
+                return {"backend": "whisperx", "text": text, "segments": segments, "notes": notes}
             except FileNotFoundError as exc:
                 message = _ffmpeg_start_failure_message("WhisperX", path)
                 if preferred_backend == "whisperx":
@@ -1257,7 +1661,8 @@ def _transcribe_with_whisper(
                 )
             )
         text = " ".join(segment.text for segment in segments).strip()
-        notes = [fallback_note] if fallback_note else []
+        language = str(result.get("language") or "")
+        notes = [note for note in (fallback_note, f"language={language}" if language else "") if note]
         return {"backend": "whisper", "text": text, "segments": segments, "notes": notes}
     except FileNotFoundError as exc:
         raise AudioProcessorError(_ffmpeg_start_failure_message("Whisper", path)) from exc
@@ -1441,11 +1846,13 @@ def _speaker_embedding(
 def _load_faster_whisper_model(model_name: str, device: str, compute_type: str) -> Any:
     from faster_whisper import WhisperModel  # type: ignore
 
+    cache_root = _model_cache_root() / "faster-whisper"
+    model_source = _faster_whisper_model_source(model_name, cache_root)
     return WhisperModel(
-        model_name,
+        str(model_source),
         device=device,
         compute_type=compute_type,
-        download_root=str(_model_cache_root() / "faster-whisper"),
+        download_root=str(cache_root),
     )
 
 
@@ -1454,11 +1861,13 @@ def _load_whisperx_model(model_name: str, device: str) -> Any:
     _prepare_torchaudio_legacy_api()
     import whisperx  # type: ignore
 
+    cache_root = _model_cache_root() / "whisperx"
+    model_source = _faster_whisper_model_source(model_name, cache_root)
     return whisperx.load_model(
-        model_name,
+        str(model_source),
         device,
         compute_type=_compute_type_for_device(device),
-        download_root=str(_model_cache_root() / "whisperx"),
+        download_root=str(cache_root),
     )
 
 
@@ -2516,6 +2925,113 @@ def _model_cache_root() -> Path:
     return fallback
 
 
+def _ensure_model_download_tls() -> Path | None:
+    return ensure_python_https_trust(_model_cache_root() / "tls")
+
+
+def _faster_whisper_model_source(model_name: str, cache_root: Path) -> Path | str:
+    cached_snapshot = _find_complete_faster_whisper_snapshot(cache_root)
+    if cached_snapshot is not None:
+        return cached_snapshot
+
+    if os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") != "1":
+        return model_name
+
+    prepared_snapshot = _prepare_faster_whisper_snapshot(model_name, cache_root)
+    if prepared_snapshot is not None:
+        return prepared_snapshot
+    return model_name
+
+
+def _prepare_faster_whisper_snapshot(model_name: str, cache_root: Path) -> Path | None:
+    _ensure_model_download_tls()
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    repo_id = _faster_whisper_repo_id(model_name)
+    if not repo_id:
+        return None
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    _remove_zero_byte_cache_files(cache_root)
+
+    from huggingface_hub import hf_hub_download, list_repo_files  # type: ignore
+
+    try:
+        repo_files = list_repo_files(repo_id)
+    except Exception:
+        repo_files = []
+
+    for filename in _faster_whisper_download_files(repo_files):
+        hf_hub_download(repo_id, filename, cache_dir=str(cache_root), local_files_only=False)
+
+    return _find_complete_faster_whisper_snapshot(cache_root)
+
+
+def _faster_whisper_repo_id(model_name: str) -> str | None:
+    if "/" in model_name:
+        return model_name
+    try:
+        from faster_whisper import utils as faster_whisper_utils  # type: ignore
+    except Exception:
+        return None
+    models = getattr(faster_whisper_utils, "_MODELS", {})
+    repo_id = models.get(model_name) if isinstance(models, dict) else None
+    return str(repo_id) if repo_id else None
+
+
+def _faster_whisper_download_files(repo_files: Sequence[str]) -> tuple[str, ...]:
+    available = set(repo_files)
+    if not available:
+        return ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt")
+
+    selected: list[str] = [
+        filename
+        for filename in ("config.json", "preprocessor_config.json", "model.bin", "tokenizer.json")
+        if filename in available
+    ]
+    selected.extend(sorted(filename for filename in available if fnmatch.fnmatch(filename, "vocabulary.*")))
+    return tuple(dict.fromkeys(selected))
+
+
+def _remove_zero_byte_cache_files(root: Path) -> None:
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        try:
+            if path.is_file() and path.stat().st_size == 0:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _find_complete_faster_whisper_snapshot(root: Path) -> Path | None:
+    if not root.exists():
+        return None
+
+    candidates = [root]
+    candidates.extend(path for path in root.glob("models--*--*/snapshots/*") if path.is_dir())
+    candidates.extend(path for path in root.glob("snapshots/*") if path.is_dir())
+
+    for candidate in sorted(candidates, key=lambda path: len(path.parts), reverse=True):
+        if _is_complete_faster_whisper_snapshot(candidate):
+            return candidate
+    return None
+
+
+def _is_complete_faster_whisper_snapshot(path: Path) -> bool:
+    for filename in FASTER_WHISPER_REQUIRED_FILES:
+        candidate = path / filename
+        if not candidate.is_file() or _file_size(candidate) <= 0:
+            return False
+    return any(_file_size(candidate) > 0 for candidate in path.glob("vocabulary.*") if candidate.is_file())
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def _model_cache_candidates() -> list[Path]:
     configured = os.environ.get("VOCAL_PROCESS_MODEL_CACHE")
     if configured:
@@ -2546,16 +3062,12 @@ def _whisper_model_cached() -> bool:
 
 def _faster_whisper_model_cached() -> bool:
     root = _model_cache_root() / "faster-whisper"
-    if not root.exists():
-        return False
-    return any(root.rglob("model.bin")) or any(root.rglob("config.json"))
+    return _find_complete_faster_whisper_snapshot(root) is not None
 
 
 def _whisperx_model_cached() -> bool:
     root = _model_cache_root() / "whisperx"
-    if not root.exists():
-        return False
-    return any(root.rglob("model.bin")) or any(root.rglob("config.json"))
+    return _find_complete_faster_whisper_snapshot(root) is not None
 
 
 def _silero_model_cached() -> bool:
