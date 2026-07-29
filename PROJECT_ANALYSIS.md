@@ -1,5 +1,13 @@
 # Project Analysis
 
+## Latest Update - 2026-07-30 Cancellation-Aware Real-Eval Repair
+
+This continuation focused on making the rendered real-eval loop recoverable enough for the next pronunciation-ordering pass. The latest full rendered run reached real model execution but failed 12 of 13 compatible cases because Python/SpeechBrain introspection loaded the optional `speechbrain.integrations.k2_fsa` module and then failed on missing `k2`. The retained compatibility layer keeps unloaded SpeechBrain lazy modules from resolving `__file__` through optional imports, while preserving normal lazy import behavior for real attributes.
+
+The real-eval pipeline now has first-class cancellation semantics. `build_preflight_report()` accepts and forwards `should_cancel`; `audio_processor.real_eval` accepts callback and stop-file cancellation, passes it through analysis and render queue execution, records cancelled cases as `cancelled`, writes exit code 130 into `recommended_exit_code`, and writes report files with atomic replacement. `scripts\run_real_eval_render_full.ps1` accepts `-StopFile` and honors `VOCAL_PROCESS_STOP_FILE`. The project maintenance runner now injects that environment variable into child tasks, writes stdout/stderr directly to log files, polls running children, terminates them on stop-file creation, and records `stopped` rather than waiting for long task timeouts.
+
+Verification passed with compileall, 128 unit tests, `audio_processor check`, PowerShell script parsing, `git diff --check` with only CRLF warnings, and a script-level stop-file smoke that returned 130 with `status_counts={"cancelled":13}`. The next acceptance step is a full `scripts\run_real_eval_render_full.ps1` run to confirm the SpeechBrain lazy import failures are gone, then resume scoring improvements from the resulting `score_summary` and `group_score_summary`.
+
 ## Standing Project Rules
 
 The durable project rules are maintained in `PROJECT_RULES.md`. In particular, completed work branches should replace `main` after verification, while the previous `main` is backed up to a separate archive/backup branch first. Major verified changes should be committed and pushed to GitHub automatically unless the user explicitly asks to keep them local. Whenever `main` is updated, `README.md` must include an update log directly after the download section.

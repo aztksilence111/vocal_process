@@ -1018,7 +1018,12 @@ class RealEvalTests(unittest.TestCase):
                 ],
             }
 
-            def fake_run_batch_queue(items: list[QueueItem], settings: ProcessingSettings) -> BatchSummary:
+            def fake_run_batch_queue(
+                items: list[QueueItem],
+                settings: ProcessingSettings,
+                **kwargs: object,
+            ) -> BatchSummary:
+                self.assertIn("should_cancel", kwargs)
                 self.assertEqual(len(items), 1)
                 _write_test_wave(items[0].output_path, duration_seconds=4.02)
                 return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
@@ -1274,6 +1279,76 @@ class RealEvalTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(summary_payload["suite"]["recommended_exit_code"], 1)
 
+    def test_real_eval_stop_file_cancels_before_starting_preflight(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzCN"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            _write_test_wave(origin / "first_CN.wav", duration_seconds=4.0)
+            _write_test_wave(origin / "second_CN.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "wo.wav", duration_seconds=1.0)
+            stop_file = root / "stop"
+            stop_file.write_text("stop", encoding="utf-8")
+
+            with patch(
+                "audio_processor.real_eval.speech_runtime_preflight_report",
+                return_value={"preferred_backend": "whisperx", "available": True, "issue": ""},
+            ):
+                with patch("audio_processor.real_eval.build_preflight_report") as preflight_mock:
+                    result = real_eval.run_real_suite(
+                        root,
+                        render=True,
+                        source_separation="never",
+                        output_root=root / "reports",
+                        stop_file=stop_file,
+                    )
+
+            summary_payload = json.loads(result.summary_path.read_text(encoding="utf-8"))
+
+        preflight_mock.assert_not_called()
+        self.assertEqual([case.status for case in result.cases], ["cancelled", "cancelled"])
+        self.assertEqual(summary_payload["suite"]["status_counts"], {"cancelled": 2})
+        self.assertEqual(summary_payload["suite"]["recommended_exit_code"], real_eval.CANCELLED_EXIT_CODE)
+        self.assertEqual(summary_payload["cases"][0]["warnings"][0]["kind"], "cancelled")
+
+    def test_real_eval_cancellation_during_preflight_marks_remaining_cases_cancelled(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzCN"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            _write_test_wave(origin / "first_CN.wav", duration_seconds=4.0)
+            _write_test_wave(origin / "second_CN.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "wo.wav", duration_seconds=1.0)
+            cancel_state = {"cancelled": False}
+
+            def fake_preflight(*args: object, **kwargs: object) -> dict[str, object]:
+                self.assertTrue(callable(kwargs.get("should_cancel")))
+                cancel_state["cancelled"] = True
+                raise AudioProcessorError("Processing cancelled")
+
+            with patch(
+                "audio_processor.real_eval.speech_runtime_preflight_report",
+                return_value={"preferred_backend": "whisperx", "available": True, "issue": ""},
+            ):
+                with patch("audio_processor.real_eval.build_preflight_report", side_effect=fake_preflight) as preflight_mock:
+                    result = real_eval.run_real_suite(
+                        root,
+                        render=False,
+                        source_separation="never",
+                        output_root=root / "reports",
+                        should_cancel=lambda: cancel_state["cancelled"],
+                    )
+
+            summary_payload = json.loads(result.summary_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(preflight_mock.call_count, 1)
+        self.assertEqual([case.status for case in result.cases], ["cancelled", "cancelled"])
+        self.assertEqual(summary_payload["suite"]["recommended_exit_code"], real_eval.CANCELLED_EXIT_CODE)
+
     def test_real_eval_infrastructure_signature_ignores_request_ids_and_reference_paths(self) -> None:
         first = (
             "WhisperX transcription failed for tests_real\\origin_vocal\\first_CN.wav: "
@@ -1358,6 +1433,66 @@ class MaintenanceRunnerTests(unittest.TestCase):
             self.assertEqual(heartbeat["status"], "completed")
             self.assertTrue(any("\"task.completed\"" in line for line in events))
             self.assertTrue(any("hello from maintenance" in text for text in stdout_texts))
+
+    def test_maintenance_stop_file_stops_running_child_process(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = root / "maintenance.plan.json"
+            session_dir = root / "session"
+            stop_file = session_dir / "stop"
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "format": maintenance.MAINTENANCE_PLAN_FORMAT,
+                        "name": "stop-smoke",
+                        "repeat": True,
+                        "cycle_pause_seconds": 0,
+                        "tasks": [
+                            {
+                                "name": "self-stop",
+                                "command": sys.executable,
+                                "args": [
+                                    "-c",
+                                    (
+                                        "import os, time; "
+                                        "from pathlib import Path; "
+                                        "Path(os.environ['VOCAL_PROCESS_STOP_FILE']).write_text('stop', encoding='utf-8'); "
+                                        "time.sleep(30)"
+                                    ),
+                                ],
+                                "cwd": ".",
+                                "timeout_seconds": 30,
+                                "continue_on_failure": True,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            started_at = time.monotonic()
+            result = maintenance.run_maintenance_session(
+                plan_path,
+                workspace_root=root,
+                session_dir=session_dir,
+                duration_hours=0.01,
+                poll_interval_seconds=0.01,
+                once=True,
+                stop_file=stop_file,
+            )
+            elapsed = time.monotonic() - started_at
+            events = [
+                json.loads(line)
+                for line in (session_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            task_completed = next(event for event in events if event["kind"] == "task.completed")
+
+        self.assertLess(elapsed, 10)
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(task_completed["result"]["status"], "stopped")
+        self.assertEqual(task_completed["result"]["termination"], "stop_file")
 
 
 class CliTests(unittest.TestCase):
@@ -1743,6 +1878,7 @@ class ModelRuntimeTests(unittest.TestCase):
     def tearDown(self) -> None:
         model_runtime._module_status.cache_clear()
         model_runtime._prepare_native_dependency_paths.cache_clear()
+        model_runtime._prepare_speechbrain_lazy_import_compat.cache_clear()
         super().tearDown()
 
     def test_model_cache_root_falls_back_when_candidate_is_not_creatable(self) -> None:
@@ -2637,6 +2773,26 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertIn(Introspection, added)
         self.assertIn(Specifications, added)
         self.assertIn(SlidingWindow, added)
+
+    def test_speechbrain_lazy_modules_do_not_load_optional_integrations_for_file_attr(self) -> None:
+        class FakeLazyModule:
+            lazy_module = None
+
+            def ensure_module(self, stacklevel: int) -> object:
+                raise ImportError("optional integration should not load")
+
+            def __getattr__(self, attr: str) -> object:
+                return self.ensure_module(1)
+
+        module = SimpleNamespace(LazyModule=FakeLazyModule)
+        model_runtime._prepare_speechbrain_lazy_import_compat.cache_clear()
+        with patch("audio_processor.model_runtime.importlib.import_module", return_value=module):
+            model_runtime._prepare_speechbrain_lazy_import_compat()
+
+        lazy = FakeLazyModule()
+        self.assertFalse(hasattr(lazy, "__file__"))
+        with self.assertRaisesRegex(ImportError, "optional integration"):
+            getattr(lazy, "k2")
 
     def test_ffmpeg_start_failure_message_points_to_portable_bin(self) -> None:
         with patch(

@@ -1,7 +1,8 @@
 param(
     [string]$Root = "tests_real",
     [string]$OutputRoot = "tests_real\output",
-    [string]$SourceSeparation = "never"
+    [string]$SourceSeparation = "never",
+    [string]$StopFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,10 +36,27 @@ Set-DefaultEnv "PYTHONUTF8" "1"
 $env:VOCAL_PROCESS_ASR_BACKEND = "whisperx"
 
 $python = Join-Path $PSScriptRoot "..\.venv311\Scripts\python.exe"
-& $python -m audio_processor.real_eval `
-    --root $Root `
-    --render `
-    --source-separation $SourceSeparation `
-    --output-root $OutputRoot
+$realEvalArgs = @(
+    "-m",
+    "audio_processor.real_eval",
+    "--root",
+    $Root,
+    "--render",
+    "--source-separation",
+    $SourceSeparation,
+    "--output-root",
+    $OutputRoot
+)
+
+$effectiveStopFile = $StopFile
+if ([string]::IsNullOrWhiteSpace($effectiveStopFile)) {
+    $effectiveStopFile = [Environment]::GetEnvironmentVariable("VOCAL_PROCESS_STOP_FILE", "Process")
+}
+if (-not [string]::IsNullOrWhiteSpace($effectiveStopFile)) {
+    [Environment]::SetEnvironmentVariable("VOCAL_PROCESS_STOP_FILE", $effectiveStopFile, "Process")
+    $realEvalArgs += @("--stop-file", $effectiveStopFile)
+}
+
+& $python @realEvalArgs
 
 exit $LASTEXITCODE

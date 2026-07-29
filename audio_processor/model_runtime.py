@@ -3221,6 +3221,7 @@ def _format_module_import_error(exc: BaseException | None) -> str:
 
 @lru_cache(maxsize=1)
 def _prepare_torchaudio_legacy_api() -> None:
+    _prepare_speechbrain_lazy_import_compat()
     try:
         os.environ.setdefault("MPLCONFIGDIR", str(_model_cache_root() / "matplotlib"))
         Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
@@ -3301,6 +3302,53 @@ def _prepare_torchaudio_legacy_api() -> None:
         torchaudio.save = save  # type: ignore[assignment]
 
     _prepare_torch_weights_safe_globals()
+
+
+@lru_cache(maxsize=1)
+def _prepare_speechbrain_lazy_import_compat() -> None:
+    try:
+        importutils = importlib.import_module("speechbrain.utils.importutils")
+        lazy_module_type = getattr(importutils, "LazyModule", None)
+        original_ensure_module = getattr(lazy_module_type, "ensure_module", None)
+        original_getattr = getattr(lazy_module_type, "__getattr__", None)
+        if not callable(original_ensure_module):
+            return
+        if not callable(original_getattr):
+            return
+        if getattr(original_getattr, "_vocal_process_file_attr_compat", False):
+            return
+    except Exception:
+        return
+
+    def ensure_module(self: Any, stacklevel: int) -> Any:
+        if _called_from_python_inspect():
+            raise AttributeError()
+        return original_ensure_module(self, stacklevel)
+
+    def getattr_compat(self: Any, attr: str) -> Any:
+        if attr == "__file__" and getattr(self, "lazy_module", None) is None:
+            raise AttributeError()
+        return original_getattr(self, attr)
+
+    ensure_module._vocal_process_windows_inspect_compat = True  # type: ignore[attr-defined]
+    getattr_compat._vocal_process_file_attr_compat = True  # type: ignore[attr-defined]
+    try:
+        lazy_module_type.ensure_module = ensure_module
+        lazy_module_type.__getattr__ = getattr_compat
+    except Exception:
+        return
+
+
+def _called_from_python_inspect(max_depth: int = 12) -> bool:
+    for depth in range(1, max_depth + 1):
+        try:
+            frame = sys._getframe(depth)
+        except ValueError:
+            break
+        filename = str(getattr(getattr(frame, "f_code", None), "co_filename", ""))
+        if filename.replace("\\", "/").endswith("/inspect.py"):
+            return True
+    return False
 
 
 def _prepare_torch_weights_safe_globals() -> None:

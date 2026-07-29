@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .engine import MaterialStretchClip, plan_material_stretch_clips, render_material_stretch_plan
 from .model_runtime import ModelOrderingResult, build_model_ordering
@@ -11,6 +11,7 @@ from .model_runtime import ModelOrderingResult, build_model_ordering
 PREFLIGHT_REPORT_FORMAT = "vocal_process_preflight_analysis_v1"
 LOW_MATCH_SCORE = 0.18
 WEAK_TEXT_SCORE = 0.12
+CancelCallback = Callable[[], bool]
 
 
 def build_preflight_report(
@@ -22,6 +23,7 @@ def build_preflight_report(
     material_cache_dir: Path | None = None,
     compute_device: str = "auto",
     source_separation: str = "auto",
+    should_cancel: CancelCallback | None = None,
 ) -> dict[str, Any]:
     ordering = build_model_ordering(
         reference_path,
@@ -31,6 +33,7 @@ def build_preflight_report(
         material_cache_dir=material_cache_dir,
         compute_device=compute_device,
         source_separation=source_separation,
+        should_cancel=should_cancel,
     )
     stretch_plan = plan_material_stretch_clips(
         reference_path,

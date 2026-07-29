@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from .batch import QueueItem, run_batch_queue
-from .engine import get_audio_duration_seconds, list_audio_files, probe_audio
+from .engine import AudioProcessorError, get_audio_duration_seconds, list_audio_files, probe_audio
 from .diagnostics import diagnostic_log_path
 from .model_runtime import (
     infer_cn_jp_language_from_name,
@@ -31,7 +32,9 @@ INFRASTRUCTURE_WARNING_KINDS = {
 }
 REAL_EVAL_FAILED_EXIT_CODE = 1
 INFRASTRUCTURE_BLOCKED_EXIT_CODE = 2
+CANCELLED_EXIT_CODE = 130
 FAILED_EXECUTION_STATUSES = {"analysis_failed", "analysis_blocked", "render_failed"}
+CancelCallback = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -134,8 +137,11 @@ def run_real_suite(
     case_filter: str | None = None,
     split_filter: str | None = None,
     output_root: Path | None = None,
+    stop_file: Path | None = None,
+    should_cancel: CancelCallback | None = None,
 ) -> RealSuiteResult:
     root = root.expanduser()
+    cancel_checker = _combined_cancel_checker(should_cancel, stop_file)
     cases, skipped_cases = discover_real_cases_with_skips(root, manifest_path=manifest_path)
     if case_filter:
         lowered = case_filter.lower()
@@ -168,6 +174,20 @@ def run_real_suite(
     )
     _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
     for case_index, case in enumerate(cases):
+        if _should_cancel(cancel_checker):
+            _append_cancelled_case_results(results, cases[case_index:], report_directory)
+            suite_summary = _suite_summary(
+                root=root,
+                manifest_path=manifest_path,
+                render=render,
+                results=results,
+                planned_case_count=planned_case_count,
+                runtime_preflight=runtime_preflight,
+                skipped_cases=skipped_cases,
+            )
+            _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
+            break
+
         case.output_directory.mkdir(parents=True, exist_ok=True)
         analysis_path = report_directory / case.name / "analysis.json"
         analysis_path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,10 +200,44 @@ def run_real_suite(
                 material_cache_dir=case.output_directory / "_analysis_cache",
                 compute_device=compute_device,
                 source_separation=source_separation,
+                should_cancel=cancel_checker,
             )
         except Exception as exc:
+            if _is_cancellation_exception(exc):
+                report = _case_cancelled_report(case, "Processing cancelled")
+                _write_json_atomic(analysis_path, report)
+                results.append(
+                    RealCaseResult(
+                        case=case,
+                        status="cancelled",
+                        analysis_report_path=analysis_path,
+                        output_path=None,
+                        render_report_path=None,
+                        summary=_case_summary(
+                            report,
+                            {},
+                            reference_path=case.reference_path,
+                            output_path=None,
+                            status="cancelled",
+                        ),
+                        warnings=list(report.get("warnings", [])),
+                    )
+                )
+                _append_cancelled_case_results(results, cases[case_index + 1 :], report_directory)
+                suite_summary = _suite_summary(
+                    root=root,
+                    manifest_path=manifest_path,
+                    render=render,
+                    results=results,
+                    planned_case_count=planned_case_count,
+                    runtime_preflight=runtime_preflight,
+                    skipped_cases=skipped_cases,
+                )
+                _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
+                break
+
             report = _case_failure_report(case, exc)
-            analysis_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            _write_json_atomic(analysis_path, report)
             result = RealCaseResult(
                 case=case,
                 status="analysis_failed",
@@ -220,10 +274,7 @@ def run_real_suite(
                         report,
                         blocked_by_case=case.name,
                     )
-                    blocked_analysis_path.write_text(
-                        json.dumps(blocked_report, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
+                    _write_json_atomic(blocked_analysis_path, blocked_report)
                     results.append(
                         RealCaseResult(
                             case=blocked_case,
@@ -253,7 +304,7 @@ def run_real_suite(
                 _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
                 break
             continue
-        analysis_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_json_atomic(analysis_path, report)
 
         warnings = list(report.get("warnings", []))
         render_output_path: Path | None = None
@@ -273,21 +324,34 @@ def run_real_suite(
             render_output_path = settings.output_path_for(case.reference_path)
             render_report_path = diagnostic_log_path(render_output_path)
             try:
-                summary = run_batch_queue([QueueItem(case.reference_path, render_output_path)], settings)
-                status = "rendered" if summary.failed == 0 and summary.cancelled == 0 else "render_failed"
+                if _should_cancel(cancel_checker):
+                    raise AudioProcessorError("Processing cancelled")
+                summary = run_batch_queue(
+                    [QueueItem(case.reference_path, render_output_path)],
+                    settings,
+                    should_cancel=cancel_checker,
+                )
+                if summary.cancelled:
+                    status = "cancelled"
+                    warnings.append(_cancelled_warning("Real-eval rendering was cancelled."))
+                else:
+                    status = "rendered" if summary.failed == 0 else "render_failed"
                 if not render_output_path.exists():
-                    status = "render_failed"
+                    status = "cancelled" if status == "cancelled" else "render_failed"
                 render_summary = {"batch_summary": summary.__dict__}
             except Exception as exc:
-                status = "render_failed"
+                status = "cancelled" if _is_cancellation_exception(exc) else "render_failed"
                 render_summary = {"error": str(exc)}
-                warnings.append(
-                    {
-                        "severity": "error",
-                        "kind": "render_exception",
-                        "message": str(exc),
-                    }
-                )
+                if status == "cancelled":
+                    warnings.append(_cancelled_warning("Real-eval rendering was cancelled."))
+                else:
+                    warnings.append(
+                        {
+                            "severity": "error",
+                            "kind": "render_exception",
+                            "message": str(exc),
+                        }
+                    )
                 report = _report_with_extra_warnings(report, warnings)
         else:
             render_summary = {}
@@ -318,6 +382,19 @@ def run_real_suite(
             skipped_cases=skipped_cases,
         )
         _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
+        if status == "cancelled":
+            _append_cancelled_case_results(results, cases[case_index + 1 :], report_directory)
+            suite_summary = _suite_summary(
+                root=root,
+                manifest_path=manifest_path,
+                render=render,
+                results=results,
+                planned_case_count=planned_case_count,
+                runtime_preflight=runtime_preflight,
+                skipped_cases=skipped_cases,
+            )
+            _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
+            break
 
     suite_summary = _suite_summary(
         root=root,
@@ -377,6 +454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--case", dest="case_filter", help="substring filter for case names")
     parser.add_argument("--split", dest="split_filter", help="filter by split name")
     parser.add_argument("--output-root", type=Path, help="override report output root")
+    parser.add_argument("--stop-file", type=Path, help="stop-file path for graceful cancellation")
     parser.add_argument(
         "--write-template",
         type=Path,
@@ -399,6 +477,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         case_filter=args.case_filter,
         split_filter=args.split_filter,
         output_root=args.output_root,
+        stop_file=args.stop_file,
     )
     print(result.summary_path)
     print(result.markdown_path)
@@ -562,6 +641,8 @@ def _recommended_exit_code(
 ) -> int:
     if infrastructure_blocker["blocked"]:
         return INFRASTRUCTURE_BLOCKED_EXIT_CODE
+    if any(result.status == "cancelled" for result in results):
+        return CANCELLED_EXIT_CODE
     if any(result.status in FAILED_EXECUTION_STATUSES for result in results):
         return REAL_EVAL_FAILED_EXIT_CODE
     return 0
@@ -574,20 +655,30 @@ def _write_suite_outputs(
     results: Sequence[RealCaseResult],
 ) -> None:
     skipped_cases = suite_summary.get("skipped_cases", [])
-    summary_path.write_text(
-        json.dumps(
-            {
-                "format": REAL_REPORT_FORMAT,
-                "suite": suite_summary,
-                "cases": [_case_result_payload(result) for result in results],
-                "skipped_cases": skipped_cases if isinstance(skipped_cases, list) else [],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    _write_json_atomic(
+        summary_path,
+        {
+            "format": REAL_REPORT_FORMAT,
+            "suite": suite_summary,
+            "cases": [_case_result_payload(result) for result in results],
+            "skipped_cases": skipped_cases if isinstance(skipped_cases, list) else [],
+        },
     )
-    markdown_path.write_text(_render_markdown_report(suite_summary, results), encoding="utf-8")
+    _write_text_atomic(markdown_path, _render_markdown_report(suite_summary, results))
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _case_result_payload(result: RealCaseResult) -> dict[str, Any]:
@@ -605,6 +696,68 @@ def _case_result_payload(result: RealCaseResult) -> dict[str, Any]:
         "render_report_path": str(result.render_report_path) if result.render_report_path else "",
         "summary": result.summary,
         "warnings": result.warnings,
+    }
+
+
+def _append_cancelled_case_results(
+    results: list[RealCaseResult],
+    cases: Sequence[RealCase],
+    report_directory: Path,
+) -> None:
+    for case in cases:
+        case.output_directory.mkdir(parents=True, exist_ok=True)
+        analysis_path = report_directory / case.name / "analysis.json"
+        analysis_path.parent.mkdir(parents=True, exist_ok=True)
+        report = _case_cancelled_report(case, "Real-eval cancellation requested before this case started.")
+        _write_json_atomic(analysis_path, report)
+        results.append(
+            RealCaseResult(
+                case=case,
+                status="cancelled",
+                analysis_report_path=analysis_path,
+                output_path=None,
+                render_report_path=None,
+                summary=_case_summary(
+                    report,
+                    {},
+                    reference_path=case.reference_path,
+                    output_path=None,
+                    status="cancelled",
+                ),
+                warnings=list(report.get("warnings", [])),
+            )
+        )
+
+
+def _case_cancelled_report(case: RealCase, message: str) -> dict[str, Any]:
+    warning = _cancelled_warning(message)
+    return {
+        "format": "vocal_process_preflight_analysis_v1",
+        "reference_path": str(case.reference_path.expanduser()),
+        "material_directory": str(case.material_directory.expanduser()),
+        "lyrics_file": str(case.lyrics_file.expanduser()) if case.lyrics_file else "",
+        "status": "cancelled",
+        "summary": {
+            "material_count": 0,
+            "warning_count": 1,
+            "error_warning_count": 0,
+            "review_required_match_count": 0,
+            "minimum_match_score": 0.0,
+            "extreme_stretch_count": 0,
+            "moderate_stretch_count": 0,
+        },
+        "warnings": [warning],
+        "optimization": {},
+        "ordering": {"ordering": [], "timeline_alignment": {}},
+        "stretch_plan": [],
+    }
+
+
+def _cancelled_warning(message: str) -> dict[str, Any]:
+    return {
+        "severity": "warning",
+        "kind": "cancelled",
+        "message": message,
     }
 
 
@@ -702,6 +855,44 @@ def _runtime_preflight_report(compute_device: str) -> dict[str, Any]:
             "available": False,
             "issue": f"Speech runtime preflight failed: {exc}",
         }
+
+
+def _combined_cancel_checker(
+    should_cancel: CancelCallback | None,
+    stop_file: Path | None,
+) -> CancelCallback | None:
+    resolved_stop_file = stop_file or _stop_file_from_environment()
+    if resolved_stop_file is None and should_cancel is None:
+        return None
+    resolved_stop_file = resolved_stop_file.expanduser().resolve() if resolved_stop_file is not None else None
+
+    def check() -> bool:
+        if should_cancel is not None and should_cancel():
+            return True
+        return bool(resolved_stop_file is not None and resolved_stop_file.exists())
+
+    return check
+
+
+def _stop_file_from_environment() -> Path | None:
+    for name in ("VOCAL_PROCESS_STOP_FILE", "CODEX_AGENT_STOP_FILE"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return Path(value.strip())
+    return None
+
+
+def _should_cancel(should_cancel: CancelCallback | None) -> bool:
+    if should_cancel is None:
+        return False
+    try:
+        return bool(should_cancel())
+    except Exception:
+        return False
+
+
+def _is_cancellation_exception(exc: Exception) -> bool:
+    return isinstance(exc, AudioProcessorError) and str(exc) == "Processing cancelled"
 
 
 def _analysis_failure_warning(exc: Exception) -> dict[str, Any]:

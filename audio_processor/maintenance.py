@@ -272,6 +272,11 @@ def run_maintenance_session(
                 record_event("task.completed", cycle_index=current_cycle, task_index=task_index, result=task_result)
                 update_state()
 
+                if task_result.get("status") == "stopped":
+                    status = "stopped"
+                    record_event("session.stop_requested", stop_file=str(stop_path))
+                    update_state()
+                    break
                 if not task_result["ok"] and not task.continue_on_failure:
                     status = "failed"
                     break
@@ -392,53 +397,24 @@ def _run_task(
         stderr_path = task_log_dir / f"{log_base}.stderr.txt"
         started_at = time.time()
         try:
-            completed = subprocess.run(
-                command,
+            result = _run_process_task(
+                command=command,
                 cwd=cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=task.timeout_seconds,
-                stdin=subprocess.DEVNULL,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=task.timeout_seconds,
+                stop_path=stop_path,
+                poll_interval_seconds=poll_interval_seconds,
+                started_at=started_at,
             )
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
-            status = "ok" if completed.returncode == 0 else "failed"
-            _write_text(stdout_path, stdout)
-            _write_text(stderr_path, stderr)
             return {
                 "task_name": task.name,
                 "attempt": attempt,
-                "ok": completed.returncode == 0,
-                "status": status,
-                "returncode": completed.returncode,
+                **result,
                 "command": command,
                 "cwd": str(cwd),
                 "stdout_path": str(stdout_path),
                 "stderr_path": str(stderr_path),
-                "started_at": started_at,
-                "finished_at": time.time(),
-                "timeout_seconds": task.timeout_seconds,
-                "max_retries": task.max_retries,
-            }
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            _write_text(stdout_path, stdout)
-            _write_text(stderr_path, stderr)
-            result = {
-                "task_name": task.name,
-                "attempt": attempt,
-                "ok": False,
-                "status": "timeout",
-                "returncode": None,
-                "command": command,
-                "cwd": str(cwd),
-                "stdout_path": str(stdout_path),
-                "stderr_path": str(stderr_path),
-                "started_at": started_at,
-                "finished_at": time.time(),
                 "timeout_seconds": task.timeout_seconds,
                 "max_retries": task.max_retries,
             }
@@ -463,9 +439,104 @@ def _run_task(
                 "max_retries": task.max_retries,
             }
 
+        if result.get("status") == "stopped":
+            return result
         if attempt > task.max_retries or not task.continue_on_failure:
             return result
         _sleep_with_stop(task.retry_delay_seconds, poll_interval_seconds, stop_path)
+
+
+def _run_process_task(
+    *,
+    command: list[str],
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout_seconds: float | None,
+    stop_path: Path,
+    poll_interval_seconds: float,
+    started_at: float,
+) -> dict[str, Any]:
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.setdefault("VOCAL_PROCESS_STOP_FILE", str(stop_path))
+    deadline = started_at + timeout_seconds if timeout_seconds is not None and timeout_seconds > 0 else None
+
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout_handle:
+        with stderr_path.open("w", encoding="utf-8", errors="replace") as stderr_handle:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                env=env,
+            )
+            termination = ""
+            while True:
+                returncode = process.poll()
+                if returncode is not None:
+                    return {
+                        "ok": returncode == 0,
+                        "status": "ok" if returncode == 0 else "failed",
+                        "returncode": returncode,
+                        "started_at": started_at,
+                        "finished_at": time.time(),
+                        "termination": termination,
+                    }
+
+                if stop_path.exists():
+                    termination = "stop_file"
+                    returncode = _terminate_process(process, kill_after_seconds=5.0)
+                    return {
+                        "ok": False,
+                        "status": "stopped",
+                        "returncode": returncode,
+                        "started_at": started_at,
+                        "finished_at": time.time(),
+                        "termination": termination,
+                        "stop_file": str(stop_path),
+                    }
+
+                if deadline is not None and time.time() >= deadline:
+                    termination = "timeout"
+                    returncode = _kill_process(process)
+                    return {
+                        "ok": False,
+                        "status": "timeout",
+                        "returncode": returncode,
+                        "started_at": started_at,
+                        "finished_at": time.time(),
+                        "termination": termination,
+                    }
+
+                sleep_seconds = max(min(poll_interval_seconds, 0.5), 0.05)
+                if deadline is not None:
+                    sleep_seconds = min(sleep_seconds, max(deadline - time.time(), 0.05))
+                time.sleep(sleep_seconds)
+
+
+def _terminate_process(process: subprocess.Popen, *, kill_after_seconds: float) -> int | None:
+    try:
+        process.terminate()
+    except OSError:
+        return process.poll()
+    try:
+        return process.wait(timeout=kill_after_seconds)
+    except subprocess.TimeoutExpired:
+        return _kill_process(process)
+
+
+def _kill_process(process: subprocess.Popen) -> int | None:
+    try:
+        process.kill()
+    except OSError:
+        return process.poll()
+    try:
+        return process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        return process.poll()
 
 
 def _resolve_task_cwd(cwd: Path | None, workspace_root: Path) -> Path:
