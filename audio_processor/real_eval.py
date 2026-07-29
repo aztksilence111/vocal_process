@@ -29,7 +29,9 @@ INFRASTRUCTURE_WARNING_KINDS = {
     "speech_runtime_unavailable",
     "runtime_tool_unavailable",
 }
+REAL_EVAL_FAILED_EXIT_CODE = 1
 INFRASTRUCTURE_BLOCKED_EXIT_CODE = 2
+FAILED_EXECUTION_STATUSES = {"analysis_failed", "analysis_blocked", "render_failed"}
 
 
 @dataclass(frozen=True)
@@ -550,10 +552,19 @@ def _suite_summary(
         "group_score_summary": _suite_group_score_summary(results),
         "runtime_preflight": runtime_preflight,
         "infrastructure_blocker": infrastructure_blocker,
-        "recommended_exit_code": INFRASTRUCTURE_BLOCKED_EXIT_CODE
-        if infrastructure_blocker["blocked"]
-        else 0,
+        "recommended_exit_code": _recommended_exit_code(results, infrastructure_blocker),
     }
+
+
+def _recommended_exit_code(
+    results: Sequence[RealCaseResult],
+    infrastructure_blocker: dict[str, Any],
+) -> int:
+    if infrastructure_blocker["blocked"]:
+        return INFRASTRUCTURE_BLOCKED_EXIT_CODE
+    if any(result.status in FAILED_EXECUTION_STATUSES for result in results):
+        return REAL_EVAL_FAILED_EXIT_CODE
+    return 0
 
 
 def _write_suite_outputs(
@@ -718,6 +729,10 @@ def _analysis_failure_kind(message: str) -> str:
     if (
         "huggingface.co" in lowered
         or "hugging face" in lowered
+        or "localentrynotfounderror" in lowered
+        or "filemetadataerror" in lowered
+        or "locate the file on the hub" in lowered
+        or "requested files in the local cache" in lowered
         or "maxretryerror" in lowered
         or "sslcertverificationerror" in lowered
         or "certificate_verify_failed" in lowered

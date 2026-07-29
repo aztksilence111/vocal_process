@@ -1279,3 +1279,27 @@ Acceptance impact:
 1. Future ordering/timing score improvements must be measured on language-compatible groups only.
 2. A user-created mismatch during normal GUI/CLI/batch testing should fail fast with a language mismatch error instead of producing a misleading rendered output.
 3. Long autonomous runs should include skipped-case counts in human-readable reports so reviewers can distinguish intentional filtering from missing test coverage.
+
+### 2026-07-30: WhisperX Runtime Gate Reopened
+
+本轮把真实渲染评测从“模型/运行时阻塞”推进到“实际排序与拉伸质量不足”的阶段。核心修复不是降低验收标准，而是让 WhisperX 路径真正可运行、可缓存、可复查。
+
+已完成的架构修复：
+
+1. `run_real_eval_render_full.ps1` 现在强制 WhisperX，并为后台自治设置项目模型缓存、可覆盖的 Hugging Face 镜像端点、下载超时、禁用 Xet、UTF-8 Python 输出环境。
+2. WhisperX/Pyannote 在当前 PyTorch 安全加载策略下可通过受限 safe-globals 白名单加载 checkpoint；没有使用 `weights_only=False`。
+3. 运行时会把 stdout/stderr 重配为 UTF-8 replace，避免 Windows GBK 控制台把 WhisperX 对齐日志中的中/日/韩字符变成 fatal exception。
+4. 素材分析缓存现在校验 ASR backend。旧 `whisper` 或未记录 backend 的素材缓存不会再污染 WhisperX 真实验收。
+5. real-eval 的退出码更适合后台自治：基础设施阻塞为 2，执行失败为 1，质量未达标但已生成真实跑分则保持 0。
+
+当前真实证据：
+
+1. `audio_processor check` 显示 Whisper、Faster-Whisper、WhisperX、Silero VAD、SpeechBrain 缓存均为 True。
+2. `tests_real\output\real-eval-20260730-040430\summary.json` 是 `render=True` 单用例真实报告，已生成拼接音频 `tests_real\output\1000nenyikiteru_JP\vmzJP\1000nenyikiteru_JP.wav`。
+3. 单用例跑分为：`planning_alignment_score.mean=0.480188`，`rendered_audio_alignment_score.mean=0.608193`，`match_ordering_score.mean=0.110427`，`render_duration_delta_ratio.mean=0.007794`，`strict_render_pass_count=0`。
+4. 下一阶段优化应直接针对 `low_match_score`、`ambiguous_phonetic_position`、`extreme_stretch_ratio`、`timed_target_duration_ratio`、`aligned_timing_score` 和各 group score，不再停留在可行性验证或模型下载修复。
+
+后续自治注意事项：
+
+1. 完整 13 个兼容用例的 `render=True` 套件会比之前慢很多，因为旧素材缓存被正确失效后需要 WhisperX 重算；这属于真实验收成本，不应回退到 segment-only ASR。
+2. 后台轮次应优先比较 `summary.json` 里的 `score_summary` 与 `group_score_summary`，按最差 reference/material/language 组做通用算法修复，避免对单个文件名或歌曲硬编码。

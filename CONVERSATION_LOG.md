@@ -1292,3 +1292,17 @@ Remaining after this continuation:
 5. Current `tests_real` discovery now yields 13 executable cases and 15 skipped `language_mismatch` cases. JP references only pair with `vmzJP`; CN references pair with the CN material sets and no longer pair with `vmzJP`.
 6. Added regressions for discovery filtering, skipped-case reporting, explicit filename mismatch errors, lyrics-detected mismatch errors, ASR-detected mismatch errors, and pinyin material-set language inference.
 7. Verification passed: `compileall`, targeted `RealEvalTests`/`ModelRuntimeTests`, full `unittest discover` with 116 tests, `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.
+
+### 2026-07-30: WhisperX Runtime Repair and Rendered Smoke Evidence
+
+1. 用户要求如果 `faster-whisper` 不理想就切换到 WhisperX，并在修复后继续后台自治运行。
+2. 已将 `scripts\run_real_eval_render_full.ps1` 固定为 WhisperX 后端，并默认设置项目模型缓存、`HF_ENDPOINT=https://hf-mirror.com`、Hugging Face 超时、禁用 Xet、`PYTHONIOENCODING=utf-8` 和 `PYTHONUTF8=1`。这些默认值可被外部环境变量覆盖。
+3. 本机官方 Hugging Face 直连仍超时；通过可连通镜像补齐 `Systran/faster-whisper-base` 缓存。`audio_processor check` 现在显示 Whisper、Faster-Whisper、WhisperX、Silero VAD、SpeechBrain 缓存均为 True。
+4. 修复了 PyTorch `weights_only=True` 与 WhisperX/Pyannote checkpoint 的兼容问题：只加入 OmegaConf、PyTorch 版本对象、Pyannote 元数据类和 Python 基本容器/标量类型白名单，没有改成 `weights_only=False`。
+5. 修复了 Windows GBK stdout/stderr 导致 WhisperX 打印非 GBK 文本时报 `UnicodeEncodeError` 的问题，运行时会把文本输出重配为 UTF-8 replace。
+6. 修复素材分析缓存污染：显式 `material_cache_dir` 也会记录并校验当前 ASR backend，旧 `whisper` 或缺少 `asr_backend` 的素材缓存会自动失效重算。
+7. 修复真实评测退出码：基础设施阻塞返回 2，非基础设施的 `analysis_failed` / `render_failed` 返回 1，避免后台自治把全失败报告误判成功。
+8. 真实 `render=True` 单用例 `1000nenyikiteru_JP__vmzJP` 已成功渲染输出拼接音频 `tests_real\output\1000nenyikiteru_JP\vmzJP\1000nenyikiteru_JP.wav`，报告为 `tests_real\output\real-eval-20260730-040430\summary.json`。
+9. 该单用例真实跑分：`status_counts={"rendered":1}`，`planning_alignment_score.mean=0.480188`，`rendered_audio_alignment_score.mean=0.608193`，`match_ordering_score.mean=0.110427`，`render_duration_delta_ratio.mean=0.007794`，`strict_render_pass_count=0`。
+10. 当前质量问题已进入实际排序/拉伸优化阶段：`low_match_score=38`、`ambiguous_phonetic_position=55`、`extreme_stretch_ratio=81`、`moderate_stretch_ratio=12`、`single_syllable_extreme_stretch=2`。
+11. 验证通过：`compileall`、相关 46 个单测、完整 `unittest discover` 124 个测试、`audio_processor check`、`git diff --check`（仅 CRLF 提示）。

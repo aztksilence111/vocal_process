@@ -601,6 +601,46 @@ class ToolResolutionTests(unittest.TestCase):
         self.assertEqual(tool_dirs, [portable_bin.resolve()])
         self.assertEqual(path_parts[0], str(portable_bin.resolve()))
 
+    def test_runtime_tool_paths_expose_existing_path_tool_dir_to_child_libraries(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            tool_dir = Path(temp_dir) / "ffmpeg-bin"
+            tool_dir.mkdir()
+            executable = tool_dir / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
+            executable.write_bytes(b"")
+
+            def fake_which(name: str) -> str | None:
+                if name == "ffmpeg":
+                    return str(executable)
+                return None
+
+            with patch("audio_processor.engine._runtime_tool_roots", return_value=[]):
+                with patch("audio_processor.engine._windows_common_runtime_tool_directories", return_value=[]):
+                    with patch("shutil.which", side_effect=fake_which):
+                        with patch.dict(os.environ, {"PATH": r"C:\Windows"}, clear=False):
+                            tool_dirs = ensure_runtime_tool_paths()
+                            path_parts = os.environ["PATH"].split(os.pathsep)
+
+        self.assertEqual(tool_dirs, [tool_dir.resolve()])
+        self.assertEqual(path_parts[0], str(tool_dir.resolve()))
+
+    def test_runtime_tool_paths_expose_configured_tool_dir_when_path_is_stripped(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            tool_dir = Path(temp_dir) / "configured-ffmpeg"
+            tool_dir.mkdir()
+            executable = tool_dir / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
+            executable.write_bytes(b"")
+
+            env = {"PATH": r"C:\Windows", "VOCAL_PROCESS_FFMPEG_DIR": str(tool_dir)}
+            with patch("audio_processor.engine._runtime_tool_roots", return_value=[]):
+                with patch("audio_processor.engine._windows_common_runtime_tool_directories", return_value=[]):
+                    with patch("shutil.which", return_value=None):
+                        with patch.dict(os.environ, env, clear=True):
+                            tool_dirs = ensure_runtime_tool_paths()
+                            path_parts = os.environ["PATH"].split(os.pathsep)
+
+        self.assertEqual(tool_dirs, [tool_dir.resolve()])
+        self.assertEqual(path_parts[0], str(tool_dir.resolve()))
+
 
 class ProbeSummaryTests(unittest.TestCase):
     def test_summarizes_probe_data(self) -> None:
@@ -1119,6 +1159,15 @@ class RealEvalTests(unittest.TestCase):
         self.assertEqual(summary_payload["suite"]["recommended_exit_code"], 2)
         self.assertIn("Infrastructure blocker", markdown)
 
+    def test_real_eval_classifies_hub_local_entry_missing_as_download_blocker(self) -> None:
+        message = (
+            "WhisperX transcription failed for song_JP.wav: LocalEntryNotFoundError: "
+            "An error happened while trying to locate the file on the Hub and we cannot find "
+            "the requested files in the local cache."
+        )
+
+        self.assertEqual(real_eval._analysis_failure_kind(message), "asr_model_download_failed")
+
     def test_real_eval_stops_after_shared_infrastructure_blocker(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1191,6 +1240,39 @@ class RealEvalTests(unittest.TestCase):
                         )
 
         self.assertEqual(exit_code, 2)
+
+    def test_real_eval_main_returns_nonzero_for_analysis_failure(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzJP"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            _write_test_wave(origin / "song_JP.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "a.wav", duration_seconds=1.0)
+
+            with patch(
+                "audio_processor.real_eval.speech_runtime_preflight_report",
+                return_value={"preferred_backend": "whisperx", "available": True, "issue": ""},
+            ):
+                with patch("audio_processor.real_eval.build_preflight_report", side_effect=RuntimeError("analysis boom")):
+                    with patch("builtins.print"):
+                        exit_code = real_eval.main(
+                            [
+                                "--root",
+                                str(root),
+                                "--source-separation",
+                                "never",
+                                "--output-root",
+                                str(root / "reports"),
+                            ]
+                        )
+
+            summary_path = sorted((root / "reports").glob("real-eval-*/summary.json"))[-1]
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary_payload["suite"]["recommended_exit_code"], 1)
 
     def test_real_eval_infrastructure_signature_ignores_request_ids_and_reference_paths(self) -> None:
         first = (
@@ -1893,6 +1975,7 @@ class ModelRuntimeTests(unittest.TestCase):
                     {
                         "format": "vocal_process_material_cache_v1",
                         "asr_model": model_runtime.DEFAULT_ASR_MODEL,
+                        "asr_backend": model_runtime._asr_backend_cache_key(),
                         "snapshot": snapshot,
                         "materials": [
                             {
@@ -1923,6 +2006,54 @@ class ModelRuntimeTests(unittest.TestCase):
         transcribe_mock.assert_not_called()
         vad_mock.assert_not_called()
         speaker_mock.assert_not_called()
+
+    def test_model_cache_snapshot_rejects_different_asr_backend(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            material_path = material_dir / "001.wav"
+            _write_test_wave(material_path)
+            cache_path = material_dir / ".vocalprocess_material_cache.json"
+            snapshot = model_runtime._material_snapshot([material_path])
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "format": "vocal_process_material_cache_v1",
+                        "asr_model": model_runtime.DEFAULT_ASR_MODEL,
+                        "asr_backend": "auto",
+                        "snapshot": snapshot,
+                        "materials": [
+                            {
+                                "path": str(material_path),
+                                "duration_seconds": 1.0,
+                                "transcript": "stale",
+                                "filename_text": "001",
+                                "segments": [],
+                                "vad_segments": [],
+                                "speaker_embedding": None,
+                                "backend": "cache",
+                                "notes": [],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"VOCAL_PROCESS_ASR_BACKEND": "whisperx"}, clear=False):
+                with patch(
+                    "audio_processor.model_runtime._transcribe_audio",
+                    return_value={"backend": "whisperx", "text": "fresh", "segments": [], "notes": []},
+                ) as transcribe_mock:
+                    with patch("audio_processor.model_runtime._detect_vad_segments", return_value=()):
+                        with patch("audio_processor.model_runtime._speaker_embedding", return_value=None):
+                            library = model_runtime.analyze_material_library(material_dir)
+
+        self.assertEqual(library.materials[0].transcript, "fresh")
+        transcribe_mock.assert_called_once()
 
     def test_material_analysis_can_write_cache_outside_source_directory(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -2403,6 +2534,110 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertIn("torch._C", issue)
         self.assertIn("full portable package", issue)
 
+    def test_torch_safe_globals_allow_omegaconf_checkpoint_containers(self) -> None:
+        class Container:
+            pass
+
+        class ContainerMetadata:
+            pass
+
+        class Metadata:
+            pass
+
+        class Node:
+            pass
+
+        class DictConfig:
+            pass
+
+        class ListConfig:
+            pass
+
+        class AnyNode:
+            pass
+
+        class BooleanNode:
+            pass
+
+        class FloatNode:
+            pass
+
+        class IntegerNode:
+            pass
+
+        class StringNode:
+            pass
+
+        class TorchVersion:
+            pass
+
+        class Introspection:
+            pass
+
+        class Output:
+            pass
+
+        class Problem:
+            pass
+
+        class Resolution:
+            pass
+
+        class Specifications:
+            pass
+
+        class Segment:
+            pass
+
+        class SlidingWindow:
+            pass
+
+        added: list[object] = []
+        modules = {
+            "torch.serialization": SimpleNamespace(add_safe_globals=lambda values: added.extend(values)),
+            "torch.torch_version": SimpleNamespace(TorchVersion=TorchVersion),
+            "omegaconf.base": SimpleNamespace(
+                Container=Container,
+                ContainerMetadata=ContainerMetadata,
+                Metadata=Metadata,
+                Node=Node,
+            ),
+            "omegaconf.dictconfig": SimpleNamespace(DictConfig=DictConfig),
+            "omegaconf.listconfig": SimpleNamespace(ListConfig=ListConfig),
+            "omegaconf.nodes": SimpleNamespace(
+                AnyNode=AnyNode,
+                BooleanNode=BooleanNode,
+                FloatNode=FloatNode,
+                IntegerNode=IntegerNode,
+                StringNode=StringNode,
+            ),
+            "pyannote.audio.core.model": SimpleNamespace(Introspection=Introspection, Output=Output),
+            "pyannote.audio.core.task": SimpleNamespace(
+                Problem=Problem,
+                Resolution=Resolution,
+                Specifications=Specifications,
+            ),
+            "pyannote.core.segment": SimpleNamespace(Segment=Segment, SlidingWindow=SlidingWindow),
+        }
+
+        with patch("audio_processor.model_runtime.importlib.import_module", side_effect=modules.__getitem__):
+            model_runtime._prepare_torch_weights_safe_globals()
+
+        self.assertIn(model_runtime.Any, added)
+        self.assertIn(list, added)
+        self.assertIn(dict, added)
+        self.assertIn(model_runtime.defaultdict, added)
+        self.assertIn(model_runtime.Counter, added)
+        self.assertIn(int, added)
+        self.assertIn(str, added)
+        self.assertIn(TorchVersion, added)
+        self.assertIn(ListConfig, added)
+        self.assertIn(DictConfig, added)
+        self.assertIn(AnyNode, added)
+        self.assertIn(Introspection, added)
+        self.assertIn(Specifications, added)
+        self.assertIn(SlidingWindow, added)
+
     def test_ffmpeg_start_failure_message_points_to_portable_bin(self) -> None:
         with patch(
             "audio_processor.model_runtime.ensure_runtime_tool_paths",
@@ -2413,6 +2648,64 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertIn("FFmpeg executable could not be started", message)
         self.assertIn("bin\\ffmpeg.exe", message)
         self.assertIn("VocalProcess", message)
+
+    def test_prepare_text_output_encoding_sets_utf8_streams(self) -> None:
+        class FakeStream:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def reconfigure(self, **kwargs: object) -> None:
+                self.calls.append(kwargs)
+
+        stdout = FakeStream()
+        stderr = FakeStream()
+
+        with patch.object(sys, "stdout", stdout):
+            with patch.object(sys, "stderr", stderr):
+                with patch.dict(os.environ, {}, clear=True):
+                    model_runtime._prepare_text_output_encoding()
+                    self.assertEqual(os.environ["PYTHONIOENCODING"], "utf-8")
+                    self.assertEqual(os.environ["PYTHONUTF8"], "1")
+
+        self.assertEqual(stdout.calls, [{"encoding": "utf-8", "errors": "replace"}])
+        self.assertEqual(stderr.calls, [{"encoding": "utf-8", "errors": "replace"}])
+
+    def test_whisperx_model_file_not_found_is_not_reported_as_ffmpeg_missing(self) -> None:
+        class HubFileNotFoundError(FileNotFoundError):
+            pass
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "input.wav"
+            _write_test_wave(audio)
+            hub_error = HubFileNotFoundError(
+                "An error happened while trying to locate the file on the Hub and we cannot find "
+                "the requested files in the local cache."
+            )
+
+            with patch.dict(
+                os.environ,
+                {"VOCAL_PROCESS_ASR_BACKEND": "whisperx", "VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD": "1"},
+                clear=False,
+            ):
+                with patch.dict(sys.modules, {"whisperx": SimpleNamespace()}, clear=False):
+                    with patch("audio_processor.model_runtime.ensure_runtime_tool_paths", return_value=[]):
+                        with patch("audio_processor.model_runtime._ensure_model_download_tls", return_value=None):
+                            with patch("audio_processor.model_runtime._speech_runtime_issue", return_value=""):
+                                with patch("audio_processor.model_runtime._module_available", return_value=True):
+                                    with patch("audio_processor.model_runtime._prepare_torchaudio_legacy_api"):
+                                        with patch(
+                                            "audio_processor.model_runtime._load_whisperx_model",
+                                            side_effect=hub_error,
+                                        ):
+                                            with self.assertRaises(AudioProcessorError) as raised:
+                                                model_runtime._transcribe_audio(audio, compute_device="cpu")
+
+        message = str(raised.exception)
+        self.assertIn("WhisperX transcription failed", message)
+        self.assertIn("HubFileNotFoundError", message)
+        self.assertIn("requested files in the local cache", message)
+        self.assertNotIn("FFmpeg executable could not be started", message)
 
 
 class DawRenderReuseTests(unittest.TestCase):

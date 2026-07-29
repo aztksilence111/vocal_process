@@ -136,15 +136,11 @@ def get_environment_report() -> list[str]:
 
 
 def ensure_runtime_tool_paths() -> list[Path]:
-    """Expose bundled FFmpeg tools to child libraries that invoke ffmpeg by name."""
+    """Expose FFmpeg tools to child libraries that invoke ffmpeg by name."""
 
-    tool_dirs: list[Path] = []
-    for root in _runtime_tool_roots():
-        for candidate in (root / "bin", root):
-            if _contains_runtime_tool(candidate):
-                resolved = candidate.resolve()
-                if resolved not in tool_dirs:
-                    tool_dirs.append(resolved)
+    tool_dirs = _bundled_runtime_tool_directories()
+    if not tool_dirs:
+        tool_dirs = _system_runtime_tool_directories()
 
     if not tool_dirs:
         return []
@@ -1120,6 +1116,79 @@ def _candidate_tool_paths(name: str) -> list[Path]:
     for root in _runtime_tool_roots():
         candidates.append(root / executable_name)
         candidates.append(root / "bin" / executable_name)
+    return candidates
+
+
+def _bundled_runtime_tool_directories() -> list[Path]:
+    tool_dirs: list[Path] = []
+    for root in _runtime_tool_roots():
+        for candidate in (root / "bin", root):
+            _append_runtime_tool_directory(tool_dirs, candidate)
+    return tool_dirs
+
+
+def _system_runtime_tool_directories() -> list[Path]:
+    tool_dirs: list[Path] = []
+    for candidate in _configured_runtime_tool_directories():
+        _append_runtime_tool_directory(tool_dirs, candidate)
+    for tool_name in ("ffmpeg", "ffprobe"):
+        resolved = shutil.which(tool_name)
+        if resolved:
+            _append_runtime_tool_directory(tool_dirs, Path(resolved).parent)
+    if sys.platform.startswith("win"):
+        for candidate in _windows_common_runtime_tool_directories():
+            _append_runtime_tool_directory(tool_dirs, candidate)
+    return tool_dirs
+
+
+def _append_runtime_tool_directory(tool_dirs: list[Path], candidate: Path) -> None:
+    if not _contains_runtime_tool(candidate):
+        return
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        resolved = candidate
+    if resolved not in tool_dirs:
+        tool_dirs.append(resolved)
+
+
+def _configured_runtime_tool_directories() -> list[Path]:
+    candidates: list[Path] = []
+    for env_name in ("VOCAL_PROCESS_FFMPEG_DIR", "VOCAL_PROCESS_RUNTIME_TOOL_DIRS"):
+        value = os.environ.get(env_name, "")
+        if not value.strip():
+            continue
+        for part in value.split(os.pathsep):
+            path_text = part.strip()
+            if path_text:
+                candidates.append(_runtime_tool_directory_from_value(path_text))
+    return candidates
+
+
+def _runtime_tool_directory_from_value(value: str) -> Path:
+    path = Path(value).expanduser()
+    if _normal_tool_name(path.name) in {"ffmpeg", "ffprobe"}:
+        return path.parent
+    return path
+
+
+def _windows_common_runtime_tool_directories() -> list[Path]:
+    candidates: list[Path] = []
+    program_data = os.environ.get("ProgramData")
+    if program_data:
+        base = Path(program_data)
+    else:
+        base = Path(os.environ.get("SystemDrive", "C:") + "\\ProgramData")
+    candidates.append(base / "chocolatey" / "bin")
+    candidates.append(base / "chocolatey" / "lib" / "ffmpeg" / "tools" / "ffmpeg" / "bin")
+
+    user_profile = os.environ.get("USERPROFILE")
+    if user_profile:
+        candidates.append(Path(user_profile) / "scoop" / "shims")
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "Microsoft" / "WinGet" / "Links")
     return candidates
 
 

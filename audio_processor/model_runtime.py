@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import importlib
 import contextlib
-from collections import namedtuple
+from collections import Counter, OrderedDict, defaultdict, namedtuple
 import fnmatch
 import hashlib
 import io
@@ -45,6 +45,10 @@ from .uvr_worker import (
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
+
+
+class _WhisperXAudioLoadFailed(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -1472,6 +1476,7 @@ def _transcribe_audio(
     should_cancel: CancelCallback | None = None,
 ) -> dict[str, Any]:
     _raise_if_cancelled(should_cancel)
+    _prepare_text_output_encoding()
     ensure_runtime_tool_paths()
     _ensure_model_download_tls()
     work_root = _prepare_work_root(work_dir)
@@ -1515,7 +1520,11 @@ def _transcribe_audio(
                     device,
                 )
                 _raise_if_cancelled(should_cancel)
-                audio = whisperx.load_audio(str(path))
+                try:
+                    audio = whisperx.load_audio(str(path))
+                except FileNotFoundError as exc:
+                    message = _ffmpeg_start_failure_message("WhisperX", path)
+                    raise _WhisperXAudioLoadFailed(message) from exc
                 _raise_if_cancelled(should_cancel)
                 result = model.transcribe(audio, batch_size=4)
                 _raise_if_cancelled(should_cancel)
@@ -1556,16 +1565,15 @@ def _transcribe_audio(
                 language = str(result.get("language") or "")
                 notes = [*fallback_notes, f"language={language}"] if language else fallback_notes
                 return {"backend": "whisperx", "text": text, "segments": segments, "notes": notes}
-            except FileNotFoundError as exc:
-                message = _ffmpeg_start_failure_message("WhisperX", path)
+            except _WhisperXAudioLoadFailed as exc:
                 if preferred_backend == "whisperx":
-                    raise AudioProcessorError(message) from exc
-                fallback_notes.append(message)
+                    raise AudioProcessorError(str(exc)) from exc
+                fallback_notes.append(str(exc))
             except Exception as exc:
                 if preferred_backend == "whisperx":
-                    raise AudioProcessorError(f"WhisperX transcription failed for {path}: {exc}") from exc
+                    raise AudioProcessorError(_backend_exception_message("WhisperX", path, exc)) from exc
                 # Fall through to Whisper if WhisperX is unavailable or fails on a specific file.
-                fallback_notes.append(f"whisperx failed: {exc}")
+                fallback_notes.append(_backend_exception_message("WhisperX", path, exc))
 
     _raise_if_cancelled(should_cancel)
     return _transcribe_with_whisper(
@@ -1670,12 +1678,28 @@ def _transcribe_with_whisper(
         raise AudioProcessorError(f"Whisper transcription failed for {path}: {exc}") from exc
 
 
+def _backend_exception_message(backend_name: str, path: Path, exc: Exception) -> str:
+    return f"{backend_name} transcription failed for {path}: {type(exc).__name__}: {exc}"
+
+
+def _prepare_text_output_encoding() -> None:
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    os.environ.setdefault("PYTHONUTF8", "1")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(Exception):
+                reconfigure(encoding="utf-8", errors="replace")
+
+
 def _ffmpeg_start_failure_message(backend_name: str, path: Path) -> str:
-    tool_dirs = ", ".join(str(path) for path in ensure_runtime_tool_paths()) or "no bundled tool directory found"
+    tool_dirs = ", ".join(str(path) for path in ensure_runtime_tool_paths()) or "no runtime tool directory found"
     return (
         f"{backend_name} transcription failed for {path}: FFmpeg executable could not be started. "
-        "For the portable package, keep the whole VocalProcess folder together and verify "
-        f"`bin\\ffmpeg.exe` exists. Runtime tool directories: {tool_dirs}"
+        "Verify FFmpeg is installed on PATH, or for the portable package keep the whole "
+        f"VocalProcess folder together and verify `bin\\ffmpeg.exe` exists. "
+        f"Runtime tool directories: {tool_dirs}"
     )
 
 
@@ -1960,6 +1984,8 @@ def _load_material_library_cache(
         return None
     if raw.get("asr_model") != DEFAULT_ASR_MODEL:
         return None
+    if raw.get("asr_backend") != _asr_backend_cache_key():
+        return None
     if raw.get("snapshot") != list(snapshot):
         return None
 
@@ -1988,6 +2014,7 @@ def _write_material_library_cache(
     payload = {
         "format": "vocal_process_material_cache_v1",
         "asr_model": DEFAULT_ASR_MODEL,
+        "asr_backend": _asr_backend_cache_key(),
         "snapshot": list(snapshot),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
     }
@@ -2003,11 +2030,15 @@ def _material_cache_path(material_directory: Path, material_cache_dir: Path | No
     return base / MATERIAL_CACHE_FILE
 
 
+def _asr_backend_cache_key() -> str:
+    return os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower() or "auto"
+
+
 def _default_material_cache_dir(work_root: Path, material_directory: Path, compute_device: str) -> Path:
     payload = {
         "material_directory": str(material_directory.expanduser().resolve()),
         "asr_model": DEFAULT_ASR_MODEL,
-        "asr_backend": os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower(),
+        "asr_backend": _asr_backend_cache_key(),
         "compute_device": compute_device,
     }
     key = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -2025,7 +2056,7 @@ def _reference_cache_path(
         "reference": _file_snapshot(reference_path),
         "lyrics": _optional_file_snapshot(lyrics_file.expanduser()) if lyrics_file else None,
         "asr_model": DEFAULT_ASR_MODEL,
-        "asr_backend": os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower(),
+        "asr_backend": _asr_backend_cache_key(),
         "reference_unit_timing_format": "voice_unit_timing_v1",
         "whisperx_return_char_alignments": True,
         "speaker_model": SPEAKER_EMBEDDING_MODEL,
@@ -3268,6 +3299,60 @@ def _prepare_torchaudio_legacy_api() -> None:
     except Exception:
         torchaudio.load = load  # type: ignore[assignment]
         torchaudio.save = save  # type: ignore[assignment]
+
+    _prepare_torch_weights_safe_globals()
+
+
+def _prepare_torch_weights_safe_globals() -> None:
+    try:
+        torch_serialization = importlib.import_module("torch.serialization")
+        add_safe_globals = getattr(torch_serialization, "add_safe_globals", None)
+        if not callable(add_safe_globals):
+            return
+    except Exception:
+        return
+
+    safe_globals: list[Any] = [
+        Any,
+        list,
+        dict,
+        tuple,
+        set,
+        frozenset,
+        defaultdict,
+        OrderedDict,
+        Counter,
+        int,
+        float,
+        str,
+        bool,
+        bytes,
+        type(None),
+    ]
+    for module_name, class_names in (
+        ("torch.torch_version", ("TorchVersion",)),
+        ("omegaconf.base", ("Container", "ContainerMetadata", "Metadata", "Node")),
+        ("omegaconf.dictconfig", ("DictConfig",)),
+        ("omegaconf.listconfig", ("ListConfig",)),
+        ("omegaconf.nodes", ("AnyNode", "BooleanNode", "FloatNode", "IntegerNode", "StringNode")),
+        ("pyannote.audio.core.model", ("Introspection", "Output")),
+        ("pyannote.audio.core.task", ("Problem", "Resolution", "Specifications")),
+        ("pyannote.core.segment", ("Segment", "SlidingWindow")),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        for class_name in class_names:
+            candidate = getattr(module, class_name, None)
+            if candidate is not None:
+                safe_globals.append(candidate)
+
+    if safe_globals:
+        try:
+            add_safe_globals(safe_globals)
+        except Exception:
+            return
 
 
 def _vad_coverage(vad_segments: Sequence[tuple[float, float]], duration_seconds: float) -> float | None:
