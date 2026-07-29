@@ -4,7 +4,7 @@ import importlib.util
 import math
 import re
 import unicodedata
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Sequence
@@ -25,6 +25,20 @@ class ModelCandidate:
 
 
 @dataclass(frozen=True)
+class VoiceUnitTiming:
+    position: int
+    unit: str
+    start_seconds: float
+    end_seconds: float
+    confidence: float | None = None
+    timing_source: str = ""
+
+    @property
+    def duration_seconds(self) -> float:
+        return max(self.end_seconds - self.start_seconds, 0.0)
+
+
+@dataclass(frozen=True)
 class VoiceSegment:
     start_seconds: float
     end_seconds: float
@@ -32,6 +46,7 @@ class VoiceSegment:
     speaker_id: str | None = None
     confidence: float | None = None
     timing_source: str = ""
+    unit_timings: tuple[VoiceUnitTiming, ...] = ()
 
     @property
     def duration_seconds(self) -> float:
@@ -346,7 +361,7 @@ def plan_material_ordering(
         return MaterialOrderingPlan(
             decisions=tuple(
                 _order_materials_by_reference_text(
-                    " ".join(segment.text for segment in usable_reference),
+                    usable_reference,
                     materials,
                     reference_embedding=reference_embedding,
                     reference_duration_hint=reference_duration_hint,
@@ -391,12 +406,13 @@ def phonetic_similarity(left: str, right: str) -> float:
 
 
 def _order_materials_by_reference_text(
-    reference_text: str,
+    reference_segments: Sequence[VoiceSegment],
     materials: Sequence[MaterialAnalysis],
     *,
     reference_embedding: tuple[float, ...] | None,
     reference_duration_hint: float,
 ) -> list[MaterialOrderDecision]:
+    reference_text = " ".join(segment.text for segment in reference_segments)
     aggregate_reference = VoiceSegment(0.0, reference_duration_hint, reference_text)
     scored: list[tuple[int, float, str, MaterialScoreBreakdown]] = []
     for material_index, material in enumerate(materials):
@@ -409,7 +425,7 @@ def _order_materials_by_reference_text(
             reference_duration_hint=reference_duration_hint,
             allow_position_reason=True,
         )
-        position = _material_text_position(reference_text, material)
+        position = _score_reference_position(score)
         fallback_position = 10**9
         scored.append(
             (
@@ -422,7 +438,7 @@ def _order_materials_by_reference_text(
 
     decisions: list[MaterialOrderDecision] = []
     for rank, (_, _, _, score) in enumerate(sorted(scored, key=lambda item: item[:3]), start=1):
-        decisions.append(_decision_from_score(rank, score))
+        decisions.append(_localize_aggregate_decision(_decision_from_score(rank, score), reference_segments))
     return decisions
 
 
@@ -513,6 +529,7 @@ def _score_material_against_reference(
     text_position = _material_text_position(reference_segment.text, material)
     phonetic_position = phonetic_match.position
     phonetic_position_count = phonetic_match.position_count
+    reference_position = text_position if text_position is not None else phonetic_position
     score = _candidate_score(
         transcript_score=transcript_score,
         filename_score=filename_score,
@@ -538,7 +555,7 @@ def _score_material_against_reference(
         filename_score=filename_score,
         phonetic_score=phonetic_score,
         duration_score=duration_score,
-        position=text_position if allow_position_reason else None,
+        position=reference_position if allow_position_reason else None,
     )
     return MaterialScoreBreakdown(
         reference_index=reference_index,
@@ -583,7 +600,7 @@ def _global_assignment_decisions(
     reference_count = len(reference_segments)
     if material_count > reference_count:
         return _order_materials_by_reference_text(
-            " ".join(segment.text for segment in reference_segments),
+            reference_segments,
             materials,
             reference_embedding=None,
             reference_duration_hint=_reference_duration_hint(reference_segments),
@@ -646,6 +663,112 @@ def _decision_from_score(rank: int, score: MaterialScoreBreakdown) -> MaterialOr
         phonetic_tone_position=score.phonetic_tone_position,
         phonetic_tone_position_count=score.phonetic_tone_position_count,
     )
+
+
+def _score_reference_position(score: MaterialScoreBreakdown) -> int | None:
+    if score.text_position is not None:
+        return score.text_position
+    return score.phonetic_position
+
+
+@dataclass(frozen=True)
+class _SegmentPosition:
+    segment_index: int
+    local_position: int
+
+
+def _localize_aggregate_decision(
+    decision: MaterialOrderDecision,
+    reference_segments: Sequence[VoiceSegment],
+) -> MaterialOrderDecision:
+    text_position = (
+        _map_compact_position_to_segment_unit(reference_segments, decision.text_position)
+        if decision.text_position is not None
+        else None
+    )
+    phonetic_position = (
+        _map_phonetic_position_to_segment_unit(reference_segments, decision.phonetic_position)
+        if decision.phonetic_position is not None
+        else None
+    )
+    primary = text_position or phonetic_position
+    if primary is None or not 0 <= primary.segment_index < len(reference_segments):
+        return replace(
+            decision,
+            reference_segment_index=None,
+            text_position=None,
+            phonetic_position=None,
+        )
+
+    segment = reference_segments[primary.segment_index]
+    return replace(
+        decision,
+        reference_text=segment.text,
+        reference_segment_index=primary.segment_index,
+        text_position=(
+            text_position.local_position
+            if text_position is not None and text_position.segment_index == primary.segment_index
+            else None
+        ),
+        phonetic_position=(
+            phonetic_position.local_position
+            if phonetic_position is not None and phonetic_position.segment_index == primary.segment_index
+            else None
+        ),
+    )
+
+
+def _map_compact_position_to_segment_unit(
+    reference_segments: Sequence[VoiceSegment],
+    position: int | None,
+) -> _SegmentPosition | None:
+    if position is None or position < 0:
+        return None
+
+    cursor = 0
+    for segment_index, segment in enumerate(reference_segments):
+        compact_length = len(_compact_text(segment.text))
+        if compact_length <= 0:
+            continue
+        if cursor <= position < cursor + compact_length:
+            local_offset = position - cursor
+            return _SegmentPosition(
+                segment_index=segment_index,
+                local_position=_unit_index_at_compact_offset(segment.text, local_offset),
+            )
+        cursor += compact_length
+    return None
+
+
+def _map_phonetic_position_to_segment_unit(
+    reference_segments: Sequence[VoiceSegment],
+    position: int | None,
+) -> _SegmentPosition | None:
+    if position is None or position < 0:
+        return None
+
+    cursor = 0
+    for segment_index, segment in enumerate(reference_segments):
+        unit_count = len(_phonetic_units(segment.text))
+        if unit_count <= 0:
+            continue
+        if cursor <= position < cursor + unit_count:
+            return _SegmentPosition(segment_index=segment_index, local_position=position - cursor)
+        cursor += unit_count
+    return None
+
+
+def _unit_index_at_compact_offset(text: str, offset: int) -> int:
+    cursor = 0
+    for unit_index, unit in enumerate(_text_units(text)):
+        compact_unit = _compact_text(unit)
+        if not compact_unit:
+            continue
+        next_cursor = cursor + len(compact_unit)
+        if cursor <= offset < next_cursor:
+            return unit_index
+        cursor = next_cursor
+    return 0
 
 
 def _max_weight_assignment(scores: Sequence[Sequence[float]]) -> list[int]:
@@ -745,7 +868,6 @@ def _material_text_position(reference_text: str, material: MaterialAnalysis) -> 
         for position in (
             _text_position(reference_text, material.transcript),
             _text_position(reference_text, material.filename_text),
-            _material_phonetic_position(reference_text, material),
         )
         if position is not None
     ]

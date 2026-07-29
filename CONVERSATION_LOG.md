@@ -1243,3 +1243,42 @@ Remaining after this continuation:
 4. Material render planning now clamps target durations to FFmpeg Rubber Band tempo bounds and labels max-compression/max-expansion strategies, reducing invalid extreme-ratio render failures.
 5. Added a real subprocess cancellation regression proving that FFmpeg-style progress handling cancels promptly even when stdout is idle, and closed progress-process stdout/stderr handles after cancellation.
 6. Verification passed: `compileall`, `unittest discover` with 94 tests, `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.
+
+### 2026-07-29: Rendered Real-Eval Scoring
+
+1. The user clarified that analysis-only real-eval is insufficient: acceptance must cover the exported concatenated material audio, so the material syllable/character order and actual clip durations can be compared against the original vocal.
+2. `audio_processor.real_eval` now writes a scorecard per case with matching mean/min scores, review-required ratio, positioned-decision ratio, target-duration total error, planning alignment score, rendered-output duration validation, rendered audio alignment score, and `strict_render_pass`.
+3. Suite summaries now include aggregate `score_summary` metrics for planning score, rendered audio score, match ordering score, render duration delta ratio, and strict pass/fail counts.
+4. `summary.json` and `summary.md` are now written at suite start and refreshed after each completed or failed case, so a long rendered run still leaves partial human-readable evidence if it is stopped mid-suite.
+5. `summary.md` now contains human-readable scoring columns, including Plan Score, Render Score, Min/Mean Match, Positioned ratio, Target Delta, Render Delta, Strict Pass, and Review Needed.
+6. The suite summary now also reports `group_score_summary` by language, reference vocal, material set, and split. This is the first overfitting guard for the finite real corpus: a change must be checked against group-level regressions, not just a single improved case.
+7. `%USERPROFILE%\.codex\tmp\demo-long-run.plan.json` was backed up, then switched from analysis-only `real-eval-full` to `real-eval-render-full` with `--render`; the task timeout was raised to 12 hours and the autonomous prompts now compare rendered-score metrics across cycles.
+8. The autonomous prompts now require targeted fixes from recurring failure classes and worst score groups, while forbidding song-name/material-name hard-coding, case-specific thresholds, warning suppression, and threshold relaxation unless the full rendered suite and worst groups do not regress.
+9. Added regressions proving that the exported wav duration participates in the scorecard/Markdown report and that partial suite summaries are flushed after a case failure.
+10. Verification passed: `compileall`, `tests.test_engine.RealEvalTests`, full `unittest discover` with 98 tests, `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.
+
+### 2026-07-29: Character Timing Enters Render Durations
+
+1. The user rejected treating forced alignment as a later item and required direct implementation toward exported material audio matching the original vocal word/pronunciation order and per-character duration.
+2. Added `VoiceUnitTiming` to the shared model-assist layer and attached `unit_timings` to `VoiceSegment`, so reference analysis can carry actual unit start/end timing instead of only segment-level timing.
+3. WhisperX transcription now calls `align(..., return_char_alignments=True)` and converts aligned `chars` into project timeline units. Chinese/Japanese kana units are preserved as character/pronunciation units, while contiguous Latin/romanized text is grouped as one timeline unit.
+4. Reference analysis cache keys now include the unit-timing format and WhisperX character-alignment mode, preventing reuse of old segment-only caches. Cache serialization/deserialization preserves `unit_timings`.
+5. `_target_durations_for_decisions()` now uses aligned unit start/end timing for positioned decisions before falling back to proportional segment splitting. Rendered material stretch durations therefore use real reference-unit duration when alignment coverage exists.
+6. Timeline diagnostics now report `reference_unit_timing_count`, `timed_target_duration_count`, `target_start_seconds`, `target_end_seconds`, `target_duration_source`, and aligned/expected unit counts for each decision.
+7. Preflight now emits `missing_aligned_unit_timing` as an error when positioned decisions exist but aligned unit timing coverage is incomplete. This prevents proportional fallback from being accepted silently as strict rendered-audio alignment.
+8. Real-eval scorecards now include `timed_target_duration_ratio` and `aligned_timing_score`; `strict_render_pass` requires at least 95% timed target coverage in addition to previous matching and render-duration checks.
+9. Added `scripts/run_real_eval_render_full.ps1`, which forces `VOCAL_PROCESS_ASR_BACKEND=whisperx` and `VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD=1` for rendered full real-eval, so the autonomous task cannot silently fall back to segment-only ASR.
+10. Updated `%USERPROFILE%\.codex\tmp\demo-long-run.plan.json` so `real-eval-render-full` runs that script and compares missing/timed alignment metrics in autonomous cycles.
+11. Verification passed: `compileall`, targeted alignment/real-eval tests, full `unittest discover` with 102 tests, `audio_processor check`, `git diff --check` with only CRLF conversion warnings, plan JSON parse, script parse, and an empty-root script execution smoke.
+
+### 2026-07-29: Autonomous Cycle 1 Infrastructure Blocker Handling
+
+1. The requested project context files were read before editing. `E:\Workplace\demo\AGENTS.md` is still absent, so the AGENTS rules supplied in the user message were followed together with `PROJECT_RULES.md`.
+2. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed, including Git directory and index-lock write probes.
+3. The autonomous `real-eval-render-full` task exposed a shared environment blocker: WhisperX attempted to load `Systran/faster-whisper-base` from Hugging Face and failed with `CERTIFICATE_VERIFY_FAILED`. This means the latest rendered eval did not produce ordering/timeline quality evidence; it produced model-runtime setup evidence.
+4. `audio_processor.real_eval` now classifies ASR/model infrastructure failures instead of reporting every case as a generic `analysis_exception`. The new warning kinds include `asr_model_download_failed`, `asr_model_cache_missing`, `speech_runtime_unavailable`, and `runtime_tool_unavailable`.
+5. Suite summaries now include `runtime_preflight`, `infrastructure_blocker`, and `recommended_exit_code`. If every planned case is blocked before pronunciation/timeline analysis can run, the CLI returns a non-zero exit so autonomous task runners do not treat the run as successful.
+6. Real-eval now stops repeating work after the first shared infrastructure blocker. The first attempted case is recorded as `analysis_failed`, and remaining cases are recorded as `analysis_blocked` with the same blocker kind, preserving group counts without repeating the same Hugging Face failure 28 times.
+7. Latest real rendered eval output: `tests_real\output\real-eval-20260729-213550\summary.json`. It reports `status_counts={"analysis_failed":1,"analysis_blocked":27}`, `warning_counts={"asr_model_download_failed":28}`, `infrastructure_blocker.blocked=true`, and `recommended_exit_code=2`.
+8. Verification passed: `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging`; `.venv311\Scripts\python.exe -m unittest discover` with 106 tests; `.venv311\Scripts\python.exe -m audio_processor check`; `git diff --check` with only CRLF conversion warnings. A first parallel `compileall`/unit-test run hit a Windows pycache rename race, then `compileall` passed when rerun alone.
+9. Next resume point: fix or pre-populate the WhisperX/Faster-Whisper model cache, or repair local certificate/network trust for Hugging Face access, then rerun `scripts\run_real_eval_render_full.ps1`. Only after real rendered eval reaches actual analysis should the next code pass optimize ordering, filename pronunciation matching, or aligned unit timing scores.

@@ -182,6 +182,25 @@ def _preflight_warnings(
                 }
             )
 
+    timeline_alignment = ordering.analysis_report.get("timeline_alignment", {})
+    if isinstance(timeline_alignment, dict):
+        positioned_count = _positive_int(timeline_alignment.get("positioned_decision_count"))
+        timed_count = _positive_int(timeline_alignment.get("timed_target_duration_count"))
+        if positioned_count > 0 and timed_count < positioned_count:
+            warnings.append(
+                {
+                    "severity": "error",
+                    "kind": "missing_aligned_unit_timing",
+                    "positioned_decision_count": positioned_count,
+                    "timed_target_duration_count": timed_count,
+                    "message": (
+                        "Reference alignment does not provide actual start/end timing for every positioned "
+                        "word or pronunciation unit; proportional duration fallback is not strict enough for "
+                        "automatic rendered-audio acceptance."
+                    ),
+                }
+            )
+
     for clip in stretch_plan:
         if not clip.quality_warning:
             continue
@@ -222,6 +241,13 @@ def _minimum_score(ordering: ModelOrderingResult) -> float:
     if not ordering.decisions:
         return 0.0
     return min(decision.score for decision in ordering.decisions)
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _optimization_report(

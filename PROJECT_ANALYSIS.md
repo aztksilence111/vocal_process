@@ -1206,3 +1206,58 @@ Next architecture direction:
 3. Stretch strategy labels now distinguish full-clip stretch, syllable-safe expansion with tail padding, max-compression floor, and max-expansion ceiling. These labels are useful diagnostics for real cases where pronunciation alignment would otherwise be hidden behind a generic extreme-stretch warning.
 4. Cancellation coverage now includes a stdout-idle child-process regression. The progress runner polls cancellation independently from FFmpeg progress output and explicitly closes stdout/stderr handles after termination.
 5. Verification for this continuation passed `compileall`, 94 unit tests, `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.
+
+### 2026-07-29: Rendered Audio Acceptance Metrics
+
+1. Real-eval is no longer treated as a feasibility-only harness. The acceptance target is the exported concatenated material wav, not just whether the analysis stage can build an ordering plan.
+2. The new real-eval scorecard separates planning quality from rendered-output quality:
+   - `match_ordering_score` tracks material ordering confidence from per-decision match scores and review-required decisions;
+   - `positioned_decision_ratio` tracks how many materials have text/phonetic positions suitable for pronunciation-level timeline placement;
+   - `target_duration_alignment_score` tracks whether planned clip target durations sum to the original vocal duration;
+   - `rendered_audio_alignment_score` adds actual rendered wav duration validation when `--render` is enabled.
+3. `strict_render_pass` is intentionally conservative: it requires a rendered output, <=1% output-duration error, <=1% target-duration total error, no error warnings/review-required matches, minimum match score above the low-score threshold, and at least 95% positioned decisions.
+4. Long rendered suites now flush `summary.json` and `summary.md` after each case, including `analysis_failed` records, so interrupted autonomous runs still leave reviewable scoring evidence.
+5. The suite now reports `group_score_summary` by language, reference vocal, material set, and split. This matters because the current real corpus is finite: progress should be accepted only when overall score and worst groups improve or remain stable, not when one case improves by exploiting a narrow filename or song pattern.
+6. Post-score improvement strategy for autonomous rounds:
+   - pick recurring warning/failure classes and worst score groups first;
+   - prefer general changes in phonetic normalization, candidate ranking, timing allocation, render bounds, diagnostics, or forced-alignment plumbing;
+   - reject case-specific song/material hard-coding, threshold relaxation, or warning suppression unless the full rendered suite and worst groups do not regress.
+7. This gives the autonomous loop numeric metrics to improve across repeated runs: aggregate score summary, group score summary, rendered audio score, strict pass/fail counts, render duration deltas, matching warnings, and timeline warnings.
+8. Remaining architectural limit: duration matching and ordering scores are still proxy evidence unless reference analysis produces aligned unit timings. The next acceptance boundary must treat missing unit timing as a failure, not as a deferred enhancement.
+
+### 2026-07-29: Forced Unit Timing Implementation
+
+1. The project now has a concrete unit-timing path in the render pipeline:
+   - WhisperX character alignment produces `VoiceUnitTiming` records;
+   - `VoiceSegment.unit_timings` carries those records through reference analysis and cache reuse;
+   - model runtime duration allocation uses aligned unit start/end for positioned material decisions;
+   - rendered material stretch durations therefore consume original-vocal unit durations when coverage exists.
+2. Strict acceptance was tightened accordingly. A rendered case cannot pass strict validation only because total wav duration matches; it must also have high `timed_target_duration_ratio` / `aligned_timing_score` and must avoid `missing_aligned_unit_timing`.
+3. `missing_aligned_unit_timing` is intentionally an error, because proportional segment splitting is not sufficient for the user's goal of matching each character's actual duration.
+4. The autonomous rendered full eval now runs through `scripts/run_real_eval_render_full.ps1`, forcing WhisperX rather than allowing the default ASR fallback to skip character alignment when the WhisperX model is not cached.
+5. The current hard problem is no longer "add a forced-alignment hook"; that hook is now in the duration path. The next concrete failures to solve must come from real rendered runs: model download/runtime failures, language support gaps, incomplete char coverage, bad positioned matching, or stretch/render limits surfaced by `missing_aligned_unit_timing`, `timed_target_duration_ratio`, and group score summaries.
+
+### 2026-07-29: Real-Eval Infrastructure Gate
+
+The rendered real-eval gate now distinguishes quality evidence from infrastructure absence. Because strict pronunciation-level timing requires WhisperX character alignment, a run where WhisperX cannot load its model is not a failed ordering experiment; it is an environment blocker.
+
+Current machine evidence:
+
+1. `audio_processor check` shows WhisperX is installed, but `WhisperX model cached: False` and `Faster Whisper model cached: False`.
+2. `scripts/run_real_eval_render_full.ps1` forces `VOCAL_PROCESS_ASR_BACKEND=whisperx` and `VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD=1`.
+3. The current environment cannot download `Systran/faster-whisper-base` from Hugging Face because HTTPS certificate verification fails.
+4. Latest generated report: `tests_real\output\real-eval-20260729-213550\summary.json`.
+5. The report records `analysis_failed=1`, `analysis_blocked=27`, `asr_model_download_failed=28`, `infrastructure_blocker.blocked=true`, and `recommended_exit_code=2`.
+
+Architecture result:
+
+1. `audio_processor.real_eval` classifies shared ASR/model/tool failures as infrastructure warning kinds rather than generic case failures.
+2. When every planned case is blocked before real pronunciation/timeline analysis, the real-eval CLI returns non-zero so autonomous runners stop treating the task as OK.
+3. After the first shared infrastructure blocker, remaining cases are marked `analysis_blocked` instead of repeating the same model download failure. Group counts stay visible, but the suite no longer spends time producing duplicate non-evidence.
+4. This preserves the stricter acceptance rule: no silent fallback to segment-only ASR and no lowering of timing thresholds. The next valid quality-improvement cycle must first restore WhisperX model availability or pre-populate the required cache, then rerun rendered real-eval.
+
+Next technical target:
+
+1. Repair the WhisperX/Faster-Whisper model-cache path or machine certificate trust for Hugging Face access.
+2. Once rendered eval reaches real analysis again, compare `timed_target_duration_ratio`, `aligned_timing_score`, `missing_aligned_unit_timing`, match scores, and group summaries before changing ordering or timing algorithms.
+3. Continue improving pinyin/romanized filename matching and pronunciation-level timeline allocation only against actual rendered-eval evidence, not against infrastructure-blocked summaries.

@@ -25,6 +25,7 @@ from .model_assist import (
     MaterialAnalysis,
     MaterialOrderDecision,
     VoiceSegment,
+    VoiceUnitTiming,
     _phonetic_units,
     list_model_candidates,
     plan_material_ordering,
@@ -52,6 +53,7 @@ class TranscriptSegment:
     confidence: float | None = None
     speaker_id: str | None = None
     timing_source: str = ""
+    unit_timings: tuple[VoiceUnitTiming, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -530,6 +532,17 @@ def render_reference_analysis(reference: ReferenceAnalysis) -> dict[str, Any]:
                 "confidence": segment.confidence,
                 "speaker_id": segment.speaker_id,
                 "timing_source": segment.timing_source,
+                "unit_timings": [
+                    {
+                        "position": timing.position,
+                        "unit": timing.unit,
+                        "start_seconds": timing.start_seconds,
+                        "end_seconds": timing.end_seconds,
+                        "confidence": timing.confidence,
+                        "timing_source": timing.timing_source,
+                    }
+                    for timing in segment.unit_timings
+                ],
             }
             for segment in reference.segments
         ],
@@ -1114,7 +1127,7 @@ def _transcribe_audio(
                     metadata,
                     audio,
                     device,
-                    return_char_alignments=False,
+                    return_char_alignments=True,
                 )
                 _raise_if_cancelled(should_cancel)
                 segments: list[TranscriptSegment] = []
@@ -1129,7 +1142,12 @@ def _transcribe_audio(
                             text=str(segment.get("text", "")).strip(),
                             confidence=_segment_confidence(segment),
                             speaker_id=segment.get("speaker"),
-                            timing_source="whisperx_alignment",
+                            timing_source=(
+                                "whisperx_char_alignment"
+                                if _aligned_char_entries(segment)
+                                else "whisperx_alignment"
+                            ),
+                            unit_timings=_unit_timings_from_aligned_chars(segment),
                         )
                     )
                 text = " ".join(segment.text for segment in segments).strip()
@@ -1599,6 +1617,8 @@ def _reference_cache_path(
         "lyrics": _optional_file_snapshot(lyrics_file.expanduser()) if lyrics_file else None,
         "asr_model": DEFAULT_ASR_MODEL,
         "asr_backend": os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower(),
+        "reference_unit_timing_format": "voice_unit_timing_v1",
+        "whisperx_return_char_alignments": True,
         "speaker_model": SPEAKER_EMBEDDING_MODEL,
         "compute_device": compute_device,
         "source_separation": source_separation,
@@ -1659,6 +1679,7 @@ def _load_reference_analysis_cache(
                 confidence=_optional_float(segment.get("confidence")),
                 speaker_id=_optional_string(segment.get("speaker_id")),
                 timing_source=str(segment.get("timing_source") or ""),
+                unit_timings=_voice_unit_timings_from_json(segment.get("unit_timings")),
             )
             for segment in reference.get("segments", [])
             if isinstance(segment, dict)
@@ -1770,6 +1791,10 @@ def _segments_from_transcript(
                             confidence=transcript_segment.confidence,
                             speaker_id=transcript_segment.speaker_id,
                             timing_source="asr_segment_with_lyric_text",
+                            unit_timings=_retarget_unit_timings_to_text(
+                                transcript_segment.unit_timings,
+                                lyric.text,
+                            ),
                         )
                     )
                 if len(lyric_segments) > max_count and segments:
@@ -1803,14 +1828,54 @@ def _segments_from_transcript(
             text=segment.text,
             confidence=segment.confidence,
             speaker_id=segment.speaker_id,
-            timing_source="asr_segment",
+            timing_source=(
+                "asr_segment_with_unit_timing"
+                if segment.unit_timings
+                else "asr_segment"
+            ),
+            unit_timings=segment.unit_timings,
         )
         for segment in segments
     )
 
 
+def _retarget_unit_timings_to_text(
+    timings: Sequence[VoiceUnitTiming],
+    text: str,
+) -> tuple[VoiceUnitTiming, ...]:
+    if not timings:
+        return ()
+    units = _timeline_units(text)
+    if len(units) != len(timings):
+        return ()
+    return tuple(
+        VoiceUnitTiming(
+            position=index,
+            unit=unit,
+            start_seconds=timing.start_seconds,
+            end_seconds=timing.end_seconds,
+            confidence=timing.confidence,
+            timing_source=f"{timing.timing_source}_retargeted_to_lyrics",
+        )
+        for index, (unit, timing) in enumerate(zip(units, timings))
+    )
+
+
 def reference_duration_for(path: Path) -> float:
     return get_audio_duration_seconds(probe_audio(path))
+
+
+@dataclass(frozen=True)
+class _TimedUnitSpan:
+    start_seconds: float
+    end_seconds: float
+    aligned_unit_count: int
+    expected_unit_count: int
+    timing_source: str
+
+    @property
+    def duration_seconds(self) -> float:
+        return max(self.end_seconds - self.start_seconds, 0.0)
 
 
 def _target_durations_for_decisions(
@@ -1900,14 +1965,19 @@ def _render_timeline_alignment_summary(
         if count > 1
     )
     decision_details = _render_timeline_alignment_details(reference_segments, decisions, target_durations)
+    timed_target_duration_count = sum(
+        1 for detail in decision_details if detail.get("target_duration_source") == "aligned_unit_timing"
+    )
     return {
         "format": "vocal_process_timeline_alignment_summary_v1",
         "reference_segment_count": len(reference_segments),
+        "reference_unit_timing_count": sum(len(segment.unit_timings) for segment in reference_segments),
         "decision_count": len(decisions),
         "positioned_decision_count": len(positioned_decisions),
         "decision_details": decision_details,
         "split_reference_segment_indices": split_segment_indices,
         "resolved_target_duration_count": sum(1 for duration in target_durations if duration is not None),
+        "timed_target_duration_count": timed_target_duration_count,
         "target_duration_total_seconds": sum(float(duration or 0.0) for duration in target_durations),
         "phonetic_positioned_decision_count": sum(
             1 for decision in decisions if decision.phonetic_position is not None
@@ -1918,7 +1988,11 @@ def _render_timeline_alignment_summary(
         "ambiguous_phonetic_decision_count": sum(
             1 for decision in decisions if decision.phonetic_position_count > 1
         ),
-        "mode": "phonetic_or_text_position_split" if split_segment_indices else "segment_or_weighted_duration",
+        "mode": (
+            "aligned_unit_timing"
+            if timed_target_duration_count
+            else "phonetic_or_text_position_split" if split_segment_indices else "segment_or_weighted_duration"
+        ),
     }
 
 
@@ -1943,9 +2017,8 @@ def _render_timeline_alignment_details(
         if segment.duration_seconds <= 0:
             continue
 
-        max_position = max(max(_decision_position(decision) or 0, 0) for _, decision in group)
-        unit_count = max(len(_timeline_units(segment.text)), max_position + 1, len(group), 1)
-        complete_position_cover = len(group) >= unit_count
+        unit_count = _positioned_group_unit_count(segment, group)
+        complete_position_cover = _positioned_group_covers_segment(group, unit_count)
         ordered_group = sorted(group, key=lambda item: (_decision_position(item[1]) or 0, item[1].rank))
         for group_index, (decision_index, decision) in enumerate(ordered_group):
             decision_path = _decision_path(decision)
@@ -1966,6 +2039,7 @@ def _render_timeline_alignment_details(
                 end_unit = start_unit + material_units
 
             span_units = max(min(end_unit, unit_count) - start_unit, 1)
+            timed_span = _timed_unit_span(segment, start_unit, end_unit)
             target_duration = target_durations[decision_index]
             reference_text_units = list(_timeline_units(segment.text))
             reference_phonetic_units = list(_phonetic_units(segment.text))
@@ -1998,7 +2072,18 @@ def _render_timeline_alignment_details(
                 "position_unit_span": span_units,
                 "complete_position_cover": complete_position_cover,
                 "segment_duration_seconds": segment.duration_seconds,
+                "target_start_seconds": (
+                    timed_span.start_seconds if timed_span is not None else None
+                ),
+                "target_end_seconds": (
+                    timed_span.end_seconds if timed_span is not None else None
+                ),
                 "target_duration_seconds": target_duration,
+                "target_duration_source": (
+                    timed_span.timing_source if timed_span is not None else "proportional_segment_split"
+                ),
+                "aligned_unit_count": timed_span.aligned_unit_count if timed_span is not None else 0,
+                "expected_unit_count": timed_span.expected_unit_count if timed_span is not None else span_units,
                 "target_duration_ratio": (
                     float(target_duration) / segment.duration_seconds
                     if target_duration is not None and segment.duration_seconds > 0
@@ -2046,7 +2131,12 @@ def _render_timeline_alignment_details(
             "position_unit_span": None,
             "complete_position_cover": False,
             "segment_duration_seconds": segment.duration_seconds if segment is not None else None,
+            "target_start_seconds": None,
+            "target_end_seconds": None,
             "target_duration_seconds": target_durations[decision_index],
+            "target_duration_source": "weighted_duration",
+            "aligned_unit_count": 0,
+            "expected_unit_count": 0,
             "target_duration_ratio": None,
             "score": decision.score,
             "confidence_label": decision.confidence_label,
@@ -2100,9 +2190,8 @@ def _positioned_target_durations(
         if segment.duration_seconds <= 0:
             continue
 
-        max_position = max(max(_decision_position(decision) or 0, 0) for _, decision in group)
-        unit_count = max(len(_timeline_units(segment.text)), max_position + 1, len(group), 1)
-        complete_position_cover = len(group) >= unit_count
+        unit_count = _positioned_group_unit_count(segment, group)
+        complete_position_cover = _positioned_group_covers_segment(group, unit_count)
         ordered_group = sorted(group, key=lambda item: (_decision_position(item[1]) or 0, item[1].rank))
         for group_index, (decision_index, decision) in enumerate(ordered_group):
             start_unit = min(max(_decision_position(decision) or 0, 0), unit_count - 1)
@@ -2121,9 +2210,75 @@ def _positioned_target_durations(
                 end_unit = start_unit + material_units
 
             span_units = max(min(end_unit, unit_count) - start_unit, 1)
-            targets[decision_index] = segment.duration_seconds * (span_units / unit_count)
+            timed_span = _timed_unit_span(segment, start_unit, end_unit)
+            if timed_span is not None and timed_span.duration_seconds > 0:
+                targets[decision_index] = timed_span.duration_seconds
+            else:
+                targets[decision_index] = segment.duration_seconds * (span_units / unit_count)
 
     return tuple(targets)
+
+
+def _timed_unit_span(segment: VoiceSegment, start_unit: int, end_unit: int) -> _TimedUnitSpan | None:
+    expected_unit_count = max(end_unit - start_unit, 1)
+    if not segment.unit_timings or expected_unit_count <= 0:
+        return None
+
+    by_position = {
+        timing.position: timing
+        for timing in segment.unit_timings
+        if timing.duration_seconds > 0
+    }
+    timings: list[VoiceUnitTiming] = []
+    for position in range(start_unit, end_unit):
+        timing = by_position.get(position)
+        if timing is None:
+            return None
+        timings.append(timing)
+    if len(timings) != expected_unit_count:
+        return None
+
+    start_seconds = min(timing.start_seconds for timing in timings)
+    end_seconds = max(timing.end_seconds for timing in timings)
+    if end_seconds <= start_seconds:
+        return None
+    return _TimedUnitSpan(
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        aligned_unit_count=len(timings),
+        expected_unit_count=expected_unit_count,
+        timing_source="aligned_unit_timing",
+    )
+
+
+def _positioned_group_unit_count(
+    segment: VoiceSegment,
+    group: Sequence[tuple[int, MaterialOrderDecision]],
+) -> int:
+    max_end = 0
+    for _, decision in group:
+        position = _decision_position(decision)
+        if position is None:
+            continue
+        max_end = max(max_end, max(int(position), 0) + _decision_timeline_unit_count(decision))
+    return max(len(_timeline_units(segment.text)), max_end, 1)
+
+
+def _positioned_group_covers_segment(
+    group: Sequence[tuple[int, MaterialOrderDecision]],
+    unit_count: int,
+) -> bool:
+    if unit_count <= 0:
+        return False
+    covered: set[int] = set()
+    for _, decision in group:
+        position = _decision_position(decision)
+        if position is None:
+            continue
+        start = min(max(int(position), 0), unit_count - 1)
+        span = max(_decision_timeline_unit_count(decision), 1)
+        covered.update(range(start, min(start + span, unit_count)))
+    return len(covered) >= unit_count
 
 
 def _decision_position(decision: MaterialOrderDecision) -> int | None:
@@ -2249,8 +2404,15 @@ def _decision_timeline_unit_count(decision: MaterialOrderDecision) -> int:
 
 
 def _timeline_units(text: str) -> list[str]:
+    return [unit for unit, _, _ in _timeline_unit_spans(text)]
+
+
+def _timeline_unit_spans(text: str) -> list[tuple[str, int, int]]:
     normalized = text.replace("_", " ").replace("-", " ").lower()
-    return re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", normalized)
+    return [
+        (match.group(0), match.start(), match.end())
+        for match in re.finditer(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", normalized)
+    ]
 
 
 def _compact_bridge_text(text: str) -> str:
@@ -2311,6 +2473,34 @@ def _optional_string(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _voice_unit_timings_from_json(value: Any) -> tuple[VoiceUnitTiming, ...]:
+    if not isinstance(value, list):
+        return ()
+    timings: list[VoiceUnitTiming] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        start_seconds = _optional_float(entry.get("start_seconds"))
+        end_seconds = _optional_float(entry.get("end_seconds"))
+        if start_seconds is None or end_seconds is None or end_seconds <= start_seconds:
+            continue
+        try:
+            position = int(entry.get("position", len(timings)))
+        except (TypeError, ValueError):
+            position = len(timings)
+        timings.append(
+            VoiceUnitTiming(
+                position=max(position, 0),
+                unit=str(entry.get("unit") or ""),
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                confidence=_optional_float(entry.get("confidence")),
+                timing_source=str(entry.get("timing_source") or "cache"),
+            )
+        )
+    return tuple(timings)
 
 
 def _model_cache_root() -> Path:
@@ -2574,6 +2764,48 @@ def _vad_coverage(vad_segments: Sequence[tuple[float, float]], duration_seconds:
 
     covered = sum(max(end - start, 0.0) for start, end in vad_segments)
     return min(max(covered / duration_seconds, 0.0), 1.0)
+
+
+def _unit_timings_from_aligned_chars(segment: dict[str, Any]) -> tuple[VoiceUnitTiming, ...]:
+    text = str(segment.get("text", "") or "")
+    char_entries = _aligned_char_entries(segment)
+    if not text.strip() or not char_entries:
+        return ()
+
+    timings: list[VoiceUnitTiming] = []
+    for position, (unit, start_index, end_index) in enumerate(_timeline_unit_spans(text)):
+        entries = char_entries[start_index:end_index]
+        aligned_entries = [
+            entry
+            for entry in entries
+            if _optional_float(entry.get("start")) is not None and _optional_float(entry.get("end")) is not None
+        ]
+        if not aligned_entries:
+            continue
+        start_seconds = min(float(entry["start"]) for entry in aligned_entries)
+        end_seconds = max(float(entry["end"]) for entry in aligned_entries)
+        if end_seconds <= start_seconds:
+            continue
+        scores = [_optional_float(entry.get("score")) for entry in aligned_entries]
+        scores = [score for score in scores if score is not None]
+        timings.append(
+            VoiceUnitTiming(
+                position=position,
+                unit=unit,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                confidence=(sum(scores) / len(scores)) if scores else None,
+                timing_source="whisperx_char_alignment",
+            )
+        )
+    return tuple(timings)
+
+
+def _aligned_char_entries(segment: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_chars = segment.get("chars", [])
+    if not isinstance(raw_chars, list):
+        return []
+    return [entry for entry in raw_chars if isinstance(entry, dict)]
 
 
 def _segment_confidence(segment: dict[str, Any]) -> float | None:
