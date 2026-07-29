@@ -11,7 +11,8 @@
 7. `scripts\run_real_eval_render_full.ps1` now accepts `-StopFile` and reads `VOCAL_PROCESS_STOP_FILE`. The project maintenance runner now injects `VOCAL_PROCESS_STOP_FILE`, writes task logs directly to files, polls running child processes, terminates them on stop-file creation, and records task status `stopped`.
 8. Verification passed: `compileall`, full `unittest discover` with 128 tests, `audio_processor check`, PowerShell parse of `run_real_eval_render_full.ps1`, and `git diff --check` with only CRLF conversion warnings.
 9. Script-level stop-file smoke passed: `scripts\run_real_eval_render_full.ps1 -StopFile ...` returned 130 and wrote `.tmp\real-eval-stop-smoke\real-eval-20260730-055649\summary.json` with `status_counts={"cancelled":13}`.
-10. Next resume point: commit/push this repair, rerun the full rendered real-eval, confirm the 12 SpeechBrain lazy import failures are gone, then optimize pronunciation ordering and pronunciation-level timeline scores from the new full-suite `score_summary` / `group_score_summary`.
+10. Committed and pushed the repair to `origin/codex/cancel-phonetic-accuracy` as `4a15239 Improve real eval cancellation recovery`.
+11. Next resume point: rerun the full rendered real-eval, confirm the 12 SpeechBrain lazy import failures are gone, then optimize pronunciation ordering and pronunciation-level timeline scores from the new full-suite `score_summary` / `group_score_summary`.
 
 > Project path: `C:\Users\WIN11\demo`
 > Current working branch: `codex/runtime-env-uvr-worker`
