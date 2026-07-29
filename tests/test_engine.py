@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -44,11 +45,13 @@ from audio_processor.engine import (
     probe_audio,
     resolve_tool,
     summarize_probe,
+    _run_progress_process,
 )
 from audio_processor.gui import LYRICS_EXTENSIONS
 from audio_processor.i18n import TRANSLATIONS, normalize_language, translate, translate_status
 from audio_processor.model_assist import (
     MaterialAnalysis,
+    MaterialOrderDecision,
     VoiceSegment,
     build_model_assisted_pipeline_plan,
     list_model_candidates,
@@ -155,6 +158,23 @@ class ProcessCommandTests(unittest.TestCase):
 
         self.assertEqual(args[args.index("-codec:a") + 1], "pcm_s24le")
 
+    def test_progress_process_cancels_while_stdout_is_idle(self) -> None:
+        cancel_checks = {"count": 0}
+
+        def should_cancel() -> bool:
+            cancel_checks["count"] += 1
+            return cancel_checks["count"] >= 2
+
+        started_at = time.monotonic()
+        with self.assertRaisesRegex(AudioProcessorError, "Processing cancelled"):
+            _run_progress_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                duration_seconds=30.0,
+                should_cancel=should_cancel,
+            )
+
+        self.assertLess(time.monotonic() - started_at, 5.0)
+
 
 class MaterialAssemblyTests(unittest.TestCase):
     def test_lists_supported_material_audio_files_by_name(self) -> None:
@@ -247,6 +267,48 @@ class MaterialAssemblyTests(unittest.TestCase):
             )
 
         self.assertEqual(clips[0].target_duration_seconds, 10.0)
+        self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
+
+    def test_material_stretch_plan_preserves_partial_model_target_durations(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "10.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+            ],
+        ):
+            clips = plan_material_stretch_clips(
+                Path("reference.wav"),
+                [Path("wo.wav"), Path("unknown.wav"), Path("ni.wav")],
+                target_durations=[2.0, None, 3.0],
+            )
+
+        self.assertEqual([clip.target_duration_seconds for clip in clips], [2.0, 5.0, 3.0])
+        self.assertEqual(
+            [round(clip.requested_tempo or 0.0, 6) for clip in clips],
+            [0.5, 0.2, 0.333333],
+        )
+
+    def test_material_stretch_plan_keeps_model_targets_inside_rubberband_bounds(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "1.0"}, "streams": []},
+            ],
+        ):
+            clips = plan_material_stretch_clips(
+                Path("reference.wav"),
+                [Path("too_short.wav"), Path("remaining.wav")],
+                target_durations=[0.001, None],
+            )
+
+        self.assertEqual(round(sum(clip.target_duration_seconds for clip in clips), 6), 1.0)
+        self.assertAlmostEqual(clips[0].target_duration_seconds, 0.01)
+        self.assertAlmostEqual(clips[0].tempo, 100.0)
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
 
     def test_short_material_expansion_uses_syllable_safe_tail_padding(self) -> None:
@@ -1417,6 +1479,57 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["decision_details"][0]["position_mode"], "text_position")
         self.assertEqual(summary["decision_details"][0]["position_unit_span"], 1)
         self.assertEqual(summary["decision_details"][0]["target_duration_seconds"], 1.0)
+
+    def test_partial_positioned_decisions_fill_remaining_target_duration(self) -> None:
+        reference_segments = [
+            VoiceSegment(0.0, 2.0, "\u6211\u662f"),
+            VoiceSegment(2.0, 10.0, "tail"),
+        ]
+        decisions = [
+            MaterialOrderDecision(
+                rank=1,
+                material_path=Path("wo.wav"),
+                score=0.8,
+                reference_text="\u6211\u662f",
+                material_text="wo",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=0,
+                phonetic_position=0,
+                phonetic_span_units=1,
+            ),
+            MaterialOrderDecision(
+                rank=2,
+                material_path=Path("shi.wav"),
+                score=0.8,
+                reference_text="\u6211\u662f",
+                material_text="shi",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=1,
+                phonetic_position=1,
+                phonetic_span_units=1,
+            ),
+            MaterialOrderDecision(
+                rank=3,
+                material_path=Path("unknown.wav"),
+                score=0.0,
+                reference_text="",
+                material_text="unknown",
+                reason="unmatched_filename_fallback",
+            ),
+        ]
+
+        target_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=10.0,
+        )
+
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (1.0, 1.0, 8.0))
+        summary = model_runtime._render_timeline_alignment_summary(reference_segments, decisions, target_durations)
+        self.assertEqual(summary["resolved_target_duration_count"], 3)
+        self.assertAlmostEqual(summary["target_duration_total_seconds"], 10.0)
 
     def test_preflight_warns_when_filename_pronunciation_matches_multiple_positions(self) -> None:
         decision = model_runtime.OrderingDecision(

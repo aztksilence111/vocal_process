@@ -1225,3 +1225,21 @@ Remaining after this continuation:
 3. Added `scripts/maintenance_plan.example.json` so the runner has a ready-made repeatable plan for compile/test/check/status cycles.
 4. Smoke-tested the hidden launcher with a one-task plan; it completed successfully and wrote `state.json`, `heartbeat.json`, `events.jsonl`, and task logs under `.tmp\maintenance_sessions\20260728-193128-smoke\`.
 5. Verification passed `compileall`, `unittest discover` with 90 tests, `audio_processor maintenance --template`, and `audio_processor maintenance --contract`.
+
+### 2026-07-29: Real-Test Evidence, Long-Run Plan, and Log Request
+
+1. Clarified that the requested evidence must come from the project software's own real test outputs, not `.codex` maintenance/session logs.
+2. Read the real project outputs under `tests_real/origin_vocal`, `tests_real/material_set`, and `tests_real/output/real-eval-20260728-170800/`.
+3. Confirmed the JP real case `PlasticLove_JP__vmzJP` was marked `review_required` with many `ambiguous_phonetic_position`, `low_match_score`, and `extreme_stretch_ratio` warnings.
+4. Created a long-run plan template at `%USERPROFILE%\.codex\tmp\demo-long-run.plan.json` for `E:\Workplace\demo`.
+5. The plan template runs `compileall`, `unittest discover`, `audio_processor check`, a `PlasticLove_JP` real-eval smoke, and `git status` before each autonomous cycle.
+6. The user requested that the complete dialogue be written into the project log before ending the turn.
+
+### 2026-07-29: Autonomous Cycle 1 Continuation
+
+1. The requested project context files were read before editing. `E:\Workplace\demo\AGENTS.md` does not exist in the workspace, so the AGENTS instructions supplied in the user message were followed together with `PROJECT_RULES.md`.
+2. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed, including Git directory and index-lock write probes.
+3. Continued the pronunciation/timeline pass by preserving partial model target durations: positioned syllable clips keep their explicit timing, while unresolved clips receive the remaining reference duration instead of distorting the known syllable spans.
+4. Material render planning now clamps target durations to FFmpeg Rubber Band tempo bounds and labels max-compression/max-expansion strategies, reducing invalid extreme-ratio render failures.
+5. Added a real subprocess cancellation regression proving that FFmpeg-style progress handling cancels promptly even when stdout is idle, and closed progress-process stdout/stderr handles after cancellation.
+6. Verification passed: `compileall`, `unittest discover` with 94 tests, `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.

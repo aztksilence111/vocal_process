@@ -71,6 +71,7 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 RUBBERBAND_MIN_TEMPO = 0.01
 RUBBERBAND_MAX_TEMPO = 100.0
 DAW_WAV_CODEC = "pcm_s24le"
+MIN_MATERIAL_TARGET_DURATION_SECONDS = 0.001
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -854,30 +855,163 @@ def _resolve_material_target_durations(
         raise AudioProcessorError("source_durations must not be empty")
 
     if target_durations is not None and len(target_durations) == len(source_durations):
-        base = [
-            float(target) if target is not None and float(target) > 0 else float(source)
-            for source, target in zip(source_durations, target_durations)
-        ]
+        explicit_targets = [_positive_optional_float(target) for target in target_durations]
+        if any(target is not None for target in explicit_targets):
+            resolved = _resolve_explicit_material_target_durations(
+                reference_duration,
+                source_durations,
+                explicit_targets,
+            )
+            return _fit_durations_to_render_bounds(resolved, source_durations, reference_duration)
+
+    resolved = _fit_durations_to_total(source_durations, reference_duration)
+    return _fit_durations_to_render_bounds(resolved, source_durations, reference_duration)
+
+
+def _resolve_explicit_material_target_durations(
+    reference_duration: float,
+    source_durations: Sequence[float],
+    explicit_targets: Sequence[float | None],
+) -> list[float]:
+    explicit_indices = [index for index, target in enumerate(explicit_targets) if target is not None]
+    unresolved_indices = [index for index, target in enumerate(explicit_targets) if target is None]
+    if not explicit_indices:
+        return _fit_durations_to_total(source_durations, reference_duration)
+
+    if not unresolved_indices:
+        return _fit_durations_to_total(
+            [float(explicit_targets[index] or 0.0) for index in explicit_indices],
+            reference_duration,
+        )
+
+    targets: list[float | None] = [None for _ in explicit_targets]
+    explicit_sum = sum(float(explicit_targets[index] or 0.0) for index in explicit_indices)
+    unresolved_reserve = _minimum_duration_budget(reference_duration, len(unresolved_indices))
+    explicit_budget = max(reference_duration - unresolved_reserve, 0.0)
+
+    if explicit_sum > explicit_budget:
+        explicit_values = _fit_durations_to_total(
+            [float(explicit_targets[index] or 0.0) for index in explicit_indices],
+            explicit_budget,
+        )
     else:
-        base = [float(source) for source in source_durations]
+        explicit_values = [float(explicit_targets[index] or 0.0) for index in explicit_indices]
 
-    total = sum(base)
-    if total <= 0:
-        raise AudioProcessorError("Could not resolve material target durations")
+    for index, value in zip(explicit_indices, explicit_values):
+        targets[index] = value
 
-    scale = reference_duration / total
-    targets = [max(duration * scale, 0.001) for duration in base]
-    if len(targets) == 1:
-        return [reference_duration]
+    remaining_duration = max(reference_duration - sum(explicit_values), 0.0)
+    unresolved_values = _fit_durations_to_total(
+        [float(source_durations[index]) for index in unresolved_indices],
+        remaining_duration,
+    )
+    for index, value in zip(unresolved_indices, unresolved_values):
+        targets[index] = value
 
-    accumulated = 0.0
+    return _fit_durations_to_total([float(value or 0.0) for value in targets], reference_duration)
+
+
+def _positive_optional_float(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _minimum_duration_budget(total_duration: float, count: int) -> float:
+    if count <= 0 or total_duration <= 0:
+        return 0.0
+    return min(MIN_MATERIAL_TARGET_DURATION_SECONDS * count, total_duration)
+
+
+def _fit_durations_to_total(durations: Sequence[float], total_duration: float) -> list[float]:
+    if not durations:
+        return []
+    if total_duration <= 0:
+        return [0.0 for _ in durations]
+    if len(durations) == 1:
+        return [total_duration]
+
+    minimum = min(MIN_MATERIAL_TARGET_DURATION_SECONDS, total_duration / len(durations))
+    raw_values = [max(float(duration), 0.0) for duration in durations]
+    raw_total = sum(raw_values)
+    if raw_total <= 0:
+        raw_values = [1.0 for _ in durations]
+        raw_total = float(len(raw_values))
+
+    scaled = [total_duration * (duration / raw_total) for duration in raw_values]
     adjusted: list[float] = []
-    for duration in targets[:-1]:
-        adjusted_duration = min(duration, max(reference_duration - accumulated - 0.001, 0.001))
+    remaining = total_duration
+    remaining_count = len(scaled)
+    for duration in scaled[:-1]:
+        max_duration = max(remaining - (minimum * (remaining_count - 1)), minimum)
+        adjusted_duration = min(max(duration, minimum), max_duration)
         adjusted.append(adjusted_duration)
-        accumulated += adjusted_duration
-    adjusted.append(max(reference_duration - accumulated, 0.001))
+        remaining -= adjusted_duration
+        remaining_count -= 1
+    adjusted.append(max(remaining, minimum))
     return adjusted
+
+
+def _fit_durations_to_render_bounds(
+    durations: Sequence[float],
+    source_durations: Sequence[float],
+    total_duration: float,
+) -> list[float]:
+    if len(durations) != len(source_durations):
+        return _fit_durations_to_total(durations, total_duration)
+    if not durations:
+        return []
+
+    lower_bounds = [
+        max(MIN_MATERIAL_TARGET_DURATION_SECONDS, float(source) / RUBBERBAND_MAX_TEMPO)
+        for source in source_durations
+    ]
+    upper_bounds = [
+        max(lower, float(source) / RUBBERBAND_MIN_TEMPO)
+        for lower, source in zip(lower_bounds, source_durations)
+    ]
+    lower_total = sum(lower_bounds)
+    upper_total = sum(upper_bounds)
+    if lower_total >= total_duration:
+        return lower_bounds
+    if upper_total <= total_duration:
+        return upper_bounds
+
+    resolved: list[float | None] = [None for _ in durations]
+    active = set(range(len(durations)))
+    desired = [max(float(duration), 0.0) for duration in durations]
+
+    while active:
+        active_indices = sorted(active)
+        fixed_total = sum(float(value or 0.0) for value in resolved)
+        remaining_total = max(total_duration - fixed_total, 0.0)
+        fitted_values = _fit_durations_to_total(
+            [desired[index] for index in active_indices],
+            remaining_total,
+        )
+
+        clamped: list[int] = []
+        for index, value in zip(active_indices, fitted_values):
+            if value < lower_bounds[index]:
+                resolved[index] = lower_bounds[index]
+                clamped.append(index)
+            elif value > upper_bounds[index]:
+                resolved[index] = upper_bounds[index]
+                clamped.append(index)
+
+        if not clamped:
+            for index, value in zip(active_indices, fitted_values):
+                resolved[index] = value
+            break
+
+        for index in clamped:
+            active.remove(index)
+
+    return [float(value or lower_bounds[index]) for index, value in enumerate(resolved)]
 
 
 def _resolve_material_text_hints(count: int, hints: Sequence[str] | None) -> list[str]:
@@ -887,8 +1021,12 @@ def _resolve_material_text_hints(count: int, hints: Sequence[str] | None) -> lis
 
 
 def _resolve_stretch_strategy(requested_tempo: float, text_hint: str) -> tuple[float, str]:
+    if requested_tempo > RUBBERBAND_MAX_TEMPO:
+        return RUBBERBAND_MAX_TEMPO, "rubberband_max_compression_floor"
     if _is_short_material_text(text_hint) and requested_tempo < 0.75:
         return 0.75, "syllable_safe_expand_with_tail_padding"
+    if requested_tempo < RUBBERBAND_MIN_TEMPO:
+        return RUBBERBAND_MIN_TEMPO, "rubberband_max_expansion_ceiling"
     return requested_tempo, "rubberband_full_clip"
 
 
@@ -1250,6 +1388,7 @@ def _run_progress_process(
             process.kill()
         stdout_thread.join(timeout=1.0)
         stderr_thread.join(timeout=1.0)
+        _close_process_streams(process)
 
     if return_code is None:
         return_code = process.returncode
@@ -1285,6 +1424,16 @@ def _stop_progress_process(process: subprocess.Popen[str]) -> None:
         time.sleep(0.05)
     if process.poll() is None:
         process.kill()
+
+
+def _close_process_streams(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 def _split_progress_line(line: str) -> tuple[str | None, str]:

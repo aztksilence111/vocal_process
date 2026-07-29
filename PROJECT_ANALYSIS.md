@@ -1190,3 +1190,19 @@ Next architecture direction:
 3. `scripts/start_maintenance_session.ps1` launches that runner with `Start-Process -WindowStyle Hidden`, satisfying the local hidden-background-service requirement while keeping all state under ignored `.tmp\maintenance_sessions`.
 4. This does not make the model itself reason unattended for 10 hours; it creates the missing process-supervision layer so long deterministic checks, real-test loops, and future resumable agent orchestration have a stable substrate.
 5. The runner is covered by maintenance-plan and one-cycle execution tests, and the full regression suite now passes with 90 tests.
+
+### 2026-07-29: Real-Test Evidence and Long-Run Plan
+
+1. The user explicitly clarified that the relevant evidence is the project software's own real test outputs, not `.codex` maintenance logs.
+2. The actual project evidence came from `tests_real/origin_vocal`, `tests_real/material_set`, and `tests_real/output/real-eval-20260728-170800/summary.json` plus `analysis.json` for `PlasticLove_JP__vmzJP`.
+3. That real case remained `review_required`, with the main risk signals being ambiguous phonetic positions, low match scores, and excessive stretch ratios.
+4. A reusable long-run plan template now exists at `%USERPROFILE%\.codex\tmp\demo-long-run.plan.json` and includes compile, unit test, audio check, a real-eval smoke, and git status.
+5. This plan is suitable as the next autonomy entry point for `E:\Workplace\demo` because it keeps real-test feedback in the loop before each cycle.
+
+### 2026-07-29: Partial Timeline Targets and Cancellation Boundary
+
+1. Pronunciation-level timeline accuracy now handles mixed-confidence ordering better: when only some material decisions have text/phonetic positions, the known syllable targets keep their segment-derived durations and unresolved materials receive the remaining reference time.
+2. The render planner now fits model target durations through a shared duration allocator and clamps them to Rubber Band tempo bounds. This prevents impossible sub-millisecond targets from producing invalid render commands while preserving the total reference duration when the requested bounds are feasible.
+3. Stretch strategy labels now distinguish full-clip stretch, syllable-safe expansion with tail padding, max-compression floor, and max-expansion ceiling. These labels are useful diagnostics for real cases where pronunciation alignment would otherwise be hidden behind a generic extreme-stretch warning.
+4. Cancellation coverage now includes a stdout-idle child-process regression. The progress runner polls cancellation independently from FFmpeg progress output and explicitly closes stdout/stderr handles after termination.
+5. Verification for this continuation passed `compileall`, 94 unit tests, `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.

@@ -1825,8 +1825,12 @@ def _target_durations_for_decisions(
         return tuple(None for _ in decisions)
 
     positioned_targets = _positioned_target_durations(reference_segments, decisions)
-    if positioned_targets and all(target is not None for target in positioned_targets):
-        return positioned_targets
+    if positioned_targets and any(target is not None for target in positioned_targets):
+        return _fill_unresolved_target_durations(
+            positioned_targets,
+            decisions,
+            reference_duration=reference_duration,
+        )
 
     normalized_reference_texts = {
         _compact_bridge_text(decision.reference_text)
@@ -1872,7 +1876,11 @@ def _target_durations_for_decisions(
             break
 
     if any(target is not None for target in targets):
-        return tuple(targets)
+        return _fill_unresolved_target_durations(
+            targets,
+            decisions,
+            reference_duration=reference_duration,
+        )
     return _weighted_target_durations(decisions, reference_duration=reference_duration)
 
 
@@ -2130,10 +2138,96 @@ def _weighted_target_durations(
     reference_duration: float,
 ) -> tuple[float | None, ...]:
     weights = [_decision_text_weight(decision) for decision in decisions]
-    total_weight = sum(weights)
-    if total_weight <= 0:
-        return tuple(None for _ in decisions)
-    return tuple(reference_duration * (weight / total_weight) for weight in weights)
+    return tuple(_fit_target_durations_to_total(weights, reference_duration))
+
+
+def _fill_unresolved_target_durations(
+    targets: Sequence[float | None],
+    decisions: Sequence[MaterialOrderDecision],
+    *,
+    reference_duration: float,
+) -> tuple[float | None, ...]:
+    if len(targets) != len(decisions):
+        return _weighted_target_durations(decisions, reference_duration=reference_duration)
+
+    explicit_indices = [
+        index
+        for index, target in enumerate(targets)
+        if target is not None and float(target) > 0
+    ]
+    if not explicit_indices:
+        return _weighted_target_durations(decisions, reference_duration=reference_duration)
+
+    explicit_index_set = set(explicit_indices)
+    unresolved_indices = [index for index in range(len(targets)) if index not in explicit_index_set]
+    if not unresolved_indices:
+        return tuple(
+            _fit_target_durations_to_total(
+                [float(targets[index] or 0.0) for index in explicit_indices],
+                reference_duration,
+            )
+        )
+
+    resolved: list[float | None] = [None for _ in targets]
+    explicit_sum = sum(float(targets[index] or 0.0) for index in explicit_indices)
+    unresolved_reserve = _minimum_target_duration_budget(reference_duration, len(unresolved_indices))
+    explicit_budget = max(reference_duration - unresolved_reserve, 0.0)
+
+    if explicit_sum > explicit_budget:
+        explicit_values = _fit_target_durations_to_total(
+            [float(targets[index] or 0.0) for index in explicit_indices],
+            explicit_budget,
+        )
+    else:
+        explicit_values = [float(targets[index] or 0.0) for index in explicit_indices]
+
+    for index, value in zip(explicit_indices, explicit_values):
+        resolved[index] = value
+
+    remaining_duration = max(reference_duration - sum(explicit_values), 0.0)
+    unresolved_values = _fit_target_durations_to_total(
+        [_decision_text_weight(decisions[index]) for index in unresolved_indices],
+        remaining_duration,
+    )
+    for index, value in zip(unresolved_indices, unresolved_values):
+        resolved[index] = value
+
+    return tuple(_fit_target_durations_to_total([float(value or 0.0) for value in resolved], reference_duration))
+
+
+def _minimum_target_duration_budget(total_duration: float, count: int) -> float:
+    if count <= 0 or total_duration <= 0:
+        return 0.0
+    return min(0.001 * count, total_duration)
+
+
+def _fit_target_durations_to_total(durations: Sequence[float], total_duration: float) -> list[float]:
+    if not durations:
+        return []
+    if total_duration <= 0:
+        return [0.0 for _ in durations]
+    if len(durations) == 1:
+        return [total_duration]
+
+    minimum = min(0.001, total_duration / len(durations))
+    raw_values = [max(float(duration), 0.0) for duration in durations]
+    raw_total = sum(raw_values)
+    if raw_total <= 0:
+        raw_values = [1.0 for _ in durations]
+        raw_total = float(len(raw_values))
+
+    scaled = [total_duration * (duration / raw_total) for duration in raw_values]
+    adjusted: list[float] = []
+    remaining = total_duration
+    remaining_count = len(scaled)
+    for duration in scaled[:-1]:
+        max_duration = max(remaining - (minimum * (remaining_count - 1)), minimum)
+        adjusted_duration = min(max(duration, minimum), max_duration)
+        adjusted.append(adjusted_duration)
+        remaining -= adjusted_duration
+        remaining_count -= 1
+    adjusted.append(max(remaining, minimum))
+    return adjusted
 
 
 def _decision_text_weight(decision: MaterialOrderDecision) -> float:
