@@ -79,6 +79,20 @@ def _preflight_warnings(
 ) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
 
+    if _reference_text_requires_verification(ordering):
+        warnings.append(
+            {
+                "severity": "error",
+                "kind": "reference_asr_unverified",
+                "reference_path": str(ordering.reference.source_path),
+                "backend": ordering.reference.backend,
+                "message": (
+                    "Reference text comes from ASR without lyrics or a verified transcript. "
+                    "Zero-recognition-error acceptance requires a lyrics_file or other ground-truth transcript."
+                ),
+            }
+        )
+
     for decision in ordering.decisions:
         if decision.score < LOW_MATCH_SCORE:
             warnings.append(
@@ -233,6 +247,14 @@ def _decision_material_text(ordering: ModelOrderingResult, rank: int) -> str:
         if decision.rank == rank:
             return decision.material_text
     return ""
+
+
+def _reference_text_requires_verification(ordering: ModelOrderingResult) -> bool:
+    if not ordering.reference.transcript.strip():
+        return False
+    if any("lyric" in segment.timing_source for segment in ordering.reference.segments):
+        return False
+    return any(segment.timing_source.startswith("asr") for segment in ordering.reference.segments)
 
 
 def _is_short_text(text: str) -> bool:

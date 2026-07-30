@@ -31,6 +31,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "remove_selected": "Remove Selected",
         "clear": "Clear",
         "check_tools": "Check Tools",
+        "help": "Help",
+        "changelog": "Changelog",
+        "help_title": "Help",
+        "changelog_title": "Changelog",
+        "dialog_close": "Close",
         "start_batch": "Start Batch",
         "cancel": "Cancel",
         "input": "Input",
@@ -112,6 +117,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "cancelled_before_processing": "Cancelled before processing",
         "processing_cancelled": "Processing cancelled",
         "no_queued_files": "No queued files",
+        "help_body": (
+            "VocalProcess assembles a new vocal track from a material folder while preserving the reference vocal timeline.\n\n"
+            "1. Select one or more original vocal files, then select a material folder. Each material clip should be a short vocal unit or phrase; clear filename labels such as wo.wav, shi4.wav, a.wav, ai.wav, or kana names improve matching.\n\n"
+            "2. Without a lyrics file, the software uses the original vocal ASR/alignment result as the target unit sequence. Material clips are matched, ordered, and stretched to the recognized units.\n\n"
+            "3. With a lyrics file, lyrics text has priority for unit selection. The original vocal ASR/alignment result remains the timing source, so each lyric unit is mapped to the reference vocal start, end, and duration whenever aligned unit timings are available.\n\n"
+            "4. Chinese lyrics/material labels are normalized through pinyin. Japanese lyrics may use kanji, kana, or romaji; kanji/kana are converted to pronunciation units before matching file names or material transcripts. Adjacent kana/romaji annotation lines and inline readings are collapsed so the same Japanese phrase is not treated as duplicated lyrics.\n\n"
+            "5. Use Reference Vocals to choose whether the original audio needs separation, choose output options, then start the batch. Enable DAW timeline export when you need every stretched material clip as an editable item."
+        ),
+        "changelog_body": (
+            "Latest development changes:\n\n"
+            "- Lyrics-priority ordering: lyrics text now drives target unit selection when provided, while original vocal alignment remains the duration source.\n"
+            "- Japanese normalization: Janome is integrated to convert Japanese kanji/kana lyrics into pronunciation units for romaji/kana filename matching.\n"
+            "- Lyric annotation cleanup: Japanese kana/romaji readings beside the same phrase are collapsed before ordering.\n"
+            "- Language safety: Chinese and Japanese reference/material mismatches are detected and reported before model-assisted ordering wastes a run.\n"
+            "- Material filename authority: short labeled material clips can override unreliable ASR hallucinations during matching.\n"
+            "- Timeline diagnostics: exported analysis records reference units, material units, phonetic positions, aligned duration source, and target duration ratios for review."
+        ),
     },
     "zh": {
         "app_title": "音频处理器",
@@ -138,6 +160,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "remove_selected": "移除选中",
         "clear": "清空",
         "check_tools": "检查工具",
+        "help": "帮助",
+        "changelog": "更新日志",
+        "help_title": "帮助",
+        "changelog_title": "更新日志",
+        "dialog_close": "关闭",
         "start_batch": "开始批量处理",
         "cancel": "取消",
         "input": "输入文件",
@@ -219,6 +246,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "cancelled_before_processing": "处理前已取消",
         "processing_cancelled": "处理已取消",
         "no_queued_files": "没有排队文件",
+        "help_body": (
+            "VocalProcess 会使用素材集拼接新的声轨，同时尽量保留原人声的字音顺序和时间轴。\n\n"
+            "1. 先选择一个或多个原人声音频，再选择素材集文件夹。素材最好是较短的字音或短词；文件名建议写清楚读音，例如 wo.wav、shi4.wav、a.wav、ai.wav 或假名文件名。\n\n"
+            "2. 不添加歌词文件时，软件以原人声 ASR/对齐后识别出的字音序列作为目标序列，再对素材进行匹配、排序和拉伸。\n\n"
+            "3. 添加歌词文件时，歌词文本是选取字音的最高优先项；原人声 ASR/对齐结果作为时间轴来源。只要存在对齐到字音的时间，软件会把每个歌词字音映射到原人声的起点、终点和实际持续时长。\n\n"
+            "4. 中文歌词和素材标签会转成拼音匹配。日文歌词可以写汉字、假名或罗马音；汉字/假名会先转为日文发音单元，再和素材文件名或素材转写结果匹配。相邻的假名/罗马音注音行、以及行内注音会先折叠，避免把同一句日文的不同写法当成重复歌词。\n\n"
+            "5. 根据原音频选择人声分离模式，设置输出格式后开始批量处理；需要在 DAW 中继续编辑每个素材片段时，勾选导出 DAW 时间轴工程。"
+        ),
+        "changelog_body": (
+            "最新开发变更：\n\n"
+            "- 歌词优先排序：存在歌词文件时，以歌词文本决定目标字音；原人声对齐结果继续负责每个字音的时长。\n"
+            "- 日文标准化：接入 Janome，把日文汉字/假名歌词转换为发音单元，用于匹配罗马音、假名文件名和素材转写。\n"
+            "- 歌词注音清理：同一句日文旁边的假名/罗马音注释会在排序前折叠，不再当成重复目标。\n"
+            "- 语言安全检查：中文/日文原人声与素材集明显错配时，会在模型辅助排序前提醒或报错，避免浪费测试轮次。\n"
+            "- 素材文件名优先：短素材带有明确文件名标签时，可压过不可靠的 ASR 幻觉文本。\n"
+            "- 时间轴诊断增强：analysis 中记录参考字音、素材字音、发音位置、对齐时长来源和目标时长比例，便于人工复查。"
+        ),
     },
 }
 

@@ -25,7 +25,7 @@ VocalProcess Portable
 - 便携版已内置 `ffmpeg.exe` 和 `ffprobe.exe`，普通用户不需要安装 Python 或 FFmpeg。
 - 便携版会优先使用同目录下的 `models` 文件夹作为本地模型缓存。
 - 当前核心流程会使用本地预训练模型进行人声分离、转写、VAD 和素材排序；不使用在线推理计费。
-- 完整包包含 Faster Whisper、WhisperX 和 pyannote.audio；pyannote 预训练模型仍需要用户提供 Hugging Face token 并接受模型条款。
+- 完整包包含 Faster Whisper、WhisperX、FunASR/ModelScope 和 pyannote.audio；pyannote 预训练模型仍需要用户提供 Hugging Face token 并接受模型条款。
 - 首次处理会比普通 FFmpeg 转码慢很多，尤其是在 CPU 上运行 Demucs 和 Whisper 时。
 - 同一素材集未变化时会复用 `.vocalprocess_material_cache.json`；同一原音频和设置未变化时会复用参考分析缓存。
 - 标准完整包分为两个：`VocalProcess-portable.zip` 不含 VST3，适合普通人工测试；`VocalProcess-portable-vst3.zip` 含 `plugins\VocalProcess Bridge.vst3`，适合 DAW 宿主插件测试。带 `-lite` 的包只用于启动/包装烟测，不代表完整模型功能。

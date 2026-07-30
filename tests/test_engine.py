@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from audio_processor import model_runtime, preflight
+from audio_processor import model_assist, model_runtime, preflight
 from audio_processor import maintenance
 from audio_processor import real_eval
 from audio_processor import tls
@@ -35,6 +35,8 @@ from audio_processor.engine import (
     AudioProcessorError,
     ProcessOptions,
     _build_material_filter_graph,
+    _build_rendered_clip_concat_args,
+    _write_rendered_clip_concat_list,
     assemble_material_to_reference_with_progress,
     build_material_assembly_args,
     build_material_clip_args,
@@ -202,8 +204,8 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("concat=n=2:v=0:a=1", graph)
         self.assertIn("rubberband=tempo=1.25000000:pitch=1:formant=preserved", graph)
         self.assertIn("apad=whole_dur=3.500000", graph)
+        self.assertIn("atrim=duration=3.500000", graph)
         self.assertNotIn("stream_loop", graph)
-        self.assertNotIn("atrim", graph)
 
     def test_single_material_file_uses_same_stretch_chain(self) -> None:
         graph = _build_material_filter_graph(
@@ -228,7 +230,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         filters = args[args.index("-af") + 1]
         self.assertIn("rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
         self.assertIn("apad=whole_dur=2.000000", filters)
-        self.assertNotIn("atrim", filters)
+        self.assertIn("atrim=duration=2.000000", filters)
         self.assertNotIn("stream_loop", args)
 
     def test_material_assembly_uses_per_clip_stretch_plan(self) -> None:
@@ -252,7 +254,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("[0:a]rubberband=tempo=0.50000000:pitch=1:formant=preserved", filters)
         self.assertIn("[1:a]rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
         self.assertIn("[clip0][clip1]concat=n=2:v=0:a=1[outa]", filters)
-        self.assertNotIn("atrim", filters)
+        self.assertIn("atrim=duration=2.000000", filters)
         self.assertNotIn("stream_loop", filters)
 
     def test_material_stretch_plan_flags_extreme_ratios(self) -> None:
@@ -292,6 +294,24 @@ class MaterialAssemblyTests(unittest.TestCase):
             [round(clip.requested_tempo or 0.0, 6) for clip in clips],
             [0.5, 0.2, 0.333333],
         )
+
+    def test_material_stretch_plan_preserves_complete_model_target_durations_without_total_scaling(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "10.0"}, "streams": []},
+                {"format": {"duration": "0.4"}, "streams": []},
+                {"format": {"duration": "0.5"}, "streams": []},
+            ],
+        ):
+            clips = plan_material_stretch_clips(
+                Path("reference.wav"),
+                [Path("ni.wav"), Path("ai.wav")],
+                target_durations=[0.3, 0.6],
+            )
+
+        self.assertEqual([round(clip.target_duration_seconds, 6) for clip in clips], [0.3, 0.6])
+        self.assertEqual([round(clip.requested_tempo or 0.0, 6) for clip in clips], [1.333333, 0.833333])
 
     def test_material_stretch_plan_keeps_model_targets_inside_rubberband_bounds(self) -> None:
         with patch(
@@ -375,6 +395,29 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(render_mock.call_count, 1)
         concat_mock.assert_called_once()
+
+    def test_large_rendered_clip_concat_uses_concat_list_to_avoid_windows_command_limit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clip_paths = []
+            for index in range(70):
+                path = root / f"clip-{index}.wav"
+                _write_test_wave(path, duration_seconds=0.01)
+                clip_paths.append(path)
+
+            list_path = _write_rendered_clip_concat_list(clip_paths, root, root / "out.wav")
+            args = _build_rendered_clip_concat_args(
+                clip_paths,
+                root / "out.wav",
+                ProcessOptions(input_path=root / "ref.wav", output_path=root / "out.wav", overwrite=True),
+                concat_list_path=list_path,
+                progress=True,
+            )
+
+        self.assertIn("-f", args)
+        self.assertIn("concat", args)
+        self.assertEqual(args.count("-i"), 1)
+        self.assertTrue(list_path.name.endswith(".concat.txt"))
 
 
 class DawTimelineTests(unittest.TestCase):
@@ -1626,6 +1669,33 @@ class I18nTests(unittest.TestCase):
 
 
 class ModelAssistTests(unittest.TestCase):
+    @staticmethod
+    def _fake_janome_tokenizer() -> object:
+        class FakeTokenizer:
+            readings = {
+                "愛して": "アイシテ",
+                "愛してる": "アイシテル",
+                "中": "チュウ",
+            }
+
+            def tokenize(self, text: str) -> list[object]:
+                tokens: list[object] = []
+                index = 0
+                keys = sorted(self.readings, key=len, reverse=True)
+                while index < len(text):
+                    matched_key = next((key for key in keys if text.startswith(key, index)), "")
+                    if matched_key:
+                        tokens.append(SimpleNamespace(surface=matched_key, phonetic=self.readings[matched_key]))
+                        index += len(matched_key)
+                        continue
+                    character = text[index]
+                    if character.strip():
+                        tokens.append(SimpleNamespace(surface=character, phonetic=character))
+                    index += 1
+                return tokens
+
+        return FakeTokenizer()
+
     def test_model_candidates_cover_required_pipeline_stages(self) -> None:
         stages = {candidate["pipeline_stage"] for candidate in list_model_candidates()}
 
@@ -1633,6 +1703,7 @@ class ModelAssistTests(unittest.TestCase):
         self.assertIn("voice_activity_detection", stages)
         self.assertIn("asr_alignment", stages)
         self.assertIn("speaker_similarity", stages)
+        self.assertIn("pronunciation_normalization", stages)
 
     def test_pipeline_plan_is_serializable(self) -> None:
         plan = build_model_assisted_pipeline_plan()
@@ -1701,6 +1772,36 @@ class ModelAssistTests(unittest.TestCase):
 
         self.assertEqual([decision.material_path.name for decision in decisions], ["002_alpha.wav", "001_beta.wav"])
         self.assertEqual([decision.material_text for decision in decisions], ["alpha", "beta"])
+
+    def test_filename_label_authority_suppresses_short_material_asr_hallucination(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            material_dir = root / "newOTTO_CN"
+            material_dir.mkdir()
+            material_path = material_dir / "ha.wav"
+            _write_test_wave(material_path, duration_seconds=0.5)
+
+            with patch(
+                "audio_processor.model_runtime._transcribe_audio",
+                return_value={"backend": "whisperx", "text": "\u4ed6", "segments": [], "notes": []},
+            ):
+                with patch("audio_processor.model_runtime._detect_vad_segments", return_value=()):
+                    with patch("audio_processor.model_runtime._speaker_embedding", return_value=None):
+                        library = model_runtime.analyze_material_library(material_dir)
+
+        self.assertEqual(library.materials[0].transcript, "ha")
+        self.assertEqual(library.materials[0].segments[0].text, "ha")
+        self.assertTrue(any("material_filename_label_authority" in note for note in library.materials[0].notes))
+
+    def test_material_display_text_collapses_duplicate_filename_authority(self) -> None:
+        material = MaterialAnalysis(
+            Path("ha.wav"),
+            transcript="ha",
+            filename_text="ha",
+            duration_seconds=0.4,
+        )
+
+        self.assertEqual(model_assist._material_display_text(material), "ha")
 
     def test_short_reference_scores_filename_and_duration_separately(self) -> None:
         decisions = order_materials_for_reference(
@@ -1778,6 +1879,41 @@ class ModelAssistTests(unittest.TestCase):
         self.assertEqual(plan.score_matrix[0][1].reference_phonetic_units, ("wo", "shi", "ni"))
         self.assertEqual(plan.score_matrix[0][1].material_phonetic_units, ("wo",))
 
+    def test_reference_phonetic_unit_sequence_skips_unrelated_noise_and_reuses_duplicate_syllables(self) -> None:
+        reference_segments = [VoiceSegment(0.0, 3.0, "\u4f60\u7231\u4f60")]
+        materials = [
+            MaterialAnalysis(Path("noise.wav"), transcript="thank you", filename_text="noise", duration_seconds=0.8),
+            MaterialAnalysis(Path("ni1.wav"), transcript="", filename_text="ni", duration_seconds=1.0),
+            MaterialAnalysis(Path("ai.wav"), transcript="", filename_text="ai", duration_seconds=1.0),
+            MaterialAnalysis(Path("ni2.wav"), transcript="", filename_text="ni", duration_seconds=1.0),
+        ]
+
+        decisions = order_materials_for_reference(reference_segments, materials)
+        plan = plan_material_ordering(reference_segments, materials)
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["ni1.wav", "ai.wav", "ni2.wav"])
+        self.assertEqual(len(decisions), 3)
+        self.assertNotIn("noise.wav", [decision.material_path.name for decision in decisions])
+        self.assertEqual([decision.phonetic_position for decision in decisions], [0, 1, 2])
+        self.assertEqual([decision.reference_segment_index for decision in decisions], [0, 0, 0])
+        self.assertEqual(plan.strategy, "reference_phonetic_unit_sequence")
+        self.assertIsNone(plan.score_matrix[0][0].phonetic_position)
+        self.assertEqual([score.phonetic_position for score in plan.score_matrix[0][1:]], [0, 1, 0])
+
+    def test_reference_phonetic_unit_sequence_reuses_material_when_reference_has_more_units(self) -> None:
+        reference_segments = [VoiceSegment(0.0, 4.0, "\u4f60\u7231\u4f60\u7231")]
+        materials = [
+            MaterialAnalysis(Path("ni.wav"), transcript="", filename_text="ni", duration_seconds=0.5),
+            MaterialAnalysis(Path("ai.wav"), transcript="", filename_text="ai", duration_seconds=0.5),
+        ]
+
+        plan = plan_material_ordering(reference_segments, materials)
+
+        self.assertEqual(plan.strategy, "reference_phonetic_unit_sequence")
+        self.assertEqual([decision.material_path.name for decision in plan.decisions], ["ni.wav", "ai.wav", "ni.wav", "ai.wav"])
+        self.assertEqual([decision.phonetic_position for decision in plan.decisions], [0, 1, 2, 3])
+        self.assertEqual(len(plan.decisions), 4)
+
     def test_orders_tone_number_pinyin_filenames_by_phonetic_position(self) -> None:
         decisions = order_materials_for_reference(
             [VoiceSegment(0.0, 3.0, "\u6211\u662f\u4f60")],
@@ -1839,6 +1975,35 @@ class ModelAssistTests(unittest.TestCase):
         self.assertEqual([decision.text_position for decision in decisions], [None, None, None, None])
         self.assertEqual([decision.phonetic_position for decision in decisions], [0, 1, 2, 3])
         self.assertTrue(all(decision.phonetic_score > 0.8 for decision in decisions))
+
+    def test_orders_japanese_kanji_lyrics_by_janome_pronunciation(self) -> None:
+        with patch("audio_processor.model_assist._janome_tokenizer", return_value=self._fake_janome_tokenizer()):
+            decisions = order_materials_for_reference(
+                [VoiceSegment(0.0, 4.0, "\u611b\u3057\u3066", language_hint="JP")],
+                [
+                    MaterialAnalysis(Path("te.wav"), transcript="", filename_text="te", duration_seconds=1.0, language_hint="JP"),
+                    MaterialAnalysis(Path("shi.wav"), transcript="", filename_text="shi", duration_seconds=1.0, language_hint="JP"),
+                    MaterialAnalysis(Path("a.wav"), transcript="", filename_text="a", duration_seconds=1.0, language_hint="JP"),
+                    MaterialAnalysis(Path("i.wav"), transcript="", filename_text="i", duration_seconds=1.0, language_hint="JP"),
+                ],
+            )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["a.wav", "i.wav", "shi.wav", "te.wav"])
+        self.assertEqual([decision.phonetic_position for decision in decisions], [0, 1, 2, 3])
+        self.assertTrue(all(decision.language_hint == "JP" for decision in decisions))
+
+    def test_chinese_language_hint_keeps_cjk_on_pinyin_path(self) -> None:
+        with patch("audio_processor.model_assist._janome_tokenizer", return_value=self._fake_janome_tokenizer()):
+            decisions = order_materials_for_reference(
+                [VoiceSegment(0.0, 1.0, "\u4e2d", language_hint="CN")],
+                [
+                    MaterialAnalysis(Path("chu.wav"), transcript="", filename_text="chu", duration_seconds=1.0, language_hint="CN"),
+                    MaterialAnalysis(Path("zhong.wav"), transcript="", filename_text="zhong", duration_seconds=1.0, language_hint="CN"),
+                ],
+            )
+
+        self.assertEqual(decisions[0].material_path.name, "zhong.wav")
+        self.assertEqual(decisions[0].language_hint, "CN")
 
     def test_repeated_phonetic_positions_are_diagnosed_and_downweighted(self) -> None:
         plan = plan_material_ordering(
@@ -2106,12 +2271,14 @@ class ModelRuntimeTests(unittest.TestCase):
             _write_test_wave(material_path)
             cache_path = material_dir / ".vocalprocess_material_cache.json"
             snapshot = model_runtime._material_snapshot([material_path])
+            filename_label_policy = model_runtime._material_filename_label_policy(material_dir, [material_path])
             cache_path.write_text(
                 json.dumps(
                     {
-                        "format": "vocal_process_material_cache_v1",
+                        "format": model_runtime.MATERIAL_CACHE_FORMAT,
                         "asr_model": model_runtime.DEFAULT_ASR_MODEL,
                         "asr_backend": model_runtime._asr_backend_cache_key(),
+                        "material_filename_label_policy": filename_label_policy.cache_key,
                         "snapshot": snapshot,
                         "materials": [
                             {
@@ -2152,12 +2319,14 @@ class ModelRuntimeTests(unittest.TestCase):
             _write_test_wave(material_path)
             cache_path = material_dir / ".vocalprocess_material_cache.json"
             snapshot = model_runtime._material_snapshot([material_path])
+            filename_label_policy = model_runtime._material_filename_label_policy(material_dir, [material_path])
             cache_path.write_text(
                 json.dumps(
                     {
-                        "format": "vocal_process_material_cache_v1",
+                        "format": model_runtime.MATERIAL_CACHE_FORMAT,
                         "asr_model": model_runtime.DEFAULT_ASR_MODEL,
                         "asr_backend": "auto",
+                        "material_filename_label_policy": filename_label_policy.cache_key,
                         "snapshot": snapshot,
                         "materials": [
                             {
@@ -2309,6 +2478,69 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["decision_details"][0]["target_duration_source"], "aligned_unit_timing")
         self.assertEqual(summary["decision_details"][0]["target_start_seconds"], 0.0)
         self.assertEqual(summary["decision_details"][0]["target_end_seconds"], 0.4)
+
+    def test_aligned_unit_targets_are_not_scaled_to_fill_uncovered_reference_tail(self) -> None:
+        reference_segments = [
+            VoiceSegment(
+                10.0,
+                20.0,
+                "\u4f60\u7231",
+                unit_timings=(
+                    VoiceUnitTiming(0, "\u4f60", 10.0, 10.3, timing_source="test_alignment"),
+                    VoiceUnitTiming(1, "\u7231", 10.3, 10.9, timing_source="test_alignment"),
+                ),
+            )
+        ]
+        decisions = order_materials_for_reference(
+            reference_segments,
+            [
+                MaterialAnalysis(Path("ni.wav"), transcript="", filename_text="ni", duration_seconds=0.4),
+                MaterialAnalysis(Path("ai.wav"), transcript="", filename_text="ai", duration_seconds=0.5),
+            ],
+        )
+
+        target_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=10.0,
+        )
+        summary = model_runtime._render_timeline_alignment_summary(reference_segments, decisions, target_durations)
+
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (0.3, 0.6))
+        self.assertAlmostEqual(summary["target_duration_total_seconds"], 0.9)
+        self.assertEqual(summary["timed_target_duration_count"], 2)
+
+    def test_funasr_unit_slots_are_scaled_to_reference_duration_when_gaps_are_sparse(self) -> None:
+        reference_segments = [
+            VoiceSegment(
+                0.0,
+                3.0,
+                "\u6211\u7231\u4f60",
+                unit_timings=(
+                    VoiceUnitTiming(0, "\u6211", 0.5, 0.6, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(1, "\u7231", 1.2, 1.3, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(2, "\u4f60", 1.8, 2.0, timing_source="funasr_timestamp"),
+                ),
+            )
+        ]
+        decisions = order_materials_for_reference(
+            reference_segments,
+            [
+                MaterialAnalysis(Path("ni.wav"), transcript="", filename_text="ni", duration_seconds=0.4),
+                MaterialAnalysis(Path("wo.wav"), transcript="", filename_text="wo", duration_seconds=0.4),
+                MaterialAnalysis(Path("ai.wav"), transcript="", filename_text="ai", duration_seconds=0.4),
+            ],
+        )
+
+        target_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=3.0,
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["wo.wav", "ai.wav", "ni.wav"])
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (1.4, 1.2, 0.4))
+        self.assertAlmostEqual(sum(float(duration or 0.0) for duration in target_durations), 3.0)
 
     def test_partial_positioned_decisions_fill_remaining_target_duration(self) -> None:
         reference_segments = [
@@ -2500,6 +2732,56 @@ class ModelRuntimeTests(unittest.TestCase):
 
         self.assertTrue(any(warning["kind"] == "missing_aligned_unit_timing" for warning in warnings))
 
+    def test_preflight_marks_unverified_reference_asr_for_strict_acceptance(self) -> None:
+        ordering = model_runtime.ModelOrderingResult(
+            reference=model_runtime.ReferenceAnalysis(
+                source_path=Path("reference.wav"),
+                vocal_path=Path("reference.wav"),
+                transcript="\u6211",
+                segments=(VoiceSegment(0.0, 1.0, "\u6211", timing_source="asr_segment"),),
+                speaker_embedding=None,
+                backend="whisperx",
+            ),
+            library=model_runtime.MaterialLibraryAnalysis(
+                material_directory=Path("materials"),
+                materials=(),
+                backend_summary={},
+            ),
+            ordered_paths=(),
+            target_durations=(),
+            decisions=(),
+            analysis_report={},
+        )
+
+        warnings = preflight._preflight_warnings(ordering, [])
+
+        self.assertTrue(any(warning["kind"] == "reference_asr_unverified" for warning in warnings))
+
+    def test_preflight_accepts_reference_text_retargeted_to_lyrics(self) -> None:
+        ordering = model_runtime.ModelOrderingResult(
+            reference=model_runtime.ReferenceAnalysis(
+                source_path=Path("reference.wav"),
+                vocal_path=Path("reference.wav"),
+                transcript="\u6211",
+                segments=(VoiceSegment(0.0, 1.0, "\u6211", timing_source="asr_segment_with_lyric_text"),),
+                speaker_embedding=None,
+                backend="whisperx",
+            ),
+            library=model_runtime.MaterialLibraryAnalysis(
+                material_directory=Path("materials"),
+                materials=(),
+                backend_summary={},
+            ),
+            ordered_paths=(),
+            target_durations=(),
+            decisions=(),
+            analysis_report={},
+        )
+
+        warnings = preflight._preflight_warnings(ordering, [])
+
+        self.assertFalse(any(warning["kind"] == "reference_asr_unverified" for warning in warnings))
+
     def test_reference_analysis_cache_reuses_matching_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2591,6 +2873,51 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(timings[2].start_seconds, 0.82)
         self.assertEqual(timings[2].end_seconds, 1.1)
 
+    def test_funasr_timestamps_become_timeline_unit_timings(self) -> None:
+        timings = model_runtime._unit_timings_from_funasr_timestamps(
+            "\u6211\u7231 you",
+            ((0.1, 0.3), (0.3, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 1.0)),
+        )
+
+        self.assertEqual([timing.unit for timing in timings], ["\u6211", "\u7231", "you"])
+        self.assertEqual([timing.position for timing in timings], [0, 1, 2])
+        self.assertEqual(timings[0].timing_source, "funasr_timestamp")
+        self.assertEqual(timings[2].start_seconds, 0.6)
+        self.assertEqual(timings[2].end_seconds, 1.0)
+
+    def test_transcribe_audio_uses_funasr_when_requested(self) -> None:
+        class FakeFunasrModel:
+            def generate(self, **kwargs: object) -> list[dict[str, object]]:
+                if "input" not in kwargs:
+                    raise AssertionError("missing input")
+                return [
+                    {
+                        "text": "\u4f60\u597d",
+                        "timestamp": [[100, 300], [300, 650]],
+                    }
+                ]
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "input.wav"
+            _write_test_wave(audio)
+
+            with patch.dict(
+                os.environ,
+                {"VOCAL_PROCESS_ASR_BACKEND": "funasr", "VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD": "1"},
+                clear=False,
+            ):
+                with patch("audio_processor.model_runtime.ensure_runtime_tool_paths", return_value=[]):
+                    with patch("audio_processor.model_runtime._ensure_model_download_tls", return_value=None):
+                        with patch("audio_processor.model_runtime._module_available", return_value=True):
+                            with patch("audio_processor.model_runtime._load_funasr_model", return_value=FakeFunasrModel()):
+                                result = model_runtime._transcribe_audio(audio, compute_device="cpu")
+
+        self.assertEqual(result["backend"], "funasr")
+        self.assertEqual(result["text"], "\u4f60\u597d")
+        self.assertEqual(result["segments"][0].timing_source, "funasr_timestamp")
+        self.assertEqual([timing.unit for timing in result["segments"][0].unit_timings], ["\u4f60", "\u597d"])
+
     def test_lrc_timestamps_are_parsed_but_conflicts_are_not_trusted_silently(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2611,13 +2938,65 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(lyric_segments[0].timing_source, "lrc_timestamp")
         self.assertTrue(any(note.startswith("lyric_timing_conflict:") for note in notes))
 
+    def test_japanese_lyrics_collapse_inline_and_adjacent_pronunciation_annotations(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "song_JP.txt"
+            lyrics.write_text(
+                "\u611b\u3057\u3066\uff08\u3042\u3044\u3057\u3066\uff09 / aishite\n"
+                "\u3042\u3044\u3057\u3066\n"
+                "aishite\n"
+                "\u611b\u3057\u3066\n"
+                "\u611b\u3057\u3066\n",
+                encoding="utf-8",
+            )
+
+            with patch("audio_processor.model_assist._janome_tokenizer", return_value=ModelAssistTests._fake_janome_tokenizer()):
+                lyric_segments = model_runtime.parse_lyrics_file(lyrics)
+
+        self.assertEqual([segment.text for segment in lyric_segments], ["\u611b\u3057\u3066", "\u611b\u3057\u3066", "\u611b\u3057\u3066"])
+        self.assertEqual([segment.language_hint for segment in lyric_segments], ["JP", "JP", "JP"])
+
+    def test_japanese_lyric_text_retargets_original_aligned_unit_durations(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "song_JP.txt"
+            lyrics.write_text("\u611b\u3057\u3066\n\u3042\u3044\u3057\u3066\n", encoding="utf-8")
+            transcript_segments = [
+                model_runtime.TranscriptSegment(
+                    0.0,
+                    2.0,
+                    "ignored",
+                    timing_source="whisperx_char_alignment",
+                    unit_timings=(
+                        VoiceUnitTiming(0, "x0", 0.0, 0.2, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(1, "x1", 0.2, 0.7, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(2, "x2", 0.7, 1.4, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(3, "x3", 1.4, 2.0, timing_source="whisperx_char_alignment"),
+                    ),
+                )
+            ]
+
+            with patch("audio_processor.model_assist._janome_tokenizer", return_value=ModelAssistTests._fake_janome_tokenizer()):
+                segments = model_runtime._segments_from_transcript(transcript_segments, lyrics_file=lyrics)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].text, "\u611b\u3057\u3066")
+        self.assertEqual(segments[0].timing_source, "asr_segment_with_lyric_text")
+        self.assertEqual([timing.unit for timing in segments[0].unit_timings], ["a", "i", "shi", "te"])
+        self.assertEqual([round(timing.duration_seconds, 6) for timing in segments[0].unit_timings], [0.2, 0.5, 0.7, 0.6])
+
     def test_auto_asr_skips_uncached_accelerated_backends(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             audio = root / "input.wav"
             _write_test_wave(audio)
 
-            with patch.dict(os.environ, {"VOCAL_PROCESS_ASR_BACKEND": "auto"}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"VOCAL_PROCESS_ASR_BACKEND": "auto", "VOCAL_PROCESS_ENABLE_FUNASR_AUTO": ""},
+                clear=False,
+            ):
                 with patch("audio_processor.model_runtime._module_available", return_value=True):
                     with patch("audio_processor.model_runtime._faster_whisper_model_cached", return_value=False):
                         with patch("audio_processor.model_runtime._whisperx_model_cached", return_value=False):

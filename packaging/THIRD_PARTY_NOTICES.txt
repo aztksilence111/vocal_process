@@ -17,6 +17,7 @@ Optional model/runtime projects referenced by the source tree:
 
 - OpenAI Whisper: https://github.com/openai/whisper
 - Faster Whisper: https://github.com/SYSTRAN/faster-whisper
+- Janome: https://github.com/mocobeta/janome
 - Demucs: https://github.com/facebookresearch/demucs
 - Silero VAD: https://github.com/snakers4/silero-vad
 - SpeechBrain: https://github.com/speechbrain/speechbrain

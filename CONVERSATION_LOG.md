@@ -1320,3 +1320,47 @@ Remaining after this continuation:
 9. 该单用例真实跑分：`status_counts={"rendered":1}`，`planning_alignment_score.mean=0.480188`，`rendered_audio_alignment_score.mean=0.608193`，`match_ordering_score.mean=0.110427`，`render_duration_delta_ratio.mean=0.007794`，`strict_render_pass_count=0`。
 10. 当前质量问题已进入实际排序/拉伸优化阶段：`low_match_score=38`、`ambiguous_phonetic_position=55`、`extreme_stretch_ratio=81`、`moderate_stretch_ratio=12`、`single_syllable_extreme_stretch=2`。
 11. 验证通过：`compileall`、相关 46 个单测、完整 `unittest discover` 124 个测试、`audio_processor check`、`git diff --check`（仅 CRLF 提示）。
+### 2026-07-30: 字音序列复用、精确裁剪渲染与真实跑分验证
+
+1. 用户要求按当前判断继续修改并跑分验证，同时追问为什么仍使用 WhisperX，而不是切换到更强的开源 ASR 项目。
+2. 本轮判断：WhisperX 不是因为中文识别最强而保留，而是因为当前项目已经把它接入了字符级 forced alignment 时间戳链路；用户目标要求字音排序和每个字音实际持续时长对齐，不能只替换成只输出文本的 ASR。更合理的长期架构是把“识别前端”和“时间对齐后端”拆开，后续把 FunASR/SenseVoice 作为可选识别前端接入，再复用或替换对齐器。
+3. 本地环境检查显示 `funasr` 和 `modelscope` 当前未安装，`onnxruntime` 已安装；因此本轮真实跑分继续使用已缓存、可复现的 WhisperX 字符时间轴，避免把评分验证变成新的依赖安装/模型缓存任务。
+4. 排序逻辑从“素材数量驱动”改为“参考字音序列驱动”：中文/日文参考文本会按参考 phonetic unit 顺序生成决策；当参考字音数量多于素材数量时允许复用同一素材样本，从而让长参考人声不再只生成素材数长度的排序。
+5. 候选选择改为当前位置精确同音/同音调优先，缺失同音素材时才进入低分 fallback；fallback 会避开后面仍有精确位置用途的素材，减少把素材提前消耗到错误字音上的情况。
+6. 目标时长分配改为优先保留 WhisperX 字符对齐得到的实际 unit duration，不再把未覆盖的间奏、空白或剩余段落时长强行分摊到已定位单字上。
+7. 渲染层修复两类实际失败：大量 300+ clip 拼接时自动写 FFmpeg concat list，避免 Windows 命令行过长；每个目标 clip 在 `apad` 后增加 `atrim` 和 `asetpts`，避免高压缩比例下 Rubber Band 输出长于目标而累积拉长整首。
+8. 验证通过：`compileall`、完整 `unittest discover` 133 项、`audio_processor check`、`git diff --check`。
+9. 非渲染真实跑分 `FengZhongYouDuo_CN__newOTTO` 输出：`tests_real\output\optimization-sequence-cn\real-eval-20260730-173309\summary.md`。结果从上一轮 165 个素材决策提升为 304 个字音级决策，`planning_alignment_score=0.785077`，`match_ordering_score=0.502006`，`Review Needed=7`，低匹配告警从 18 降到 7。
+10. 渲染真实跑分 `FengZhongYouDuo_CN__newOTTO` 输出：`tests_real\output\optimization-sequence-render-cn3\real-eval-20260730-183600\summary.md`。状态为 `rendered`，`rendered_audio_alignment_score=0.838808`，`render_duration_delta_ratio=0.000001`，输出总时长误差约 `0.00025s`。
+11. 与旧基线 `tests_real\output\real-eval-20260730-061920\summary.md` 对比，同一案例的 `planning_alignment_score` 从 `0.35795` 提升到 `0.785077`，`match_ordering_score` 从约 `0.04384` 提升到 `0.502006`，定位/定时覆盖从 `0.369697` 提升到 `1.0`。
+12. 严格验收仍未通过，原因不是基础设施或渲染失败，而是质量告警仍存在：`weak_text_signal=104`、`low_match_score=7`、`extreme_stretch_ratio=55`、`moderate_stretch_ratio=137`。这些主要来自素材集中缺少若干参考目标拼音音节，仍需要更强识别前端、素材缺失诊断和更细的近音替代策略继续优化。
+
+### 2026-07-30: FunASR 后端接入与再次真实验收
+
+1. 已安装 `funasr` 和 `modelscope`，并把 FunASR 作为可选中文 ASR 后端接入 `audio_processor.model_runtime`。模型缓存统一落到 `.tmp\model-cache\modelscope` 和 `.tmp\model-cache\funasr`。
+2. `scripts/run_real_eval_render_full.ps1` 与 `scripts/run_real_tests.ps1` 已支持 `-AsrBackend`，默认渲染脚本可直接切到 `funasr`。
+3. `real_eval` Markdown 报告已加入中文说明和输出音频路径列，便于人工复查渲染结果。
+4. 第一次 FunASR 跑分暴露出一个真实问题：字级时间戳只覆盖发声片段，导致目标总时长被压缩到 81.324 秒，渲染分只有 `0.55701`，不适合人工参考。
+5. 随后修正了 FunASR 的字位槽时长逻辑，并在总槽时长明显短于参考人声时强制按参考总时长归一化，避免拼接音频严重变短。
+6. 第二次 FunASR 真实验收已恢复正常：`tests_real\output\optimization-funasr-render-cn2\real-eval-20260730-210123\summary.json`，输出音频为 `tests_real\output\FengZhongYouDuo_CN\newOTTO\FengZhongYouDuo_CN.wav`。
+7. 这次结果：`planning_alignment_score=0.797601`，`rendered_audio_alignment_score=0.8482`，`match_ordering_score=0.518228`，`render_duration_delta_ratio=0.000001`，`target_duration_total_seconds=259.27619`，输出 wav 时长 `259.276576` 秒，已与原人声基本对齐。
+8. 严格通过仍未开启，主要因为 `weak_text_signal`、`moderate_stretch_ratio`、`extreme_stretch_ratio` 还存在，但这次已经不是模型加载或时长塌缩问题，而是素材和匹配本身的质量问题。
+### 2026-07-30: 素材文本权威化与参考 ASR 未验证告警
+
+1. 本轮修复把短素材的文件名/OTO 标签提升为匹配权威文本。对中文/日文素材集，且单条素材时长不超过阈值时，分析阶段会把 WhisperX/FunASR 的幻觉转写忽略掉，`material_text` 仅保留文件名标签，不再把错误文本写入排序决策。
+2. 素材缓存已升级到新格式，并把“文件名标签权威策略”写入缓存键。旧缓存会自动失效重建，避免旧的 ASR 错误文本继续污染 `.jsonl` 和分析报告。
+3. 排序展示层对“转写文本与文件名标签等价”的素材做了去重显示，避免重复出现冗余文本。
+4. 参考侧新增 `reference_asr_unverified` 预检错误：如果参考音频没有歌词/验证文本，而结果又来自 ASR segment，就会在严格验收里显式失败，避免把未验证识别当作零错误结果。
+5. 单元测试已覆盖：短素材 ASR 幻觉被文件名标签覆盖、重复显示被折叠、缓存策略键失效重建、参考 ASR 未验证告警、歌词转写豁免。
+6. 验证通过：`.venv311\\Scripts\\python.exe -m unittest discover` 共 140 项通过；`compileall` 通过。当前仓库内没有真实输入音频目录，无法在本地重新跑完整 real-eval，只能依赖历史输出和单测确认修复方向。
+
+### 2026-07-31: 歌词优先、日文读音归一化与帮助弹窗
+
+1. 用户补充软件运行逻辑：无歌词时按原人声 ASR/对齐出的字音拼接；有歌词时以歌词文本为选字音最高优先项，原人声 ASR/对齐时间轴负责每个字音的起点、终点和持续时长。
+2. 本轮接入开源 Janome 作为日文读音归一化层。它不替代 WhisperX/FunASR 的时间轴能力，而是把日文汉字/假名歌词转换成可和罗马音、假名素材文件名匹配的发音单元。
+3. 中文仍走 `pypinyin`，并通过 `language_hint` 贯穿 `VoiceSegment`、`MaterialAnalysis`、评分矩阵、排序决策和时间轴诊断，避免 JP 歌词中的汉字被默认当成中文拼音。
+4. 歌词解析新增日文注音清理：行内 `愛して（あいして） / aishite`、以及相邻的汉字/假名/罗马音同音异写行会折叠成一个目标句；完全相同的重复歌词不会仅因同音被折叠。
+5. 时间轴路径继续以原人声为准：歌词覆盖文本，`_retarget_unit_timings_to_text()` 会在歌词发音单元数与原 ASR unit timing 数一致时保留原人声每个字音的真实 duration。
+6. GUI 新增“帮助”和“更新日志”按钮，均以弹窗显示中英文说明，不把长说明堆到主界面。
+7. 依赖与打包同步加入 `janome>=0.5,<0.6`，便携打包收集 Janome，`audio_processor check` 现在会显示 `Janome: available`。
+8. 验证通过：`.venv311\Scripts\python.exe -m compileall -q audio_processor tests`；`.venv311\Scripts\python.exe -m unittest discover` 共 144 项通过；`.venv311\Scripts\python.exe -m audio_processor check` 通过；`git diff --check` 仅有 CRLF 提示。

@@ -95,6 +95,10 @@ class AudioProcessorApp(tk.Tk):
 
         self.check_button = self._button(toolbar, "check_tools", self.check_tools)
         self.check_button.pack(side="left", padx=(8, 0))
+        self.help_button = self._button(toolbar, "help", self.show_help)
+        self.help_button.pack(side="left", padx=(8, 0))
+        self.changelog_button = self._button(toolbar, "changelog", self.show_changelog)
+        self.changelog_button.pack(side="left", padx=(8, 0))
 
         self.start_button = self._button(toolbar, "start_batch", self.start_batch)
         self.start_button.pack(side="right")
@@ -385,6 +389,39 @@ class AudioProcessorApp(tk.Tk):
             return
         self._log(report)
         messagebox.showinfo(self._t("tool_check_title"), report)
+
+    def show_help(self) -> None:
+        self._show_text_window(self._t("help_title"), self._t("help_body"))
+
+    def show_changelog(self) -> None:
+        self._show_text_window(self._t("changelog_title"), self._t("changelog_body"))
+
+    def _show_text_window(self, title: str, body: str) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.geometry("660x460")
+        dialog.minsize(520, 340)
+        dialog.transient(self)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        content = ttk.Frame(dialog, padding=12)
+        content.grid(row=0, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+
+        text = tk.Text(content, wrap="word", height=18)
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(content, orient="vertical", command=text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scrollbar.set)
+        text.insert("1.0", body)
+        text.configure(state="disabled")
+
+        close_button = ttk.Button(content, text=self._t("dialog_close"), command=dialog.destroy)
+        close_button.grid(row=1, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        close_button.focus_set()
+        dialog.grab_set()
 
     def save_current_settings(self) -> None:
         try:

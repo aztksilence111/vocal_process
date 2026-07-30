@@ -5,6 +5,7 @@ param(
     [switch]$Render,
     [string]$ComputeDevice = "auto",
     [string]$SourceSeparation = "never",
+    [string]$AsrBackend,
     [int]$MaxCases,
     [string]$Case,
     [string]$Split,
@@ -16,6 +17,10 @@ $ErrorActionPreference = "Stop"
 $python = Join-Path $PSScriptRoot "..\\.venv311\\Scripts\\python.exe"
 if (-not (Test-Path -LiteralPath $python)) {
     $python = "python"
+}
+
+if ($AsrBackend) {
+    $env:VOCAL_PROCESS_ASR_BACKEND = $AsrBackend
 }
 
 $args = @("-m", "audio_processor.real_eval", "--root", $Root, "--compute-device", $ComputeDevice, "--source-separation", $SourceSeparation)

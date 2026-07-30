@@ -1436,37 +1436,46 @@ def _count_by(values: Iterable[str]) -> dict[str, int]:
 
 
 def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseResult]) -> str:
+    runtime_preflight = summary.get("runtime_preflight", {})
+    preferred_backend = (
+        runtime_preflight.get("preferred_backend", "")
+        if isinstance(runtime_preflight, dict)
+        else ""
+    )
     lines = [
-        "# Real Audio Evaluation Report",
+        "# 真实音频验收报告 / Real Audio Evaluation Report",
         "",
-        f"- Root: `{summary['root']}`",
-        f"- Render: `{summary['render']}`",
-        f"- Completed cases: `{summary.get('completed_case_count', summary['case_count'])}` / "
+        f"- 根目录 Root: `{summary['root']}`",
+        f"- 是否渲染 Render: `{summary['render']}`",
+        f"- ASR 后端 ASR backend: `{preferred_backend}`",
+        f"- 完成用例 Completed cases: `{summary.get('completed_case_count', summary['case_count'])}` / "
         f"`{summary.get('planned_case_count', summary['case_count'])}`",
-        f"- Skipped cases: `{summary.get('skipped_case_count', 0)}` / "
+        f"- 跳过用例 Skipped cases: `{summary.get('skipped_case_count', 0)}` / "
         f"`{summary.get('discovered_case_count', summary.get('planned_case_count', summary['case_count']))}`",
         "",
-        "## Counts",
+        "## 统计 Counts",
         "",
-        f"- Split counts: `{json.dumps(summary['split_counts'], ensure_ascii=False)}`",
-        f"- Language counts: `{json.dumps(summary['language_counts'], ensure_ascii=False)}`",
-        f"- Status counts: `{json.dumps(summary['status_counts'], ensure_ascii=False)}`",
-        f"- Warning counts: `{json.dumps(summary['warning_counts'], ensure_ascii=False)}`",
-        f"- Skipped counts: `{json.dumps(summary.get('skipped_case_counts', {}), ensure_ascii=False)}`",
-        f"- Score summary: `{json.dumps(summary.get('score_summary', {}), ensure_ascii=False)}`",
-        f"- Infrastructure blocker: `{json.dumps(summary.get('infrastructure_blocker', {}), ensure_ascii=False)}`",
+        f"- 数据拆分统计 Split counts: `{json.dumps(summary['split_counts'], ensure_ascii=False)}`",
+        f"- 语言统计 Language counts: `{json.dumps(summary['language_counts'], ensure_ascii=False)}`",
+        f"- 状态统计 Status counts: `{json.dumps(summary['status_counts'], ensure_ascii=False)}`",
+        f"- 告警统计 Warning counts: `{json.dumps(summary['warning_counts'], ensure_ascii=False)}`",
+        f"- 跳过统计 Skipped counts: `{json.dumps(summary.get('skipped_case_counts', {}), ensure_ascii=False)}`",
+        f"- 多维度跑分汇总 Score summary: `{json.dumps(summary.get('score_summary', {}), ensure_ascii=False)}`",
+        f"- 基础设施阻塞 Infrastructure blocker: `{json.dumps(summary.get('infrastructure_blocker', {}), ensure_ascii=False)}`",
         "",
         *_render_group_score_markdown(summary),
         "",
         *_render_skipped_cases_markdown(summary),
         "",
-        "## Cases",
+        "## 用例明细 Cases",
         "",
         (
-            "| Case | Split | Language | Status | Plan Score | Render Score | Min Match | "
-            "Mean Match | Positioned | Timed | Target Delta | Render Delta | Strict Pass | Review Needed |"
+            "| 用例 Case | Split | Language | Status | 规划分 Plan Score | 渲染分 Render Score | "
+            "最低匹配 Min Match | 平均匹配 Mean Match | 定位率 Positioned | 计时率 Timed | "
+            "目标时长差 Target Delta | 渲染时长差 Render Delta | 严格通过 Strict Pass | "
+            "需复查 Review Needed | 输出音频 Output Audio |"
         ),
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for result in results:
         case_summary = result.summary
@@ -1488,7 +1497,8 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
             f"{result.status} | {_markdown_value(plan_score)} | {_markdown_value(render_score)} | "
             f"{_markdown_value(min_score)} | {_markdown_value(mean_score)} | {_markdown_value(positioned_ratio)} | "
             f"{_markdown_value(timed_ratio)} | {_markdown_value(target_delta)} | {_markdown_value(render_delta)} | "
-            f"{case_summary.get('strict_render_pass', False)} | {review_count} |"
+            f"{case_summary.get('strict_render_pass', False)} | {review_count} | "
+            f"{_markdown_value(result.output_path or '')} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -1499,9 +1509,9 @@ def _render_skipped_cases_markdown(summary: dict[str, Any]) -> list[str]:
     if not isinstance(skipped_cases, list) or not skipped_cases:
         return []
     lines = [
-        "## Skipped Cases",
+        "## 跳过用例 Skipped Cases",
         "",
-        "| Case | Split | Reference Lang | Material Lang | Reason | Message |",
+        "| 用例 Case | Split | 原人声语言 Reference Lang | 素材集语言 Material Lang | 原因 Reason | 说明 Message |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for case in skipped_cases:
@@ -1524,11 +1534,11 @@ def _render_group_score_markdown(summary: dict[str, Any]) -> list[str]:
     if not isinstance(group_summary, dict):
         return []
     lines = [
-        "## Group Scores",
+        "## 分组跑分 Group Scores",
         "",
         (
-            "| Group | Name | Cases | Plan Mean | Render Mean | Match Mean | "
-            "Strict Pass/Fail | Status Counts |"
+            "| 分组 Group | 名称 Name | 用例数 Cases | 规划均分 Plan Mean | 渲染均分 Render Mean | "
+            "匹配均分 Match Mean | 严格通过/失败 Strict Pass/Fail | 状态统计 Status Counts |"
         ),
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]

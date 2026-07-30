@@ -13,6 +13,13 @@
 
 ## 更新日志
 
+### 2026-07-31: 歌词优先与日文注音处理
+
+1. 有歌词文件时，歌词文本作为目标字音最高优先项，原人声 ASR/对齐时间轴继续负责每个字音的起点、终点和持续时长；无歌词时继续按原人声识别字音拼接。
+2. 接入 Janome，把日文汉字/假名歌词转换为可匹配素材文件名的发音单元；中文仍使用拼音匹配。
+3. 日文歌词中的假名/罗马音注音行和行内注音会先折叠，避免同一句歌词的不同写法被当成重复目标。
+4. GUI 新增“帮助”和“更新日志”弹窗，`audio_processor check` 会显示 Janome 是否可用。
+
 ### 2026-07-27: 便携包 torch._C / Whisper FFmpeg 人工测试修复
 
 1. 针对人工测试中 `Whisper transcription failed ... No module named 'torch._C'` 的失败，模型运行时预检现在会真实验证 PyTorch 原生扩展，而不是只检查 `torch` 包目录是否存在。
@@ -41,14 +48,14 @@
 4. 短字素材大幅拉长时启用 `syllable_safe_expand_with_tail_padding`，限制人声核心过度拉伸并用尾部补白补足目标时长。
 5. 普通 WAV 输出也开始使用片段渲染缓存；相同源素材、目标时长、Rubber Band 参数和处理参数会复用已渲染片段。
 6. VST3 bridge 请求支持 `progress_path`，helper 会持续写入 JSON 进度，便于 DAW UI 后续读取状态。
-7. 自动 ASR 模式会跳过未缓存的 Faster Whisper/WhisperX 模型，除非显式允许下载，避免人工测试时反复等待离线 Hub 查找失败。
+7. 自动/可选 ASR 模式会跳过未缓存的 Faster Whisper/WhisperX/FunASR 模型，除非显式允许下载，避免人工测试时反复等待离线 Hub 查找失败。
 
 ### 2026-07-27: 完整便携包与 VST3 包发布更新
 
 1. Release 资产应同时提供两个完整便携包：
    - `VocalProcess-portable.zip`：不含 VST3，适合普通 GUI/CLI 人工测试和本地模型处理。
    - `VocalProcess-portable-vst3.zip`：包含 `plugins\VocalProcess Bridge.vst3`，适合 DAW 宿主插件测试。
-2. 两个完整包都包含 Python 3.11 模型运行时、本地模型缓存、UVR worker、Faster Whisper、WhisperX 和 pyannote.audio。
+2. 两个完整包都包含 Python 3.11 模型运行时、本地模型缓存、UVR worker、Faster Whisper、WhisperX、FunASR/ModelScope 和 pyannote.audio。
 3. 非 VST3 版体积略小，测试变量更少；VST3 版只在需要宿主软件扫描/加载插件时使用。
 4. 带 `-lite` 的压缩包只用于启动、GUI 或 VST3 包装烟测，不作为完整功能发布包。
 5. 本次完整包 Release：`v2026.07.27-portable-full-runtime`，地址为 <https://github.com/aztksilence111/vocal_process/releases/tag/v2026.07.27-portable-full-runtime>。
@@ -62,7 +69,7 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 1. GUI 批量处理原音频、素材集、歌词文件和输出目录。
 2. 使用本地预训练模型辅助分析，不使用在线推理计费。
 3. UVR headless worker 和 Demucs 用于原音频人声分离；可用时优先通过独立 UVR worker 运行，失败时回退到 Demucs。
-4. Faster Whisper、WhisperX 和 OpenAI Whisper 用于原音频和素材音频转写/对齐；默认优先尝试本地加速后端，失败时回退。
+4. Faster Whisper、WhisperX、FunASR/Paraformer 和 OpenAI Whisper 用于原音频和素材音频转写/对齐；默认优先尝试本地加速后端，失败时回退。
 5. Silero VAD 用于检测素材中的人声区域。
 6. SpeechBrain 说话人特征接口已接入；默认只在模型缓存命中时启用，避免用户首次运行时长时间等待 Hugging Face 下载。
 7. 生成结构化 `.diagnostics.jsonl`，用于定位无报错失败、模型转写失败、FFprobe 元数据失败等问题。
@@ -71,7 +78,7 @@ VocalProcess 是一个本地人声素材处理工具，提供命令行入口和�
 10. 素材分析缓存默认写入工作缓存目录，同一素材目录未变化时复用分析结果；如需定向缓存，可由调用方单独指定。
 11. 原音频分析会生成参考缓存，同一原音频、歌词、计算设备和人声分离策略不变时复用 Demucs/ASR/声纹结果。
 12. GUI 显示运行时长，支持 CPU/GPU 计算设备选择，并提供“自动判断 / 已是人声跳过分离 / 强制分离”按钮。
-13. 完整模型运行时包含 `faster-whisper`、`whisperx` 和 `pyannote.audio`；pyannote 预训练模型仍需要 Hugging Face token 和模型条款授权。
+13. 完整模型运行时包含 `faster-whisper`、`whisperx`、`funasr`、`modelscope` 和 `pyannote.audio`；pyannote 预训练模型仍需要 Hugging Face token 和模型条款授权。
 14. 排序诊断包含全局评分矩阵、拼音/发音分数、证据计数和低置信度标记，便于人工测试前复核。
 15. 提供 Melodyne 和 VEGAS 时间轴交接导出；可生成完整参考 WAV、全长 lane WAV、manifest/CSV，并为 VEGAS 写入 BWF timestamp 片段。
 

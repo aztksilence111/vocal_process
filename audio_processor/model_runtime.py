@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -98,6 +98,13 @@ class MaterialLibraryAnalysis:
 
 
 @dataclass(frozen=True)
+class _MaterialFilenameLabelPolicy:
+    enabled: bool
+    cache_key: str
+    language: str
+
+
+@dataclass(frozen=True)
 class OrderingDecision:
     rank: int
     source_path: Path
@@ -135,9 +142,13 @@ class ModelOrderingResult:
 
 
 DEFAULT_ASR_MODEL = os.environ.get("VOCAL_PROCESS_ASR_MODEL", "base")
+DEFAULT_FUNASR_MODEL = "paraformer-zh"
+DEFAULT_FUNASR_VAD_MODEL = "fsmn-vad"
+DEFAULT_FUNASR_PUNC_MODEL = "ct-punc"
 DEFAULT_DEVICE = "cpu"
 DEFAULT_COMPUTE_TYPE = "int8"
 MATERIAL_CACHE_FILE = ".vocalprocess_material_cache.json"
+MATERIAL_CACHE_FORMAT = "vocal_process_material_cache_v2_filename_label_authority"
 REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v1"
 PYANNOTE_DIA_MODEL = "pyannote/speaker-diarization-community-1"
 SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
@@ -148,6 +159,7 @@ TORCH_NATIVE_RUNTIME_HINT = (
 )
 IMPORT_PROBE_MODULES = {"torch", "torchaudio"}
 FASTER_WHISPER_REQUIRED_FILES = ("config.json", "model.bin", "tokenizer.json")
+FUNASR_BACKENDS = {"funasr", "paraformer", "paraformer-zh"}
 _DLL_DIRECTORY_HANDLES: list[Any] = []
 LANGUAGE_COMPATIBILITY_FORMAT = "vocal_process_language_compatibility_v1"
 CN_JP_LANGUAGE_LABELS = {"CN": "Chinese", "JP": "Japanese"}
@@ -504,6 +516,91 @@ def _language_report_from_material_filenames(material_paths: Sequence[Path]) -> 
     return _language_report("", "material_filename_heuristic", 0.0, signals)
 
 
+def _material_filename_label_policy(
+    material_directory: Path,
+    material_paths: Sequence[Path],
+) -> _MaterialFilenameLabelPolicy:
+    mode = os.environ.get("VOCAL_PROCESS_TRUST_MATERIAL_FILENAME_LABELS", "auto").strip().lower() or "auto"
+    disabled_modes = {"0", "false", "off", "no", "disabled", "never"}
+    forced_modes = {"1", "true", "on", "yes", "enabled", "force", "forced", "always"}
+
+    report = _material_set_language_report(material_directory, material_paths=material_paths)
+    language = str(report.get("language") or "")
+    confidence = float(report.get("confidence") or 0.0)
+    source = str(report.get("source") or "unknown")
+    normalized_mode = "auto"
+    enabled = language in {"CN", "JP"} and confidence >= 0.75
+    if mode in disabled_modes:
+        normalized_mode = "disabled"
+        enabled = False
+    elif mode in forced_modes:
+        normalized_mode = "forced"
+        enabled = True
+    elif mode != "auto":
+        normalized_mode = f"auto-{mode}"
+
+    cache_key = f"{normalized_mode}:{language or 'unknown'}:{confidence:.3f}:{source}"
+    return _MaterialFilenameLabelPolicy(enabled=enabled, cache_key=cache_key, language=language)
+
+
+def _apply_material_filename_label_authority(
+    path: Path,
+    *,
+    duration_seconds: float,
+    transcript: str,
+    segments: Sequence[TranscriptSegment],
+    policy: _MaterialFilenameLabelPolicy,
+) -> tuple[str, tuple[TranscriptSegment, ...], tuple[str, ...]]:
+    normalized_segments = tuple(segments)
+    if not policy.enabled:
+        return transcript, normalized_segments, ()
+
+    filename_text = _filename_text_hint(path)
+    if not _looks_like_material_filename_label(filename_text, duration_seconds, language_hint=policy.language):
+        return transcript, normalized_segments, ()
+
+    authority_segment = TranscriptSegment(
+        start_seconds=0.0,
+        end_seconds=max(duration_seconds, 0.0),
+        text=filename_text,
+        timing_source="filename_label_authority",
+    )
+    note = (
+        "material_filename_label_authority: "
+        f"filename label used for matching; policy={policy.cache_key}; asr_transcript_ignored=True"
+    )
+    return filename_text, (authority_segment,), (note,)
+
+
+def _looks_like_material_filename_label(
+    filename_text: str,
+    duration_seconds: float,
+    *,
+    language_hint: str = "",
+) -> bool:
+    text = filename_text.strip()
+    if not text:
+        return False
+    if duration_seconds <= 0 or duration_seconds > _material_filename_label_max_seconds():
+        return False
+    units = re.findall(r"[a-zA-Z]+[0-9]*|[\u3040-\u30ff\u31f0-\u31ff]+|[\u4e00-\u9fff]+", text)
+    if not units or len(units) > 4:
+        return False
+    if len("".join(units)) > 24:
+        return False
+    phonetic_units = _phonetic_units(text, language_hint=language_hint)
+    return 0 < len(phonetic_units) <= 4
+
+
+def _material_filename_label_max_seconds() -> float:
+    raw_value = os.environ.get("VOCAL_PROCESS_MATERIAL_LABEL_MAX_SECONDS", "4.0")
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return 4.0
+    return max(value, 0.1)
+
+
 def _filename_language_tokens(stem: str) -> list[str]:
     return re.findall(r"[a-zA-Z]+[0-9]*|[\u3040-\u30ff\u31f0-\u31ff]+|[\u4e00-\u9fff]+", stem)
 
@@ -603,8 +700,17 @@ def build_model_ordering(
                 start_seconds=0.0,
                 end_seconds=max(reference_duration_for(reference.source_path), 0.0),
                 text=reference.transcript,
+                language_hint=str(language_compatibility.get("reference_language") or ""),
             ),
         )
+
+    reference_language_hint = str(language_compatibility.get("reference_language") or "")
+    material_language_hint = str(language_compatibility.get("material_set_language") or "")
+    if not reference_language_hint and material_language_hint and lyrics_file is not None:
+        reference_language_hint = material_language_hint
+    reference_segments = tuple(
+        replace(segment, language_hint=reference_language_hint or segment.language_hint) for segment in reference_segments
+    )
 
     material_analyses = [
         MaterialAnalysis(
@@ -618,6 +724,7 @@ def build_model_ordering(
                     confidence=segment.confidence,
                     speaker_id=segment.speaker_id,
                     timing_source=segment.timing_source,
+                    language_hint=material_language_hint,
                 )
                 for segment in analysis.segments
             ),
@@ -626,6 +733,7 @@ def build_model_ordering(
             vad_coverage=_vad_coverage(analysis.vad_segments, analysis.duration_seconds),
             duration_seconds=analysis.duration_seconds,
             analysis_source=analysis.analysis_source,
+            language_hint=material_language_hint,
         )
         for analysis in library.materials
     ]
@@ -841,10 +949,16 @@ def analyze_material_library(
     if material_cache_dir is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot = _material_snapshot(material_paths)
+    filename_label_policy = _material_filename_label_policy(material_directory, material_paths)
+    notes.append(
+        "material filename label policy: "
+        f"enabled={filename_label_policy.enabled}; key={filename_label_policy.cache_key}"
+    )
     cached_library = _load_material_library_cache(
         cache_path,
         material_directory=material_directory,
         snapshot=snapshot,
+        filename_label_policy=filename_label_policy,
     )
     if cached_library is not None:
         _raise_if_cancelled(should_cancel)
@@ -876,25 +990,33 @@ def analyze_material_library(
         )
         _raise_if_cancelled(should_cancel)
         duration = get_audio_duration_seconds(probe_audio(path))
+        raw_segments = tuple(
+            TranscriptSegment(
+                start_seconds=segment.start_seconds,
+                end_seconds=segment.end_seconds,
+                text=segment.text,
+                confidence=segment.confidence,
+                speaker_id=segment.speaker_id,
+            )
+            for segment in transcript_result["segments"]
+        )
+        transcript_text, transcript_segments, transcript_notes = _apply_material_filename_label_authority(
+            path,
+            duration_seconds=duration,
+            transcript=str(transcript_result["text"]),
+            segments=raw_segments,
+            policy=filename_label_policy,
+        )
         analyses.append(
             AudioAnalysis(
                 path=path,
                 duration_seconds=duration,
-                transcript=transcript_result["text"],
-                segments=tuple(
-                    TranscriptSegment(
-                        start_seconds=segment.start_seconds,
-                        end_seconds=segment.end_seconds,
-                        text=segment.text,
-                        confidence=segment.confidence,
-                        speaker_id=segment.speaker_id,
-                    )
-                    for segment in transcript_result["segments"]
-                ),
+                transcript=transcript_text,
+                segments=transcript_segments,
                 vad_segments=vad_segments,
                 speaker_embedding=speaker_embedding,
                 analysis_source=transcript_result["backend"],
-                notes=tuple(transcript_result.get("notes", ())),
+                notes=tuple(transcript_result.get("notes", ())) + transcript_notes,
             )
         )
 
@@ -904,7 +1026,12 @@ def analyze_material_library(
         backend_summary=backend_availability(),
         notes=tuple(notes),
     )
-    cache_written = _write_material_library_cache(cache_path, library=library, snapshot=snapshot)
+    cache_written = _write_material_library_cache(
+        cache_path,
+        library=library,
+        snapshot=snapshot,
+        filename_label_policy=filename_label_policy,
+    )
     updated_notes = list(notes)
     if cache_written:
         updated_notes.append(f"material analysis cache updated: {cache_path}")
@@ -1010,6 +1137,8 @@ def speech_runtime_preflight_report(compute_device: str = "auto") -> dict[str, A
         "faster_whisper_model_cached": _faster_whisper_model_cached(),
         "whisperx_module": _module_available("whisperx"),
         "whisperx_model_cached": _whisperx_model_cached(),
+        "funasr_module": _module_available("funasr"),
+        "funasr_model_cached": _funasr_model_cached(),
         "openai_whisper_module": _module_available("whisper"),
         "openai_whisper_model_cached": _whisper_model_cached(),
     }
@@ -1032,10 +1161,12 @@ def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
         "Demucs",
         "UVR Headless Runner",
         "Faster Whisper",
+        "FunASR Paraformer",
         "OpenAI Whisper",
         "Silero VAD",
         "SpeechBrain",
         "WhisperX",
+        "Janome",
         "pyannote.audio",
         "whisper.cpp",
         "Librosa",
@@ -1050,6 +1181,7 @@ def get_model_runtime_report(compute_device: str = "auto") -> list[str]:
     lines.append(f"Whisper model cached: {_whisper_model_cached()}")
     lines.append(f"Faster Whisper model cached: {_faster_whisper_model_cached()}")
     lines.append(f"WhisperX model cached: {_whisperx_model_cached()}")
+    lines.append(f"FunASR model cached: {_funasr_model_cached()}")
     lines.append(f"Silero VAD cached: {_silero_model_cached()}")
     lines.append(f"SpeechBrain cached: {_speechbrain_model_cached(cache_root / 'speechbrain' / 'ecapa')}")
     ca_bundle = _ensure_model_download_tls()
@@ -1108,7 +1240,13 @@ def parse_lyrics_file(path: Path | None) -> list[VoiceSegment]:
     else:
         raise AudioProcessorError(f"Unsupported lyrics file format: {lyrics_path}")
 
-    segments = _lyrics_text_to_segments(text, suffix=suffix)
+    language_hint = infer_cn_jp_language_from_name(lyrics_path.stem)
+    if not language_hint:
+        report = _language_report_from_text(text, source="lyrics_text")
+        if float(report.get("confidence") or 0.0) >= 0.75:
+            language_hint = str(report.get("language") or "")
+
+    segments = _lyrics_text_to_segments(text, suffix=suffix, language_hint=language_hint)
     if not segments:
         raise AudioProcessorError(f"Lyrics file did not contain usable text: {lyrics_path}")
     return segments
@@ -1162,7 +1300,7 @@ def _lyric_timing_notes(
     ]
 
 
-def _lyrics_text_to_segments(text: str, *, suffix: str) -> list[VoiceSegment]:
+def _lyrics_text_to_segments(text: str, *, suffix: str, language_hint: str = "") -> list[VoiceSegment]:
     if suffix == ".lrc":
         timed_lines: list[tuple[float, str]] = []
         for raw_line in text.splitlines():
@@ -1175,9 +1313,10 @@ def _lyrics_text_to_segments(text: str, *, suffix: str) -> list[VoiceSegment]:
                 for timestamp in timestamps:
                     start = _parse_lrc_timestamp(timestamp)
                     if start is not None:
-                        timed_lines.append((start, cleaned))
+                        timed_lines.append((start, _normalize_lyric_annotation_text(cleaned, language_hint=language_hint)))
         if timed_lines:
             timed_lines.sort(key=lambda item: item[0])
+            timed_lines = _collapse_timed_lyric_annotation_lines(timed_lines, language_hint=language_hint)
             return [
                 VoiceSegment(
                     start_seconds=start,
@@ -1185,22 +1324,25 @@ def _lyrics_text_to_segments(text: str, *, suffix: str) -> list[VoiceSegment]:
                     text=line,
                     confidence=0.8,
                     timing_source="lrc_timestamp",
+                    language_hint=language_hint,
                 )
                 for index, (start, line) in enumerate(timed_lines)
                 if line
             ]
         lines = [
-            _strip_lrc_timestamp(raw_line.strip())
+            _normalize_lyric_annotation_text(_strip_lrc_timestamp(raw_line.strip()), language_hint=language_hint)
             for raw_line in text.splitlines()
             if _strip_lrc_timestamp(raw_line.strip())
         ]
     elif suffix == ".srt":
-        timed_segments = _parse_srt_segments(text)
+        timed_segments = _parse_srt_segments(text, language_hint=language_hint)
         if timed_segments:
             return timed_segments
         lines = _srt_text_lines_without_timing(text)
     else:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        lines = [_normalize_lyric_annotation_text(line.strip(), language_hint=language_hint) for line in text.splitlines() if line.strip()]
+
+    lines = _collapse_lyric_annotation_lines(lines, language_hint=language_hint)
 
     return [
         VoiceSegment(
@@ -1209,10 +1351,193 @@ def _lyrics_text_to_segments(text: str, *, suffix: str) -> list[VoiceSegment]:
             text=line,
             confidence=1.0,
             timing_source="lyrics_sequence",
+            language_hint=language_hint,
         )
         for index, line in enumerate(lines)
         if line
     ]
+
+
+def _collapse_timed_lyric_annotation_lines(
+    timed_lines: Sequence[tuple[float, str]],
+    *,
+    language_hint: str = "",
+) -> list[tuple[float, str]]:
+    collapsed: list[tuple[float, str]] = []
+    for start_seconds, line in timed_lines:
+        normalized_line = _normalize_lyric_annotation_text(line, language_hint=language_hint)
+        if not normalized_line:
+            continue
+        if collapsed and _is_japanese_annotation_pair(collapsed[-1][1], normalized_line, language_hint=language_hint):
+            previous_start, previous_text = collapsed[-1]
+            collapsed[-1] = (
+                previous_start,
+                _preferred_japanese_lyric_text(previous_text, normalized_line),
+            )
+            continue
+        collapsed.append((start_seconds, normalized_line))
+    return collapsed
+
+
+def _collapse_lyric_annotation_lines(lines: Sequence[str], *, language_hint: str = "") -> list[str]:
+    collapsed: list[str] = []
+    for line in lines:
+        normalized_line = _normalize_lyric_annotation_text(line, language_hint=language_hint)
+        if not normalized_line:
+            continue
+        if collapsed and _is_japanese_annotation_pair(collapsed[-1], normalized_line, language_hint=language_hint):
+            collapsed[-1] = _preferred_japanese_lyric_text(collapsed[-1], normalized_line)
+            continue
+        collapsed.append(normalized_line)
+    return collapsed
+
+
+def _normalize_lyric_annotation_text(text: str, *, language_hint: str = "") -> str:
+    stripped = _normalize_lyric_spaces(text)
+    if not stripped or not _should_process_japanese_lyric_annotations(stripped, language_hint=language_hint):
+        return stripped
+
+    normalized = _strip_html_ruby_annotations(stripped)
+    normalized = _strip_bracketed_japanese_annotations(normalized, language_hint=language_hint)
+    normalized = _collapse_separated_japanese_annotations(normalized, language_hint=language_hint)
+    normalized = _strip_trailing_japanese_annotation(normalized, language_hint=language_hint)
+    return _normalize_lyric_spaces(normalized)
+
+
+def _should_process_japanese_lyric_annotations(text: str, *, language_hint: str = "") -> bool:
+    if _normalize_cn_jp_language(language_hint) == "JP":
+        return True
+    has_kana = bool(re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text))
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+    has_latin = bool(re.search(r"[A-Za-z]", text))
+    return has_kana or (has_cjk and has_latin)
+
+
+def _strip_html_ruby_annotations(text: str) -> str:
+    without_rt = re.sub(r"<rt\b[^>]*>.*?</rt>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(r"</?(?:ruby|rb|rp)\b[^>]*>", "", without_rt, flags=re.IGNORECASE)
+
+
+def _strip_bracketed_japanese_annotations(text: str, *, language_hint: str = "") -> str:
+    pattern = re.compile(r"(\([^()]+\)|（[^（）]+）|\[[^\[\]]+\]|【[^【】]+】)")
+    current = text
+    while True:
+        changed = False
+
+        def replace_annotation(match: re.Match[str]) -> str:
+            nonlocal changed
+            matched = match.group(0)
+            inner = matched[1:-1].strip()
+            candidate = _normalize_lyric_spaces(current[: match.start()] + " " + current[match.end() :])
+            if _is_japanese_annotation_pair(candidate, inner, language_hint=language_hint):
+                changed = True
+                return " "
+            return matched
+
+        updated = pattern.sub(replace_annotation, current)
+        updated = _normalize_lyric_spaces(updated)
+        if not changed or updated == current:
+            return updated
+        current = updated
+
+
+def _collapse_separated_japanese_annotations(text: str, *, language_hint: str = "") -> str:
+    parts = [_normalize_lyric_spaces(part) for part in re.split(r"\s*[\/／|｜]\s*", text) if part.strip()]
+    if len(parts) < 2:
+        return text
+    primary = parts[0]
+    for part in parts[1:]:
+        if _is_japanese_annotation_pair(primary, part, language_hint=language_hint):
+            primary = _preferred_japanese_lyric_text(primary, part)
+            continue
+        return text
+    return primary
+
+
+def _strip_trailing_japanese_annotation(text: str, *, language_hint: str = "") -> str:
+    patterns = (
+        r"^(?P<main>.*[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff])\s+(?P<annotation>[A-Za-z][A-Za-z'\-\s]+)$",
+        r"^(?P<main>.*[\u4e00-\u9fff].*)\s+(?P<annotation>[\u3040-\u30ff\u31f0-\u31ff\s]+)$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, text)
+        if not match:
+            continue
+        main = _normalize_lyric_spaces(match.group("main"))
+        annotation = _normalize_lyric_spaces(match.group("annotation"))
+        if _is_japanese_annotation_pair(main, annotation, language_hint=language_hint):
+            return main
+    return text
+
+
+def _is_japanese_annotation_pair(left: str, right: str, *, language_hint: str = "") -> bool:
+    left_text = _normalize_lyric_spaces(left)
+    right_text = _normalize_lyric_spaces(right)
+    if not left_text or not right_text or left_text == right_text:
+        return False
+    if _normalize_cn_jp_language(language_hint) != "JP" and not (
+        _has_japanese_script(left_text)
+        or _has_japanese_script(right_text)
+        or (_has_cjk(left_text + right_text) and (_has_latin(left_text) or _has_latin(right_text)))
+    ):
+        return False
+    if _has_cjk(left_text) and _has_cjk(right_text):
+        return False
+    if not (_is_japanese_annotation_like(left_text) or _is_japanese_annotation_like(right_text)):
+        return False
+
+    left_compact = _phonetic_compact_for_annotation(left_text, language_hint=language_hint or "JP")
+    right_compact = _phonetic_compact_for_annotation(right_text, language_hint=language_hint or "JP")
+    if not left_compact or not right_compact:
+        return False
+    if left_compact == right_compact:
+        return True
+    if _has_cjk(left_text) and right_compact in left_compact:
+        return True
+    if _has_cjk(right_text) and left_compact in right_compact:
+        return True
+    return False
+
+
+def _preferred_japanese_lyric_text(left: str, right: str) -> str:
+    return max((left, right), key=lambda value: (_japanese_lyric_text_score(value), len(value)))
+
+
+def _japanese_lyric_text_score(text: str) -> int:
+    return (
+        (5 if _has_cjk(text) else 0)
+        + (3 if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text) else 0)
+        + (1 if _has_latin(text) else 0)
+    )
+
+
+def _phonetic_compact_for_annotation(text: str, *, language_hint: str = "") -> str:
+    return re.sub(r"[^a-z0-9]", "", "".join(_phonetic_units(text, language_hint=language_hint)).lower())
+
+
+def _is_japanese_annotation_like(text: str) -> bool:
+    normalized = _normalize_lyric_spaces(text)
+    if not normalized:
+        return False
+    if _has_cjk(normalized):
+        return False
+    return bool(re.fullmatch(r"[\u3040-\u30ff\u31f0-\u31ffA-Za-z0-9'\-\s]+", normalized))
+
+
+def _has_japanese_script(text: str) -> bool:
+    return bool(re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text))
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def _has_latin(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text))
+
+
+def _normalize_lyric_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip())
 
 
 def _strip_lrc_timestamp(line: str) -> str:
@@ -1233,7 +1558,7 @@ def _parse_lrc_timestamp(value: str) -> float | None:
     return (minutes * 60.0) + seconds + fraction_seconds
 
 
-def _parse_srt_segments(text: str) -> list[VoiceSegment]:
+def _parse_srt_segments(text: str, *, language_hint: str = "") -> list[VoiceSegment]:
     segments: list[VoiceSegment] = []
     blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n"))
     for block in blocks:
@@ -1253,12 +1578,39 @@ def _parse_srt_segments(text: str) -> list[VoiceSegment]:
             VoiceSegment(
                 start_seconds=start,
                 end_seconds=end,
-                text=subtitle_text,
+                text=_normalize_lyric_annotation_text(subtitle_text, language_hint=language_hint),
                 confidence=0.8,
                 timing_source="srt_timestamp",
+                language_hint=language_hint,
             )
         )
-    return segments
+    return _collapse_lyric_annotation_segments(segments, language_hint=language_hint)
+
+
+def _collapse_lyric_annotation_segments(
+    segments: Sequence[VoiceSegment],
+    *,
+    language_hint: str = "",
+) -> list[VoiceSegment]:
+    collapsed: list[VoiceSegment] = []
+    for segment in segments:
+        text = _normalize_lyric_annotation_text(segment.text, language_hint=language_hint)
+        if not text:
+            continue
+        normalized = replace(segment, text=text)
+        if collapsed and _is_japanese_annotation_pair(collapsed[-1].text, text, language_hint=language_hint):
+            previous = collapsed[-1]
+            collapsed[-1] = replace(
+                previous,
+                start_seconds=min(previous.start_seconds, normalized.start_seconds),
+                end_seconds=max(previous.end_seconds, normalized.end_seconds),
+                text=_preferred_japanese_lyric_text(previous.text, text),
+                confidence=max(float(previous.confidence or 0.0), float(normalized.confidence or 0.0)),
+                timing_source=f"{previous.timing_source}_annotation_collapsed",
+            )
+            continue
+        collapsed.append(normalized)
+    return collapsed
 
 
 def _parse_srt_time_range(line: str) -> tuple[float | None, float | None]:
@@ -1489,6 +1841,25 @@ def _transcribe_audio(
         raise AudioProcessorError(runtime_issue)
 
     _raise_if_cancelled(should_cancel)
+    funasr_requested = preferred_backend in FUNASR_BACKENDS or (
+        preferred_backend == "auto" and _auto_funasr_enabled()
+    )
+    if funasr_requested and _module_available("funasr"):
+        if preferred_backend == "auto" and not allow_model_download and not _funasr_model_cached():
+            fallback_notes.append("funasr skipped: local model cache not found and downloads are not enabled")
+        else:
+            try:
+                return _transcribe_with_funasr(
+                    path,
+                    compute_device=device,
+                    should_cancel=should_cancel,
+                )
+            except Exception as exc:
+                if preferred_backend in FUNASR_BACKENDS:
+                    raise AudioProcessorError(_backend_exception_message("FunASR", path, exc)) from exc
+                fallback_notes.append(_backend_exception_message("FunASR", path, exc))
+
+    _raise_if_cancelled(should_cancel)
     if preferred_backend in {"auto", "faster-whisper", "faster_whisper"} and _module_available("faster_whisper"):
         if preferred_backend == "auto" and not allow_model_download and not _faster_whisper_model_cached():
             fallback_notes.append("faster-whisper skipped: local model cache not found and downloads are not enabled")
@@ -1625,6 +1996,54 @@ def _transcribe_with_faster_whisper(
     return {"backend": "faster-whisper", "text": text, "segments": segments, "notes": notes}
 
 
+def _transcribe_with_funasr(
+    path: Path,
+    *,
+    compute_device: str,
+    should_cancel: CancelCallback | None = None,
+) -> dict[str, Any]:
+    _raise_if_cancelled(should_cancel)
+    model_name = _current_funasr_model()
+    vad_model = _current_funasr_vad_model()
+    punc_model = _current_funasr_punc_model()
+    device = _funasr_device(_resolve_compute_device(compute_device))
+    _raise_if_cancelled(should_cancel)
+    model = _load_funasr_model(model_name, vad_model, punc_model, device)
+    _raise_if_cancelled(should_cancel)
+    result = model.generate(
+        input=str(path),
+        batch_size_s=_funasr_batch_size_seconds(),
+        sentence_timestamp=True,
+        output_timestamp=True,
+        return_time_stamps=True,
+        pred_timestamp=True,
+    )
+    _raise_if_cancelled(should_cancel)
+    entry = _first_funasr_result(result)
+    text = _clean_funasr_text(entry.get("text") or entry.get("raw_text") or "")
+    timestamps = _normalise_funasr_timestamps(entry.get("timestamp", entry.get("timestamps", [])))
+    unit_timings = _unit_timings_from_funasr_timestamps(text, timestamps)
+    segment = _funasr_transcript_segment(path, text, timestamps, unit_timings)
+    notes = [
+        "language=zh",
+        f"funasr_model={model_name}",
+        f"funasr_vad_model={vad_model or 'disabled'}",
+        f"funasr_punc_model={punc_model or 'disabled'}",
+    ]
+    if timestamps and not unit_timings:
+        notes.append(
+            "funasr_timestamp_mismatch: timestamp count did not match normalized transcript units"
+        )
+    if not timestamps:
+        notes.append("funasr_timestamp_missing: falling back to segment duration only")
+    return {
+        "backend": "funasr",
+        "text": text,
+        "segments": [segment] if segment is not None else [],
+        "notes": notes,
+    }
+
+
 def _transcribe_with_whisper(
     path: Path,
     *,
@@ -1680,6 +2099,124 @@ def _transcribe_with_whisper(
 
 def _backend_exception_message(backend_name: str, path: Path, exc: Exception) -> str:
     return f"{backend_name} transcription failed for {path}: {type(exc).__name__}: {exc}"
+
+
+def _first_funasr_result(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, list):
+        for entry in result:
+            if isinstance(entry, dict):
+                return entry
+    return {}
+
+
+def _clean_funasr_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"<\|[^|]*\|>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalise_funasr_timestamps(value: Any) -> tuple[tuple[float, float], ...]:
+    if not isinstance(value, list):
+        return ()
+
+    timestamps: list[tuple[float, float]] = []
+    for entry in value:
+        start: Any = None
+        end: Any = None
+        if isinstance(entry, dict):
+            start = entry.get("start_time", entry.get("start"))
+            end = entry.get("end_time", entry.get("end"))
+            seconds_scale = 1.0 if "start_time" in entry or "end_time" in entry else 0.001
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            start, end = entry[0], entry[1]
+            seconds_scale = 0.001
+        else:
+            continue
+
+        start_value = _optional_float(start)
+        end_value = _optional_float(end)
+        if start_value is None or end_value is None:
+            continue
+        start_seconds = max(start_value * seconds_scale, 0.0)
+        end_seconds = max(end_value * seconds_scale, 0.0)
+        if end_seconds <= start_seconds:
+            continue
+        timestamps.append((start_seconds, end_seconds))
+    return tuple(timestamps)
+
+
+def _unit_timings_from_funasr_timestamps(
+    text: str,
+    timestamps: Sequence[tuple[float, float]],
+) -> tuple[VoiceUnitTiming, ...]:
+    spans = _timeline_unit_spans(text)
+    if not spans or not timestamps:
+        return ()
+
+    if len(spans) == len(timestamps):
+        groups = [(index, index + 1) for index in range(len(spans))]
+    else:
+        expanded_counts = [
+            len(unit) if re.fullmatch(r"[a-z0-9]+", unit) else 1
+            for unit, _, _ in spans
+        ]
+        if sum(expanded_counts) != len(timestamps):
+            return ()
+        groups = []
+        cursor = 0
+        for count in expanded_counts:
+            groups.append((cursor, cursor + count))
+            cursor += count
+
+    timings: list[VoiceUnitTiming] = []
+    for position, ((unit, _start_index, _end_index), (start, end)) in enumerate(zip(spans, groups)):
+        entries = timestamps[start:end]
+        if not entries:
+            continue
+        start_seconds = min(entry[0] for entry in entries)
+        end_seconds = max(entry[1] for entry in entries)
+        if end_seconds <= start_seconds:
+            continue
+        timings.append(
+            VoiceUnitTiming(
+                position=position,
+                unit=unit,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                confidence=None,
+                timing_source="funasr_timestamp",
+            )
+        )
+    return tuple(timings)
+
+
+def _funasr_transcript_segment(
+    path: Path,
+    text: str,
+    timestamps: Sequence[tuple[float, float]],
+    unit_timings: Sequence[VoiceUnitTiming],
+) -> TranscriptSegment | None:
+    if not text.strip():
+        return None
+    if timestamps:
+        start_seconds = min(start for start, _ in timestamps)
+        end_seconds = max(end for _, end in timestamps)
+    else:
+        start_seconds = 0.0
+        end_seconds = max(get_audio_duration_seconds(probe_audio(path)), 0.0)
+    if end_seconds <= start_seconds:
+        end_seconds = max(get_audio_duration_seconds(probe_audio(path)), start_seconds)
+    return TranscriptSegment(
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        text=text,
+        confidence=None,
+        speaker_id=None,
+        timing_source="funasr_timestamp" if unit_timings else "funasr_segment",
+        unit_timings=tuple(unit_timings),
+    )
 
 
 def _prepare_text_output_encoding() -> None:
@@ -1895,6 +2432,25 @@ def _load_whisperx_model(model_name: str, device: str) -> Any:
     )
 
 
+@lru_cache(maxsize=2)
+def _load_funasr_model(model_name: str, vad_model: str, punc_model: str, device: str) -> Any:
+    _prepare_funasr_environment()
+    from funasr import AutoModel  # type: ignore
+
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "device": device,
+        "disable_update": True,
+    }
+    if vad_model:
+        kwargs["vad_model"] = vad_model
+        if _current_funasr_vad_max_segment_ms() > 0:
+            kwargs["vad_kwargs"] = {"max_single_segment_time": _current_funasr_vad_max_segment_ms()}
+    if punc_model:
+        kwargs["punc_model"] = punc_model
+    return AutoModel(**kwargs)
+
+
 @lru_cache(maxsize=4)
 def _load_openai_whisper_model(model_name: str, device: str) -> Any:
     import whisper  # type: ignore
@@ -1969,6 +2525,7 @@ def _load_material_library_cache(
     *,
     material_directory: Path,
     snapshot: Sequence[dict[str, Any]],
+    filename_label_policy: _MaterialFilenameLabelPolicy,
 ) -> MaterialLibraryAnalysis | None:
     if not cache_path.exists():
         return None
@@ -1980,11 +2537,13 @@ def _load_material_library_cache(
 
     if not isinstance(raw, dict):
         return None
-    if raw.get("format") != "vocal_process_material_cache_v1":
+    if raw.get("format") != MATERIAL_CACHE_FORMAT:
         return None
     if raw.get("asr_model") != DEFAULT_ASR_MODEL:
         return None
     if raw.get("asr_backend") != _asr_backend_cache_key():
+        return None
+    if raw.get("material_filename_label_policy") != filename_label_policy.cache_key:
         return None
     if raw.get("snapshot") != list(snapshot):
         return None
@@ -2010,11 +2569,13 @@ def _write_material_library_cache(
     *,
     library: MaterialLibraryAnalysis,
     snapshot: Sequence[dict[str, Any]],
+    filename_label_policy: _MaterialFilenameLabelPolicy,
 ) -> bool:
     payload = {
-        "format": "vocal_process_material_cache_v1",
+        "format": MATERIAL_CACHE_FORMAT,
         "asr_model": DEFAULT_ASR_MODEL,
         "asr_backend": _asr_backend_cache_key(),
+        "material_filename_label_policy": filename_label_policy.cache_key,
         "snapshot": list(snapshot),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
     }
@@ -2030,8 +2591,22 @@ def _material_cache_path(material_directory: Path, material_cache_dir: Path | No
     return base / MATERIAL_CACHE_FILE
 
 
-def _asr_backend_cache_key() -> str:
+def _current_asr_backend() -> str:
     return os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower() or "auto"
+
+
+def _asr_backend_cache_key() -> str:
+    backend = _current_asr_backend()
+    if backend in FUNASR_BACKENDS:
+        return ":".join(
+            [
+                backend,
+                _current_funasr_model(),
+                _current_funasr_vad_model() or "no-vad",
+                _current_funasr_punc_model() or "no-punc",
+            ]
+        )
+    return backend
 
 
 def _default_material_cache_dir(work_root: Path, material_directory: Path, compute_device: str) -> Path:
@@ -2234,7 +2809,9 @@ def _segments_from_transcript(
                             unit_timings=_retarget_unit_timings_to_text(
                                 transcript_segment.unit_timings,
                                 lyric.text,
+                                language_hint=lyric.language_hint,
                             ),
+                            language_hint=lyric.language_hint,
                         )
                     )
                 if len(lyric_segments) > max_count and segments:
@@ -2256,6 +2833,7 @@ def _segments_from_transcript(
                                 text=lyric.text,
                                 confidence=1.0,
                                 timing_source=timing_source,
+                                language_hint=lyric.language_hint,
                             )
                         )
                 return tuple(paired)
@@ -2282,10 +2860,12 @@ def _segments_from_transcript(
 def _retarget_unit_timings_to_text(
     timings: Sequence[VoiceUnitTiming],
     text: str,
+    *,
+    language_hint: str = "",
 ) -> tuple[VoiceUnitTiming, ...]:
     if not timings:
         return ()
-    units = _timeline_units(text)
+    units = _timeline_units(text, language_hint=language_hint)
     if len(units) != len(timings):
         return ()
     return tuple(
@@ -2331,6 +2911,13 @@ def _target_durations_for_decisions(
 
     positioned_targets = _positioned_target_durations(reference_segments, decisions)
     if positioned_targets and any(target is not None for target in positioned_targets):
+        if _can_preserve_positioned_target_durations(reference_segments, decisions, positioned_targets):
+            if _can_preserve_positioned_target_total(
+                reference_segments,
+                positioned_targets,
+                reference_duration=reference_duration,
+            ):
+                return tuple(float(target) if target is not None else None for target in positioned_targets)
         return _fill_unresolved_target_durations(
             positioned_targets,
             decisions,
@@ -2481,11 +3068,12 @@ def _render_timeline_alignment_details(
             span_units = max(min(end_unit, unit_count) - start_unit, 1)
             timed_span = _timed_unit_span(segment, start_unit, end_unit)
             target_duration = target_durations[decision_index]
-            reference_text_units = list(_timeline_units(segment.text))
-            reference_phonetic_units = list(_phonetic_units(segment.text))
+            language_hint = decision.language_hint or segment.language_hint
+            reference_text_units = list(_timeline_units(segment.text, language_hint=language_hint))
+            reference_phonetic_units = list(_phonetic_units(segment.text, language_hint=language_hint))
             material_text = decision.material_text or decision_path.stem
-            material_text_units = list(_timeline_units(material_text))
-            material_phonetic_units = list(_phonetic_units(material_text))
+            material_text_units = list(_timeline_units(material_text, language_hint=language_hint))
+            material_phonetic_units = list(_phonetic_units(material_text, language_hint=language_hint))
             details[decision_index] = {
                 "rank": decision.rank,
                 "source_path": str(decision_path),
@@ -2494,8 +3082,8 @@ def _render_timeline_alignment_details(
                 "reference_segment_text": segment.text,
                 "reference_text_units": reference_text_units,
                 "reference_phonetic_units": reference_phonetic_units,
-                "source_filename_units": list(_timeline_units(decision_path.stem)),
-                "source_filename_phonetic_units": list(_phonetic_units(decision_path.stem)),
+                "source_filename_units": list(_timeline_units(decision_path.stem, language_hint=language_hint)),
+                "source_filename_phonetic_units": list(_phonetic_units(decision_path.stem, language_hint=language_hint)),
                 "material_text": decision.material_text,
                 "material_text_units": material_text_units,
                 "material_phonetic_units": material_phonetic_units,
@@ -2545,19 +3133,20 @@ def _render_timeline_alignment_details(
             else None
         )
         material_text = decision.material_text or decision_path.stem
+        language_hint = decision.language_hint or (segment.language_hint if segment is not None else "")
         details[decision_index] = {
             "rank": decision.rank,
             "source_path": str(decision_path),
             "source_filename": decision_path.name,
             "reference_segment_index": decision.reference_segment_index,
             "reference_segment_text": segment.text if segment is not None else "",
-            "reference_text_units": list(_timeline_units(segment.text)) if segment is not None else [],
-            "reference_phonetic_units": list(_phonetic_units(segment.text)) if segment is not None else [],
-            "source_filename_units": list(_timeline_units(decision_path.stem)),
-            "source_filename_phonetic_units": list(_phonetic_units(decision_path.stem)),
+            "reference_text_units": list(_timeline_units(segment.text, language_hint=language_hint)) if segment is not None else [],
+            "reference_phonetic_units": list(_phonetic_units(segment.text, language_hint=language_hint)) if segment is not None else [],
+            "source_filename_units": list(_timeline_units(decision_path.stem, language_hint=language_hint)),
+            "source_filename_phonetic_units": list(_phonetic_units(decision_path.stem, language_hint=language_hint)),
             "material_text": decision.material_text,
-            "material_text_units": list(_timeline_units(material_text)),
-            "material_phonetic_units": list(_phonetic_units(material_text)),
+            "material_text_units": list(_timeline_units(material_text, language_hint=language_hint)),
+            "material_phonetic_units": list(_phonetic_units(material_text, language_hint=language_hint)),
             "position_mode": "weighted_duration",
             "text_position": decision.text_position,
             "phonetic_position": decision.phonetic_position,
@@ -2565,7 +3154,7 @@ def _render_timeline_alignment_details(
             "phonetic_tone_position": decision.phonetic_tone_position,
             "phonetic_tone_position_count": decision.phonetic_tone_position_count,
             "phonetic_span_units": decision.phonetic_span_units,
-            "reference_segment_unit_count": len(_timeline_units(segment.text)) if segment is not None else 0,
+            "reference_segment_unit_count": len(_timeline_units(segment.text, language_hint=language_hint)) if segment is not None else 0,
             "position_unit_start": None,
             "position_unit_end": None,
             "position_unit_span": None,
@@ -2624,8 +3213,6 @@ def _positioned_target_durations(
         groups.setdefault(segment_index, []).append((decision_index, decision))
 
     for segment_index, group in groups.items():
-        if len(group) <= 1:
-            continue
         segment = reference_segments[segment_index]
         if segment.duration_seconds <= 0:
             continue
@@ -2633,6 +3220,17 @@ def _positioned_target_durations(
         unit_count = _positioned_group_unit_count(segment, group)
         complete_position_cover = _positioned_group_covers_segment(group, unit_count)
         ordered_group = sorted(group, key=lambda item: (_decision_position(item[1]) or 0, item[1].rank))
+        if len(ordered_group) == 1:
+            decision_index, decision = ordered_group[0]
+            start_unit = min(max(_decision_position(decision) or 0, 0), unit_count - 1)
+            material_units = _decision_timeline_unit_count(decision)
+            end_unit = min(start_unit + max(material_units, 1), unit_count)
+            timed_span = _timed_unit_span(segment, start_unit, end_unit)
+            if timed_span is not None and timed_span.duration_seconds > 0:
+                targets[decision_index] = timed_span.duration_seconds
+            else:
+                targets[decision_index] = segment.duration_seconds * (max(end_unit - start_unit, 1) / unit_count)
+            continue
         for group_index, (decision_index, decision) in enumerate(ordered_group):
             start_unit = min(max(_decision_position(decision) or 0, 0), unit_count - 1)
             next_start = None
@@ -2659,6 +3257,50 @@ def _positioned_target_durations(
     return tuple(targets)
 
 
+def _can_preserve_positioned_target_durations(
+    reference_segments: Sequence[VoiceSegment],
+    decisions: Sequence[MaterialOrderDecision],
+    targets: Sequence[float | None],
+) -> bool:
+    if len(targets) != len(decisions) or not decisions:
+        return False
+
+    covered: set[tuple[int, int]] = set()
+    for decision, target in zip(decisions, targets):
+        if target is None or float(target) <= 0:
+            return False
+        segment_index = decision.reference_segment_index
+        position = _decision_position(decision)
+        if segment_index is None or position is None:
+            return False
+        if not 0 <= segment_index < len(reference_segments):
+            return False
+        span = max(_decision_timeline_unit_count(decision), 1)
+        for unit_position in range(max(int(position), 0), max(int(position), 0) + span):
+            key = (segment_index, unit_position)
+            if key in covered:
+                return False
+            covered.add(key)
+    return bool(covered)
+
+
+def _can_preserve_positioned_target_total(
+    reference_segments: Sequence[VoiceSegment],
+    targets: Sequence[float | None],
+    *,
+    reference_duration: float,
+) -> bool:
+    if not _uses_gap_sensitive_unit_timing(reference_segments):
+        return True
+    if reference_duration <= 0:
+        return False
+    target_total = sum(float(target or 0.0) for target in targets)
+    if target_total <= 0:
+        return False
+    ratio = target_total / reference_duration
+    return 0.92 <= ratio <= 1.08
+
+
 def _timed_unit_span(segment: VoiceSegment, start_unit: int, end_unit: int) -> _TimedUnitSpan | None:
     expected_unit_count = max(end_unit - start_unit, 1)
     if not segment.unit_timings or expected_unit_count <= 0:
@@ -2679,7 +3321,7 @@ def _timed_unit_span(segment: VoiceSegment, start_unit: int, end_unit: int) -> _
         return None
 
     start_seconds = min(timing.start_seconds for timing in timings)
-    end_seconds = max(timing.end_seconds for timing in timings)
+    end_seconds = _slot_timing_end_seconds(by_position, end_unit, timings[-1])
     if end_seconds <= start_seconds:
         return None
     return _TimedUnitSpan(
@@ -2689,6 +3331,31 @@ def _timed_unit_span(segment: VoiceSegment, start_unit: int, end_unit: int) -> _
         expected_unit_count=expected_unit_count,
         timing_source="aligned_unit_timing",
     )
+
+
+def _slot_timing_end_seconds(
+    by_position: dict[int, VoiceUnitTiming],
+    end_unit: int,
+    fallback_timing: VoiceUnitTiming,
+) -> float:
+    if not _uses_gap_sensitive_timing_source(fallback_timing.timing_source):
+        return fallback_timing.end_seconds
+    next_timing = by_position.get(end_unit)
+    if next_timing is not None and next_timing.start_seconds > fallback_timing.start_seconds:
+        return next_timing.start_seconds
+    return fallback_timing.end_seconds
+
+
+def _uses_gap_sensitive_unit_timing(reference_segments: Sequence[VoiceSegment]) -> bool:
+    return any(
+        _uses_gap_sensitive_timing_source(timing.timing_source)
+        for segment in reference_segments
+        for timing in segment.unit_timings
+    )
+
+
+def _uses_gap_sensitive_timing_source(source: str) -> bool:
+    return str(source or "").startswith("funasr")
 
 
 def _positioned_group_unit_count(
@@ -2701,7 +3368,7 @@ def _positioned_group_unit_count(
         if position is None:
             continue
         max_end = max(max_end, max(int(position), 0) + _decision_timeline_unit_count(decision))
-    return max(len(_timeline_units(segment.text)), max_end, 1)
+    return max(len(_timeline_units(segment.text, language_hint=segment.language_hint)), max_end, 1)
 
 
 def _positioned_group_covers_segment(
@@ -2832,18 +3499,27 @@ def _decision_text_weight(decision: MaterialOrderDecision) -> float:
 def _decision_timeline_unit_count(decision: MaterialOrderDecision) -> int:
     if decision.phonetic_span_units > 0:
         return decision.phonetic_span_units
+    language_hint = decision.language_hint
     counts = [
         len(units)
         for units in (
-            _timeline_units(decision.material_path.stem),
-            _timeline_units(decision.material_text),
+            _timeline_units(decision.material_path.stem, language_hint=language_hint),
+            _timeline_units(decision.material_text, language_hint=language_hint),
         )
         if units
     ]
     return max(min(counts), 1) if counts else 1
 
 
-def _timeline_units(text: str) -> list[str]:
+def _timeline_units(text: str, *, language_hint: str = "") -> list[str]:
+    hint = _normalize_cn_jp_language(language_hint)
+    if (hint == "JP" or re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text)) and re.search(
+        r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]",
+        text,
+    ):
+        units = _phonetic_units(text, language_hint=hint or "JP")
+        if units:
+            return list(units)
     return [unit for unit, _, _ in _timeline_unit_spans(text)]
 
 
@@ -3101,6 +3777,73 @@ def _whisperx_model_cached() -> bool:
     return _find_complete_faster_whisper_snapshot(root) is not None
 
 
+def _funasr_model_cached() -> bool:
+    root = _funasr_cache_root()
+    if not root.exists():
+        return False
+    markers = (
+        "configuration.json",
+        "config.yaml",
+        "model.pt",
+        "model.pb",
+        "am.mvn",
+    )
+    for marker in markers:
+        if any(path.is_file() and path.stat().st_size > 0 for path in root.rglob(marker)):
+            return True
+    return False
+
+
+def _funasr_cache_root() -> Path:
+    return _model_cache_root() / "modelscope"
+
+
+def _prepare_funasr_environment() -> Path:
+    root = _funasr_cache_root()
+    root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MODELSCOPE_CACHE", str(root))
+    os.environ.setdefault("MS_CACHE_HOME", str(root))
+    os.environ.setdefault("FUNASR_HOME", str(_model_cache_root() / "funasr"))
+    Path(os.environ["FUNASR_HOME"]).mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _current_funasr_model() -> str:
+    return os.environ.get("VOCAL_PROCESS_FUNASR_MODEL", DEFAULT_FUNASR_MODEL).strip() or DEFAULT_FUNASR_MODEL
+
+
+def _current_funasr_vad_model() -> str:
+    return os.environ.get("VOCAL_PROCESS_FUNASR_VAD_MODEL", DEFAULT_FUNASR_VAD_MODEL).strip()
+
+
+def _current_funasr_punc_model() -> str:
+    return os.environ.get("VOCAL_PROCESS_FUNASR_PUNC_MODEL", DEFAULT_FUNASR_PUNC_MODEL).strip()
+
+
+def _current_funasr_vad_max_segment_ms() -> int:
+    raw = os.environ.get("VOCAL_PROCESS_FUNASR_VAD_MAX_SEGMENT_MS", "30000")
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return 30000
+
+
+def _funasr_batch_size_seconds() -> int:
+    raw = os.environ.get("VOCAL_PROCESS_FUNASR_BATCH_SIZE_S", "300")
+    try:
+        return max(int(raw), 1)
+    except (TypeError, ValueError):
+        return 300
+
+
+def _funasr_device(device: str) -> str:
+    return "cuda:0" if device == "cuda" else "cpu"
+
+
+def _auto_funasr_enabled() -> bool:
+    return os.environ.get("VOCAL_PROCESS_ENABLE_FUNASR_AUTO", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _silero_model_cached() -> bool:
     root = _model_cache_root() / "torch" / "hub"
     return (root / "snakers4_silero-vad_master").exists() or any((root / "checkpoints").glob("*.th"))
@@ -3108,6 +3851,21 @@ def _silero_model_cached() -> bool:
 
 def _speech_runtime_issue(preferred_backend: str, allow_model_download: bool) -> str:
     attempted: list[str] = []
+
+    funasr_requested = preferred_backend in FUNASR_BACKENDS or (
+        preferred_backend == "auto" and _auto_funasr_enabled()
+    )
+    if funasr_requested:
+        if _module_available("funasr"):
+            torch_issue = _torch_dependent_backend_issue("funasr")
+            if torch_issue:
+                attempted.append(torch_issue)
+            elif preferred_backend != "auto" or allow_model_download or _funasr_model_cached():
+                return ""
+            else:
+                attempted.append("funasr skipped: local model cache not found and downloads are not enabled")
+        else:
+            attempted.append(f"funasr not loadable: {_module_unavailable_reason('funasr')}")
 
     if preferred_backend in {"auto", "faster-whisper", "faster_whisper"}:
         if _module_available("faster_whisper"):
@@ -3139,7 +3897,16 @@ def _speech_runtime_issue(preferred_backend: str, allow_model_download: bool) ->
         else:
             attempted.append(f"openai-whisper not loadable: {_module_unavailable_reason('whisper')}")
 
-    if preferred_backend not in {"auto", "faster-whisper", "faster_whisper", "whisperx", "whisper", "openai-whisper", "openai_whisper"}:
+    if preferred_backend not in {
+        "auto",
+        *FUNASR_BACKENDS,
+        "faster-whisper",
+        "faster_whisper",
+        "whisperx",
+        "whisper",
+        "openai-whisper",
+        "openai_whisper",
+    }:
         attempted.append(f"unsupported ASR backend setting: {preferred_backend}")
 
     reason = " | ".join(part for part in attempted if part)

@@ -2,6 +2,7 @@ param(
     [string]$Root = "tests_real",
     [string]$OutputRoot = "tests_real\output",
     [string]$SourceSeparation = "never",
+    [string]$AsrBackend = "funasr",
     [string]$StopFile = ""
 )
 
@@ -24,6 +25,9 @@ $ProjectModelCache = Join-Path $ProjectRoot ".tmp\model-cache"
 Set-DefaultEnv "VOCAL_PROCESS_MODEL_CACHE" $ProjectModelCache
 Set-DefaultEnv "HF_HOME" $ProjectModelCache
 Set-DefaultEnv "HUGGINGFACE_HUB_CACHE" (Join-Path $ProjectModelCache "hub")
+Set-DefaultEnv "MODELSCOPE_CACHE" (Join-Path $ProjectModelCache "modelscope")
+Set-DefaultEnv "MS_CACHE_HOME" (Join-Path $ProjectModelCache "modelscope")
+Set-DefaultEnv "FUNASR_HOME" (Join-Path $ProjectModelCache "funasr")
 Set-DefaultEnv "TORCH_HOME" (Join-Path $ProjectModelCache "torch")
 Set-DefaultEnv "HF_ENDPOINT" "https://hf-mirror.com"
 Set-DefaultEnv "HF_HUB_DISABLE_XET" "1"
@@ -33,7 +37,7 @@ Set-DefaultEnv "VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD" "1"
 Set-DefaultEnv "PYTHONIOENCODING" "utf-8"
 Set-DefaultEnv "PYTHONUTF8" "1"
 
-$env:VOCAL_PROCESS_ASR_BACKEND = "whisperx"
+$env:VOCAL_PROCESS_ASR_BACKEND = $AsrBackend
 
 $python = Join-Path $PSScriptRoot "..\.venv311\Scripts\python.exe"
 $realEvalArgs = @(

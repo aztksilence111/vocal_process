@@ -6,6 +6,7 @@ import re
 import unicodedata
 from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
@@ -47,6 +48,7 @@ class VoiceSegment:
     confidence: float | None = None
     timing_source: str = ""
     unit_timings: tuple[VoiceUnitTiming, ...] = ()
+    language_hint: str = ""
 
     @property
     def duration_seconds(self) -> float:
@@ -65,6 +67,7 @@ class MaterialAnalysis:
     speaker_embedding: tuple[float, ...] | None = None
     vad_coverage: float | None = None
     analysis_source: str = ""
+    language_hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,7 @@ class MaterialOrderDecision:
     phonetic_tone_score: float = 0.0
     phonetic_tone_position: int | None = None
     phonetic_tone_position_count: int = 0
+    language_hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -122,15 +126,18 @@ class MaterialScoreBreakdown:
     phonetic_tone_score: float = 0.0
     phonetic_tone_position: int | None = None
     phonetic_tone_position_count: int = 0
+    language_hint: str = ""
 
 
 @dataclass(frozen=True)
 class _PhoneticMatch:
     position: int | None = None
     position_count: int = 0
+    positions: tuple[int, ...] = ()
     span_units: int = 0
     tone_position: int | None = None
     tone_position_count: int = 0
+    tone_positions: tuple[int, ...] = ()
     tone_span_units: int = 0
     tone_score: float = 0.0
 
@@ -141,6 +148,14 @@ class _RawPhoneticMatch:
     span_units: int = 0
     tone_positions: tuple[int, ...] = ()
     tone_span_units: int = 0
+
+
+@dataclass(frozen=True)
+class _PositionCandidate:
+    position: int
+    span_units: int
+    source: str
+    tone_matched: bool = False
 
 
 @dataclass(frozen=True)
@@ -195,6 +210,24 @@ OPEN_SOURCE_MODEL_CANDIDATES: tuple[ModelCandidate, ...] = (
         optional_dependency="whisperx",
         install_hint="pip install whisperx",
         notes="Best fit for matching material text to reference vocal timing.",
+    ),
+    ModelCandidate(
+        name="FunASR Paraformer",
+        repository_url="https://github.com/modelscope/FunASR",
+        pipeline_stage="asr_alignment",
+        role="Transcribe Chinese vocals and provide character-level timestamps for timeline matching.",
+        optional_dependency="funasr",
+        install_hint="pip install funasr modelscope",
+        notes="Preferred Chinese ASR/timestamp backend for CN material matching; WhisperX remains available as fallback.",
+    ),
+    ModelCandidate(
+        name="Janome",
+        repository_url="https://github.com/mocobeta/janome",
+        pipeline_stage="pronunciation_normalization",
+        role="Convert Japanese kanji and kana lyrics into pronunciation units before filename/material matching.",
+        optional_dependency="janome",
+        install_hint="pip install janome",
+        notes="Used for Japanese lyric/material normalization; ASR timing still comes from WhisperX/FunASR/Faster Whisper.",
     ),
     ModelCandidate(
         name="Faster Whisper",
@@ -278,7 +311,13 @@ def build_model_assisted_pipeline_plan() -> dict[str, object]:
                 "stage": "asr_alignment",
                 "input": "vocal ranges",
                 "output": "transcript segments with timestamps",
-                "candidate_models": ["Faster Whisper", "WhisperX", "OpenAI Whisper", "whisper.cpp"],
+                "candidate_models": [
+                    "FunASR Paraformer",
+                    "Faster Whisper",
+                    "WhisperX",
+                    "OpenAI Whisper",
+                    "whisper.cpp",
+                ],
             },
             {
                 "stage": "speaker_similarity",
@@ -332,6 +371,21 @@ def order_materials_for_reference(
     )
 
 
+def _sequence_language_hint(
+    reference_segments: Sequence[VoiceSegment],
+    materials: Sequence[MaterialAnalysis] = (),
+) -> str:
+    for segment in reference_segments:
+        hint = _normalize_language_hint(segment.language_hint)
+        if hint:
+            return hint
+    for material in materials:
+        hint = _normalize_language_hint(material.language_hint)
+        if hint:
+            return hint
+    return ""
+
+
 def plan_material_ordering(
     reference_segments: Sequence[VoiceSegment],
     materials: Sequence[MaterialAnalysis],
@@ -350,14 +404,24 @@ def plan_material_ordering(
             strategy="filename_fallback",
         )
 
+    language_hint = _sequence_language_hint(usable_reference, usable_materials)
     reference_duration_hint = _reference_duration_hint(usable_reference)
+    reference_unit_count = sum(len(_phonetic_units(segment.text, language_hint=language_hint)) for segment in usable_reference)
     score_matrix = _build_score_matrix(
         usable_reference,
         materials,
         reference_embedding=reference_embedding,
         reference_duration_hint=reference_duration_hint,
+        language_hint=language_hint,
     )
-    if len(usable_reference) < len(usable_materials):
+    first_reference_scores = tuple(
+        (material, score) for material, score in zip(materials, score_matrix[0])
+    ) if score_matrix else ()
+    if reference_unit_count > 0 and _should_use_phonetic_unit_sequence(
+        " ".join(segment.text for segment in usable_reference),
+        first_reference_scores,
+        language_hint=language_hint,
+    ):
         return MaterialOrderingPlan(
             decisions=tuple(
                 _order_materials_by_reference_text(
@@ -365,14 +429,15 @@ def plan_material_ordering(
                     materials,
                     reference_embedding=reference_embedding,
                     reference_duration_hint=reference_duration_hint,
+                    language_hint=language_hint,
                 )
             ),
             score_matrix=score_matrix,
-            strategy="reference_text_position",
+            strategy="reference_phonetic_unit_sequence",
         )
 
     return MaterialOrderingPlan(
-        decisions=tuple(_global_assignment_decisions(usable_reference, materials, score_matrix)),
+        decisions=tuple(_global_assignment_decisions(usable_reference, materials, score_matrix, language_hint=language_hint)),
         score_matrix=score_matrix,
         strategy="global_assignment",
     )
@@ -397,9 +462,9 @@ def text_similarity(left: str, right: str) -> float:
     return max(jaccard, (0.6 * sequence_score) + (0.4 * jaccard))
 
 
-def phonetic_similarity(left: str, right: str) -> float:
-    left_phonetic = _phonetic_text(left)
-    right_phonetic = _phonetic_text(right)
+def phonetic_similarity(left: str, right: str, *, language_hint: str = "") -> float:
+    left_phonetic = _phonetic_text(left, language_hint=language_hint)
+    right_phonetic = _phonetic_text(right, language_hint=language_hint)
     if not left_phonetic or not right_phonetic:
         return 0.0
     return text_similarity(left_phonetic, right_phonetic)
@@ -411,10 +476,11 @@ def _order_materials_by_reference_text(
     *,
     reference_embedding: tuple[float, ...] | None,
     reference_duration_hint: float,
+    language_hint: str = "",
 ) -> list[MaterialOrderDecision]:
     reference_text = " ".join(segment.text for segment in reference_segments)
-    aggregate_reference = VoiceSegment(0.0, reference_duration_hint, reference_text)
-    scored: list[tuple[int, float, str, MaterialScoreBreakdown]] = []
+    aggregate_reference = VoiceSegment(0.0, reference_duration_hint, reference_text, language_hint=language_hint)
+    scored_by_material: list[tuple[MaterialAnalysis, MaterialScoreBreakdown]] = []
     for material_index, material in enumerate(materials):
         score = _score_material_against_reference(
             0,
@@ -423,8 +489,22 @@ def _order_materials_by_reference_text(
             material,
             reference_embedding=reference_embedding,
             reference_duration_hint=reference_duration_hint,
+            language_hint=language_hint,
             allow_position_reason=True,
         )
+        scored_by_material.append((material, score))
+
+    unit_decisions = _order_materials_by_reference_unit_sequence(
+        reference_segments,
+        reference_text,
+        scored_by_material,
+        language_hint=language_hint,
+    )
+    if unit_decisions:
+        return unit_decisions
+
+    scored: list[tuple[int, float, str, MaterialScoreBreakdown]] = []
+    for material, score in scored_by_material:
         position = _score_reference_position(score)
         fallback_position = 10**9
         scored.append(
@@ -440,6 +520,326 @@ def _order_materials_by_reference_text(
     for rank, (_, _, _, score) in enumerate(sorted(scored, key=lambda item: item[:3]), start=1):
         decisions.append(_localize_aggregate_decision(_decision_from_score(rank, score), reference_segments))
     return decisions
+
+
+def _order_materials_by_reference_unit_sequence(
+    reference_segments: Sequence[VoiceSegment],
+    reference_text: str,
+    scored_by_material: Sequence[tuple[MaterialAnalysis, MaterialScoreBreakdown]],
+    *,
+    language_hint: str = "",
+) -> list[MaterialOrderDecision]:
+    reference_units = _phonetic_units(reference_text, language_hint=language_hint)
+    if not reference_units:
+        return []
+    if not _should_use_phonetic_unit_sequence(reference_text, scored_by_material, language_hint=language_hint):
+        return []
+
+    target_durations = _reference_phonetic_unit_durations(reference_segments)
+    position_candidates_by_path = {
+        material.path: _position_candidates_for_material(reference_text, material, language_hint=language_hint)
+        for material, _ in scored_by_material
+    }
+    material_units_by_path = {
+        material.path: _material_candidate_phonetic_units(material, language_hint=language_hint)
+        for material, _ in scored_by_material
+    }
+    usage_counts: dict[Path, int] = {}
+    decisions: list[MaterialOrderDecision] = []
+    position = 0
+    while position < len(reference_units):
+        candidate = _best_material_for_reference_position(
+            reference_units,
+            reference_text,
+            scored_by_material,
+            position,
+            target_durations[position] if position < len(target_durations) else None,
+            usage_counts,
+            position_candidates_by_path,
+            material_units_by_path,
+        )
+        if candidate is None:
+            position += 1
+            continue
+
+        material, base_score, position_candidate, selection_score = candidate
+        adjusted_score = _score_for_selected_reference_position(
+            base_score,
+            selected_position=position_candidate.position,
+            selection_score=selection_score,
+            reason=f"reference_{position_candidate.source}_sequence",
+            tone_matched=position_candidate.tone_matched,
+        )
+        decision = _localize_aggregate_decision(
+            _decision_from_score(len(decisions) + 1, adjusted_score),
+            reference_segments,
+        )
+        decisions.append(decision)
+        usage_counts[material.path] = usage_counts.get(material.path, 0) + 1
+        position += max(position_candidate.span_units, 1)
+
+    return decisions
+
+
+def _best_material_for_reference_position(
+    reference_units: Sequence[str],
+    reference_text: str,
+    scored_by_material: Sequence[tuple[MaterialAnalysis, MaterialScoreBreakdown]],
+    position: int,
+    target_duration: float | None,
+    usage_counts: dict[Path, int],
+    position_candidates_by_path: dict[Path, tuple[_PositionCandidate, ...]],
+    material_units_by_path: dict[Path, tuple[str, ...]],
+) -> tuple[MaterialAnalysis, MaterialScoreBreakdown, _PositionCandidate, float] | None:
+    candidates: list[tuple[int, float, float, int, str, MaterialAnalysis, MaterialScoreBreakdown, _PositionCandidate]] = []
+    for material, score in scored_by_material:
+        for position_candidate in position_candidates_by_path.get(material.path, ()):
+            if position_candidate.position != position:
+                continue
+            selection_score = _reference_position_selection_score(
+                score,
+                material,
+                target_duration=target_duration,
+                position_candidate=position_candidate,
+            )
+            reuse_penalty = min(usage_counts.get(material.path, 0) * 0.04, 0.24)
+            effective_score = max(selection_score - reuse_penalty, 0.0)
+            duration_score = (
+                _duration_similarity(float(target_duration), material.duration_seconds)
+                if target_duration is not None and target_duration > 0
+                else 0.0
+            )
+            candidates.append(
+                (
+                    1 if usage_counts.get(material.path, 0) == 0 else 0,
+                    effective_score,
+                    duration_score,
+                    -usage_counts.get(material.path, 0),
+                    material.path.name.lower(),
+                    material,
+                    score,
+                    position_candidate,
+                )
+            )
+
+    if not candidates:
+        fallback_pool = [
+            (material, score)
+            for material, score in scored_by_material
+            if not _has_future_position_candidate(position_candidates_by_path.get(material.path, ()), position)
+        ]
+        if not fallback_pool:
+            return None
+        material, score = max(
+            fallback_pool,
+            key=lambda item: (
+                1 if usage_counts.get(item[0].path, 0) == 0 else 0,
+                _target_unit_similarity(reference_units, position, material_units_by_path.get(item[0].path, ())),
+                item[1].duration_score,
+                item[1].score,
+                -usage_counts.get(item[0].path, 0),
+                _reverse_lexicographic_key(item[0].path.name.lower()),
+            ),
+        )
+        fallback_candidate = _PositionCandidate(position=position, span_units=1, source="fallback", tone_matched=False)
+        fallback_score = _fallback_reference_position_selection_score(
+            score,
+            material,
+            reference_units=reference_units,
+            material_units=material_units_by_path.get(material.path, ()),
+            position=position,
+            target_duration=target_duration,
+        )
+        return material, score, fallback_candidate, fallback_score
+
+    _, effective_score, _, _, _, material, score, position_candidate = max(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2], item[3], _reverse_lexicographic_key(item[4])),
+    )
+    return material, score, position_candidate, effective_score
+
+
+def _has_future_position_candidate(candidates: Sequence[_PositionCandidate], position: int) -> bool:
+    return any(candidate.position > position for candidate in candidates)
+
+
+def _should_use_phonetic_unit_sequence(
+    reference_text: str,
+    scored_by_material: Sequence[tuple[MaterialAnalysis, MaterialScoreBreakdown]],
+    *,
+    language_hint: str = "",
+) -> bool:
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]", reference_text):
+        return True
+    if _normalize_language_hint(language_hint) in {"CN", "JP"} and re.search(r"[\u4e00-\u9fff]", reference_text):
+        return True
+    return False
+
+
+def _material_has_cn_jp_filename_hint(material: MaterialAnalysis) -> bool:
+    text = material.filename_text or material.path.stem
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]", text):
+        return True
+    units = _phonetic_units(text, language_hint=material.language_hint)
+    if not units:
+        return False
+    if any(re.search(r"[1-5]$", token) for token in _text_units(text)):
+        return True
+    return any(_looks_like_pinyin_or_romaji_unit(unit) for unit in units)
+
+
+def _position_candidates_for_material(
+    reference_text: str,
+    material: MaterialAnalysis,
+    *,
+    language_hint: str = "",
+) -> tuple[_PositionCandidate, ...]:
+    sources: list[tuple[str, _RawPhoneticMatch]] = [
+        ("filename_phonetic", _phonetic_match(reference_text, material.filename_text, language_hint=language_hint or material.language_hint)),
+        ("transcript_phonetic", _phonetic_match(reference_text, material.transcript, language_hint=language_hint or material.language_hint)),
+    ]
+    candidates: list[_PositionCandidate] = []
+    for source, match in sources:
+        if match.tone_positions:
+            span_units = max(match.tone_span_units, match.span_units, 1)
+            candidates.extend(
+                _PositionCandidate(position=position, span_units=span_units, source=source, tone_matched=True)
+                for position in match.tone_positions
+            )
+            if source == "filename_phonetic":
+                break
+        if match.positions:
+            span_units = max(match.span_units, 1)
+            candidates.extend(
+                _PositionCandidate(position=position, span_units=span_units, source=source)
+                for position in match.positions
+            )
+            if source == "filename_phonetic":
+                break
+
+    deduped: dict[tuple[int, int, str, bool], _PositionCandidate] = {}
+    for candidate in candidates:
+        deduped[(candidate.position, candidate.span_units, candidate.source, candidate.tone_matched)] = candidate
+    return tuple(sorted(deduped.values(), key=lambda item: (item.position, -item.span_units, item.source)))
+
+
+def _reference_position_selection_score(
+    score: MaterialScoreBreakdown,
+    material: MaterialAnalysis,
+    *,
+    target_duration: float | None,
+    position_candidate: _PositionCandidate,
+) -> float:
+    duration_score = (
+        _duration_similarity(float(target_duration), material.duration_seconds)
+        if target_duration is not None and target_duration > 0
+        else 0.0
+    )
+    source_bonus = 0.10 if position_candidate.source.startswith("filename") else 0.0
+    tone_bonus = 0.06 if position_candidate.tone_matched else 0.0
+    ambiguity_count = score.phonetic_tone_position_count if position_candidate.tone_matched else score.phonetic_position_count
+    ambiguity_penalty = 0.05 if ambiguity_count > 1 else 0.0
+    phonetic_score = max(score.phonetic_score, score.phonetic_tone_score if position_candidate.tone_matched else 0.0)
+    selection_score = (
+        (0.58 * phonetic_score)
+        + (0.24 * duration_score)
+        + (0.07 * score.vad_score)
+        + (0.06 * score.speaker_score)
+        + source_bonus
+        + tone_bonus
+        - ambiguity_penalty
+    )
+    return max(min(selection_score, 0.98), 0.0)
+
+
+def _fallback_reference_position_selection_score(
+    score: MaterialScoreBreakdown,
+    material: MaterialAnalysis,
+    *,
+    reference_units: Sequence[str],
+    material_units: Sequence[str],
+    position: int,
+    target_duration: float | None,
+) -> float:
+    duration_score = (
+        _duration_similarity(float(target_duration), material.duration_seconds)
+        if target_duration is not None and target_duration > 0
+        else 0.0
+    )
+    unit_similarity = _target_unit_similarity(reference_units, position, material_units)
+    selection_score = (
+        (0.42 * unit_similarity)
+        + (0.26 * duration_score)
+        + (0.08 * score.vad_score)
+        + (0.04 * score.speaker_score)
+    )
+    return max(min(selection_score, 0.42), 0.0)
+
+
+def _target_unit_similarity(
+    reference_units: Sequence[str],
+    position: int,
+    material_units: Sequence[str],
+) -> float:
+    if not 0 <= position < len(reference_units):
+        return 0.0
+    target_unit = reference_units[position]
+    if not material_units:
+        return 0.0
+    return max(text_similarity(target_unit, unit) for unit in material_units)
+
+
+def _material_candidate_phonetic_units(material: MaterialAnalysis, *, language_hint: str = "") -> tuple[str, ...]:
+    hint = language_hint or material.language_hint
+    units = _phonetic_units(material.filename_text or material.path.stem, language_hint=hint)
+    if units:
+        return tuple(units)
+    return tuple(_phonetic_units(material.transcript, language_hint=hint))
+
+
+def _score_for_selected_reference_position(
+    score: MaterialScoreBreakdown,
+    *,
+    selected_position: int,
+    selection_score: float,
+    reason: str,
+    tone_matched: bool,
+) -> MaterialScoreBreakdown:
+    score_value = max(score.score, selection_score)
+    evidence_count = max(score.evidence_count, 2 if selection_score >= 0.45 else 1)
+    return replace(
+        score,
+        score=score_value,
+        evidence_count=evidence_count,
+        confidence_label=_confidence_label(score_value, evidence_count=evidence_count, short_reference=False),
+        reason="reference_text_position",
+        text_position=None,
+        phonetic_position=selected_position,
+        phonetic_position_count=1,
+        phonetic_tone_position=selected_position if tone_matched else None,
+        phonetic_tone_position_count=1 if tone_matched else 0,
+    )
+
+
+def _reference_phonetic_unit_durations(reference_segments: Sequence[VoiceSegment]) -> tuple[float | None, ...]:
+    durations: list[float | None] = []
+    for segment in reference_segments:
+        units = _phonetic_units(segment.text, language_hint=segment.language_hint)
+        if not units:
+            continue
+        by_position = {
+            timing.position: timing.duration_seconds
+            for timing in segment.unit_timings
+            if timing.duration_seconds > 0
+        }
+        fallback_duration = segment.duration_seconds / len(units) if segment.duration_seconds > 0 else None
+        for index in range(len(units)):
+            durations.append(by_position.get(index, fallback_duration))
+    return tuple(durations)
+
+
+def _reverse_lexicographic_key(text: str) -> tuple[int, ...]:
+    return tuple(-ord(character) for character in text)
 
 
 def render_ordering_score_matrix(plan: MaterialOrderingPlan) -> list[list[dict[str, object]]]:
@@ -486,6 +886,7 @@ def _build_score_matrix(
     *,
     reference_embedding: tuple[float, ...] | None,
     reference_duration_hint: float,
+    language_hint: str = "",
 ) -> tuple[tuple[MaterialScoreBreakdown, ...], ...]:
     return tuple(
         tuple(
@@ -496,6 +897,7 @@ def _build_score_matrix(
                 material,
                 reference_embedding=reference_embedding,
                 reference_duration_hint=reference_duration_hint,
+                language_hint=language_hint or reference_segment.language_hint or material.language_hint,
             )
             for material_index, material in enumerate(materials)
         )
@@ -511,15 +913,17 @@ def _score_material_against_reference(
     *,
     reference_embedding: tuple[float, ...] | None,
     reference_duration_hint: float,
+    language_hint: str = "",
     allow_position_reason: bool = False,
 ) -> MaterialScoreBreakdown:
     reference_duration = reference_segment.duration_seconds or reference_duration_hint
+    normalized_hint = language_hint or reference_segment.language_hint or material.language_hint
     transcript_score = text_similarity(reference_segment.text, material.transcript)
     filename_score = text_similarity(reference_segment.text, material.filename_text)
-    phonetic_match = _material_phonetic_match(reference_segment.text, material)
+    phonetic_match = _material_phonetic_match(reference_segment.text, material, language_hint=normalized_hint)
     phonetic_score = max(
-        phonetic_similarity(reference_segment.text, _material_search_text(material)),
-        _material_phonetic_position_score(reference_segment.text, material, phonetic_match=phonetic_match),
+        phonetic_similarity(reference_segment.text, _material_search_text(material), language_hint=normalized_hint),
+        _material_phonetic_position_score(reference_segment.text, material, phonetic_match=phonetic_match, language_hint=normalized_hint),
     )
     if phonetic_match.tone_score > 0:
         phonetic_score = max(phonetic_score, phonetic_match.tone_score)
@@ -577,14 +981,15 @@ def _score_material_against_reference(
         text_position=text_position,
         phonetic_position=phonetic_position,
         phonetic_position_count=phonetic_position_count,
-        reference_phonetic_units=tuple(_phonetic_units(reference_segment.text)),
-        material_phonetic_units=tuple(_phonetic_units(_material_search_text(material))),
-        reference_phonetic_tone_units=tuple(_phonetic_tone_units(reference_segment.text)),
-        material_phonetic_tone_units=tuple(_phonetic_tone_units(_material_search_text(material))),
+        reference_phonetic_units=tuple(_phonetic_units(reference_segment.text, language_hint=normalized_hint)),
+        material_phonetic_units=tuple(_phonetic_units(_material_search_text(material), language_hint=normalized_hint)),
+        reference_phonetic_tone_units=tuple(_phonetic_tone_units(reference_segment.text, language_hint=normalized_hint)),
+        material_phonetic_tone_units=tuple(_phonetic_tone_units(_material_search_text(material), language_hint=normalized_hint)),
         phonetic_span_units=phonetic_match.span_units,
         phonetic_tone_score=phonetic_match.tone_score,
         phonetic_tone_position=phonetic_match.tone_position,
         phonetic_tone_position_count=phonetic_match.tone_position_count,
+        language_hint=normalized_hint,
     )
 
 
@@ -592,6 +997,8 @@ def _global_assignment_decisions(
     reference_segments: Sequence[VoiceSegment],
     materials: Sequence[MaterialAnalysis],
     score_matrix: Sequence[Sequence[MaterialScoreBreakdown]],
+    *,
+    language_hint: str = "",
 ) -> list[MaterialOrderDecision]:
     if not score_matrix:
         return _filename_order_decisions(materials, reason="filename_fallback")
@@ -604,6 +1011,7 @@ def _global_assignment_decisions(
             materials,
             reference_embedding=None,
             reference_duration_hint=_reference_duration_hint(reference_segments),
+            language_hint=language_hint or _sequence_language_hint(reference_segments, materials),
         )
 
     assignment_scores = [
@@ -662,6 +1070,7 @@ def _decision_from_score(rank: int, score: MaterialScoreBreakdown) -> MaterialOr
         phonetic_tone_score=score.phonetic_tone_score,
         phonetic_tone_position=score.phonetic_tone_position,
         phonetic_tone_position_count=score.phonetic_tone_position_count,
+        language_hint=score.language_hint,
     )
 
 
@@ -749,7 +1158,7 @@ def _map_phonetic_position_to_segment_unit(
 
     cursor = 0
     for segment_index, segment in enumerate(reference_segments):
-        unit_count = len(_phonetic_units(segment.text))
+        unit_count = len(_phonetic_units(segment.text, language_hint=segment.language_hint))
         if unit_count <= 0:
             continue
         if cursor <= position < cursor + unit_count:
@@ -875,11 +1284,11 @@ def _material_text_position(reference_text: str, material: MaterialAnalysis) -> 
 
 
 def _material_phonetic_position(reference_text: str, material: MaterialAnalysis) -> int | None:
-    return _material_phonetic_match(reference_text, material).position
+    return _material_phonetic_match(reference_text, material, language_hint=material.language_hint).position
 
 
 def _material_phonetic_position_count(reference_text: str, material: MaterialAnalysis) -> int:
-    return _material_phonetic_match(reference_text, material).position_count
+    return _material_phonetic_match(reference_text, material, language_hint=material.language_hint).position_count
 
 
 def _material_phonetic_position_score(
@@ -887,12 +1296,14 @@ def _material_phonetic_position_score(
     material: MaterialAnalysis,
     *,
     phonetic_match: _PhoneticMatch | None = None,
+    language_hint: str = "",
 ) -> float:
-    reference_units = _phonetic_units(reference_text)
+    hint = language_hint or material.language_hint
+    reference_units = _phonetic_units(reference_text, language_hint=hint)
     if not reference_units:
         return 0.0
 
-    match = phonetic_match or _material_phonetic_match(reference_text, material)
+    match = phonetic_match or _material_phonetic_match(reference_text, material, language_hint=hint)
     if match.position_count <= 0:
         return 0.0
 
@@ -908,13 +1319,19 @@ def _material_phonetic_position_score(
     return max(base - ambiguity_penalty, match.tone_score)
 
 
-def _material_phonetic_match(reference_text: str, material: MaterialAnalysis) -> _PhoneticMatch:
+def _material_phonetic_match(
+    reference_text: str,
+    material: MaterialAnalysis,
+    *,
+    language_hint: str = "",
+) -> _PhoneticMatch:
     positions: set[int] = set()
     tone_positions: set[int] = set()
     span_units = 0
     tone_span_units = 0
+    hint = language_hint or material.language_hint
     for text in (material.transcript, material.filename_text):
-        match = _phonetic_match(reference_text, text)
+        match = _phonetic_match(reference_text, text, language_hint=hint)
         positions.update(match.positions)
         tone_positions.update(match.tone_positions)
         span_units = max(span_units, match.span_units)
@@ -934,9 +1351,11 @@ def _material_phonetic_match(reference_text: str, material: MaterialAnalysis) ->
     return _PhoneticMatch(
         position=resolved_position,
         position_count=len(positions),
+        positions=tuple(sorted(positions)),
         span_units=span_units,
         tone_position=min(tone_positions) if tone_positions else None,
         tone_position_count=tone_position_count,
+        tone_positions=tuple(sorted(tone_positions)),
         tone_span_units=tone_span_units,
         tone_score=tone_score,
     )
@@ -948,6 +1367,8 @@ def _material_search_text(material: MaterialAnalysis) -> str:
 
 def _material_display_text(material: MaterialAnalysis) -> str:
     if material.transcript.strip() and material.filename_text.strip():
+        if _compact_text(material.transcript) == _compact_text(material.filename_text):
+            return material.filename_text
         return f"{material.transcript} | filename: {material.filename_text}"
     return _material_search_text(material)
 
@@ -972,6 +1393,7 @@ def _filename_order_decisions(
                 duration_score=0.0,
                 speaker_score=0.0,
                 vad_score=0.0,
+                language_hint=material.language_hint,
             )
         )
     return decisions
@@ -1013,14 +1435,22 @@ def _compact_text(text: str) -> str:
     return "".join(_text_units(text))
 
 
-def _phonetic_text(text: str) -> str:
-    return " ".join(_phonetic_units(text))
+def _phonetic_text(text: str, *, language_hint: str = "") -> str:
+    return " ".join(_phonetic_units(text, language_hint=language_hint))
 
 
-def _phonetic_units(text: str) -> list[str]:
+def _phonetic_units(text: str, *, language_hint: str = "") -> list[str]:
     units = _group_kana_units(_text_units(_strip_accents(text)))
     if not units:
         return []
+
+    normalized_hint = _normalize_language_hint(language_hint)
+    contains_kana = any(KANA_PATTERN.fullmatch(unit) for unit in units)
+    contains_cjk = any(re.fullmatch(r"[\u4e00-\u9fff]+", unit) for unit in units)
+    if normalized_hint == "JP" and (contains_kana or contains_cjk):
+        return _japanese_phonetic_units(text)
+    if contains_kana:
+        return _japanese_phonetic_units(text)
 
     result: list[str] = []
     for unit in units:
@@ -1035,10 +1465,18 @@ def _phonetic_units(text: str) -> list[str]:
     return [unit for unit in result if unit]
 
 
-def _phonetic_tone_units(text: str) -> list[str]:
+def _phonetic_tone_units(text: str, *, language_hint: str = "") -> list[str]:
     units = _group_kana_units(_text_units(_strip_accents(text)))
     if not units:
         return []
+
+    normalized_hint = _normalize_language_hint(language_hint)
+    contains_kana = any(KANA_PATTERN.fullmatch(unit) for unit in units)
+    contains_cjk = any(re.fullmatch(r"[\u4e00-\u9fff]+", unit) for unit in units)
+    if normalized_hint == "JP" and (contains_kana or contains_cjk):
+        return _japanese_phonetic_tone_units(text)
+    if contains_kana:
+        return _japanese_phonetic_tone_units(text)
 
     result: list[str] = []
     for unit in units:
@@ -1053,26 +1491,44 @@ def _phonetic_tone_units(text: str) -> list[str]:
     return [unit for unit in result if unit]
 
 
-def _phonetic_position(reference_text: str, material_text: str) -> int | None:
-    positions = _phonetic_positions(reference_text, material_text)
+def _japanese_phonetic_units(text: str) -> list[str]:
+    tokenizer = _janome_tokenizer()
+    if tokenizer is None:
+        return _kana_romaji_units(text)
+
+    result: list[str] = []
+    for token in tokenizer.tokenize(text):
+        reading = getattr(token, "phonetic", "") or getattr(token, "reading", "") or getattr(token, "surface", "")
+        if not reading or reading == "*":
+            reading = getattr(token, "surface", "")
+        result.extend(_kana_romaji_units(str(reading)))
+    return [unit for unit in result if unit]
+
+
+def _japanese_phonetic_tone_units(text: str) -> list[str]:
+    return _japanese_phonetic_units(text)
+
+
+def _phonetic_position(reference_text: str, material_text: str, *, language_hint: str = "") -> int | None:
+    positions = _phonetic_positions(reference_text, material_text, language_hint=language_hint)
     return positions[0] if positions else None
 
 
-def _phonetic_positions(reference_text: str, material_text: str) -> list[int]:
-    return list(_phonetic_match(reference_text, material_text).positions)
+def _phonetic_positions(reference_text: str, material_text: str, *, language_hint: str = "") -> list[int]:
+    return list(_phonetic_match(reference_text, material_text, language_hint=language_hint).positions)
 
 
-def _phonetic_match(reference_text: str, material_text: str) -> _RawPhoneticMatch:
-    reference_units = _phonetic_units(reference_text)
-    material_units = _phonetic_units(material_text)
+def _phonetic_match(reference_text: str, material_text: str, *, language_hint: str = "") -> _RawPhoneticMatch:
+    reference_units = _phonetic_units(reference_text, language_hint=language_hint)
+    material_units = _phonetic_units(material_text, language_hint=language_hint)
     if not reference_units or not material_units:
         return _RawPhoneticMatch()
 
     positions, span_units = _phonetic_positions_for_units(reference_units, material_units)
     tone_positions: list[int] = []
     tone_span_units = 0
-    reference_tone_units = _phonetic_tone_units(reference_text)
-    material_tone_units = _phonetic_tone_units(material_text)
+    reference_tone_units = _phonetic_tone_units(reference_text, language_hint=language_hint)
+    material_tone_units = _phonetic_tone_units(material_text, language_hint=language_hint)
     if _has_tone_evidence(material_tone_units):
         tone_positions, tone_span_units = _phonetic_positions_for_units(reference_tone_units, material_tone_units)
 
@@ -1431,11 +1887,454 @@ _ROMAJI_VARIANTS: dict[str, str] = {
 }
 
 
+_PINYIN_OR_ROMAJI_UNIT_HINTS = {
+    "a",
+    "ai",
+    "an",
+    "ang",
+    "ao",
+    "ba",
+    "bai",
+    "ban",
+    "bang",
+    "bao",
+    "bei",
+    "ben",
+    "beng",
+    "bi",
+    "bian",
+    "biao",
+    "bie",
+    "bin",
+    "bing",
+    "bo",
+    "bu",
+    "ca",
+    "cai",
+    "can",
+    "cang",
+    "cao",
+    "ce",
+    "cen",
+    "ceng",
+    "cha",
+    "chai",
+    "chan",
+    "chang",
+    "chao",
+    "che",
+    "chen",
+    "cheng",
+    "chi",
+    "chong",
+    "chou",
+    "chu",
+    "chuai",
+    "chuan",
+    "chuang",
+    "chui",
+    "chun",
+    "chuo",
+    "ci",
+    "cong",
+    "cou",
+    "cu",
+    "cuan",
+    "cui",
+    "cun",
+    "cuo",
+    "da",
+    "dai",
+    "dan",
+    "dang",
+    "dao",
+    "de",
+    "dei",
+    "deng",
+    "di",
+    "dian",
+    "diao",
+    "die",
+    "ding",
+    "diu",
+    "dong",
+    "dou",
+    "du",
+    "duan",
+    "dui",
+    "dun",
+    "duo",
+    "e",
+    "ei",
+    "en",
+    "er",
+    "fa",
+    "fan",
+    "fang",
+    "fei",
+    "fen",
+    "feng",
+    "fo",
+    "fou",
+    "fu",
+    "ga",
+    "gai",
+    "gan",
+    "gang",
+    "gao",
+    "ge",
+    "gei",
+    "gen",
+    "geng",
+    "gong",
+    "gou",
+    "gu",
+    "gua",
+    "guai",
+    "guan",
+    "guang",
+    "gui",
+    "gun",
+    "guo",
+    "ha",
+    "hai",
+    "han",
+    "hang",
+    "hao",
+    "he",
+    "hei",
+    "hen",
+    "heng",
+    "hong",
+    "hou",
+    "hu",
+    "hua",
+    "huai",
+    "huan",
+    "huang",
+    "hui",
+    "hun",
+    "huo",
+    "ji",
+    "jia",
+    "jian",
+    "jiang",
+    "jiao",
+    "jie",
+    "jin",
+    "jing",
+    "jiong",
+    "jiu",
+    "ju",
+    "juan",
+    "jue",
+    "jun",
+    "ka",
+    "kai",
+    "kan",
+    "kang",
+    "kao",
+    "ke",
+    "ken",
+    "keng",
+    "kong",
+    "kou",
+    "ku",
+    "kua",
+    "kuai",
+    "kuan",
+    "kuang",
+    "kui",
+    "kun",
+    "kuo",
+    "la",
+    "lai",
+    "lan",
+    "lang",
+    "lao",
+    "le",
+    "lei",
+    "leng",
+    "li",
+    "lia",
+    "lian",
+    "liang",
+    "liao",
+    "lie",
+    "lin",
+    "ling",
+    "liu",
+    "long",
+    "lou",
+    "lu",
+    "luan",
+    "lue",
+    "lun",
+    "luo",
+    "ma",
+    "mai",
+    "man",
+    "mang",
+    "mao",
+    "me",
+    "mei",
+    "men",
+    "meng",
+    "mi",
+    "mian",
+    "miao",
+    "mie",
+    "min",
+    "ming",
+    "miu",
+    "mo",
+    "mou",
+    "mu",
+    "na",
+    "nai",
+    "nan",
+    "nang",
+    "nao",
+    "ne",
+    "nei",
+    "nen",
+    "neng",
+    "ni",
+    "nian",
+    "niang",
+    "niao",
+    "nie",
+    "nin",
+    "ning",
+    "niu",
+    "nong",
+    "nou",
+    "nu",
+    "nuan",
+    "nue",
+    "nuo",
+    "o",
+    "ou",
+    "pa",
+    "pai",
+    "pan",
+    "pang",
+    "pao",
+    "pei",
+    "pen",
+    "peng",
+    "pi",
+    "pian",
+    "piao",
+    "pie",
+    "pin",
+    "ping",
+    "po",
+    "pou",
+    "pu",
+    "qi",
+    "qia",
+    "qian",
+    "qiang",
+    "qiao",
+    "qie",
+    "qin",
+    "qing",
+    "qiong",
+    "qiu",
+    "qu",
+    "quan",
+    "que",
+    "qun",
+    "ran",
+    "rang",
+    "rao",
+    "re",
+    "ren",
+    "reng",
+    "ri",
+    "rong",
+    "rou",
+    "ru",
+    "ruan",
+    "rui",
+    "run",
+    "ruo",
+    "sa",
+    "sai",
+    "san",
+    "sang",
+    "sao",
+    "se",
+    "sen",
+    "seng",
+    "sha",
+    "shai",
+    "shan",
+    "shang",
+    "shao",
+    "she",
+    "shei",
+    "shen",
+    "sheng",
+    "shi",
+    "shou",
+    "shu",
+    "shua",
+    "shuai",
+    "shuan",
+    "shuang",
+    "shui",
+    "shun",
+    "shuo",
+    "si",
+    "song",
+    "sou",
+    "su",
+    "suan",
+    "sui",
+    "sun",
+    "suo",
+    "ta",
+    "tai",
+    "tan",
+    "tang",
+    "tao",
+    "te",
+    "teng",
+    "ti",
+    "tian",
+    "tiao",
+    "tie",
+    "ting",
+    "tong",
+    "tou",
+    "tu",
+    "tuan",
+    "tui",
+    "tun",
+    "tuo",
+    "wa",
+    "wai",
+    "wan",
+    "wang",
+    "wei",
+    "wen",
+    "weng",
+    "wo",
+    "wu",
+    "xi",
+    "xia",
+    "xian",
+    "xiang",
+    "xiao",
+    "xie",
+    "xin",
+    "xing",
+    "xiong",
+    "xiu",
+    "xu",
+    "xuan",
+    "xue",
+    "xun",
+    "ya",
+    "yan",
+    "yang",
+    "yao",
+    "ye",
+    "yi",
+    "yin",
+    "ying",
+    "yo",
+    "yong",
+    "you",
+    "yu",
+    "yuan",
+    "yue",
+    "yun",
+    "za",
+    "zai",
+    "zan",
+    "zang",
+    "zao",
+    "ze",
+    "zei",
+    "zen",
+    "zeng",
+    "zha",
+    "zhai",
+    "zhan",
+    "zhang",
+    "zhao",
+    "zhe",
+    "zhei",
+    "zhen",
+    "zheng",
+    "zhi",
+    "zhong",
+    "zhou",
+    "zhu",
+    "zhua",
+    "zhuai",
+    "zhuan",
+    "zhuang",
+    "zhui",
+    "zhun",
+    "zhuo",
+    "zi",
+    "zong",
+    "zou",
+    "zu",
+    "zuan",
+    "zui",
+    "zun",
+    "zuo",
+    "tsu",
+    "kya",
+    "kyu",
+    "kyo",
+    "sha",
+    "shu",
+    "sho",
+    "cha",
+    "chu",
+    "cho",
+    "nya",
+    "nyu",
+    "nyo",
+    "hya",
+    "hyu",
+    "hyo",
+    "mya",
+    "myu",
+    "myo",
+    "rya",
+    "ryu",
+    "ryo",
+    "gya",
+    "gyu",
+    "gyo",
+    "ja",
+    "ju",
+    "jo",
+    "bya",
+    "byu",
+    "byo",
+    "pya",
+    "pyu",
+    "pyo",
+}
+
+
 def _normalize_phonetic_unit(unit: str) -> str:
     normalized = _strip_accents(unit)
     normalized = re.sub(r"[1-5]", "", normalized)
     normalized = normalized.replace("u:", "u").replace("v", "u")
     return _ROMAJI_VARIANTS.get(normalized, normalized)
+
+
+def _looks_like_pinyin_or_romaji_unit(unit: str) -> bool:
+    return _normalize_phonetic_unit(unit) in _PINYIN_OR_ROMAJI_UNIT_HINTS
 
 
 def _normalize_phonetic_tone_unit(unit: str) -> str:
@@ -1454,6 +2353,28 @@ def _has_tone_evidence(units: Sequence[str]) -> bool:
 def _strip_accents(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
     return "".join(character for character in normalized if not unicodedata.combining(character)).lower()
+
+
+def _normalize_language_hint(value: str | None) -> str:
+    normalized = re.sub(r"[^a-z]", "", str(value or "").lower())
+    if normalized in {"cn", "zh", "zho", "cmn", "zhcn", "chinese", "mandarin"}:
+        return "CN"
+    if normalized in {"jp", "ja", "jpn", "japanese", "nihongo"}:
+        return "JP"
+    return ""
+
+
+@lru_cache(maxsize=1)
+def _janome_tokenizer() -> object | None:
+    try:
+        from janome.tokenizer import Tokenizer  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        return Tokenizer(mmap=False)
+    except Exception:
+        return None
 
 
 def _speaker_similarity(

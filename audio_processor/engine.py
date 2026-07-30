@@ -72,6 +72,8 @@ RUBBERBAND_MIN_TEMPO = 0.01
 RUBBERBAND_MAX_TEMPO = 100.0
 DAW_WAV_CODEC = "pcm_s24le"
 MIN_MATERIAL_TARGET_DURATION_SECONDS = 0.001
+RENDERED_CLIP_CONCAT_LIST_THRESHOLD = 64
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v2_exact_target_atrim"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -93,7 +95,7 @@ def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.Com
             creationflags=_subprocess_creationflags(),
         )
     except FileNotFoundError as exc:
-        raise AudioProcessorError(f"Required tool not found: {args[0]}") from exc
+        raise _tool_launch_error(args, command_args, exc) from exc
     except subprocess.CalledProcessError as exc:
         output = (exc.stderr or exc.stdout or "").strip()
         command = subprocess.list2cmdline([str(arg) for arg in command_args])
@@ -370,6 +372,7 @@ def _build_rendered_clip_concat_args(
     output_path: Path,
     options: ProcessOptions,
     *,
+    concat_list_path: Path | None = None,
     progress: bool = False,
 ) -> list[str]:
     if not clip_paths:
@@ -380,12 +383,14 @@ def _build_rendered_clip_concat_args(
         args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
 
     args.append("-y" if options.overwrite else "-n")
-    for path in clip_paths:
-        args.extend(["-i", str(path)])
-
-    if len(clip_paths) == 1:
+    if concat_list_path is not None:
+        args.extend(["-f", "concat", "-safe", "0", "-i", str(concat_list_path), "-map", "0:a"])
+    elif len(clip_paths) == 1:
+        args.extend(["-i", str(clip_paths[0])])
         args.extend(["-map", "0:a"])
     else:
+        for path in clip_paths:
+            args.extend(["-i", str(path)])
         labels = "".join(f"[{index}:a]" for index in range(len(clip_paths)))
         args.extend(["-filter_complex", f"{labels}concat=n={len(clip_paths)}:v=0:a=1[outa]", "-map", "[outa]"])
 
@@ -610,7 +615,16 @@ def _assemble_material_clips_with_render_cache(
         )
         rendered_paths.append(cache_path)
 
-    args = _build_rendered_clip_concat_args(rendered_paths, output_path, options, progress=True)
+    concat_list_path = None
+    if len(rendered_paths) > RENDERED_CLIP_CONCAT_LIST_THRESHOLD:
+        concat_list_path = _write_rendered_clip_concat_list(rendered_paths, cache_root, output_path)
+    args = _build_rendered_clip_concat_args(
+        rendered_paths,
+        output_path,
+        options,
+        concat_list_path=concat_list_path,
+        progress=True,
+    )
 
     def concat_progress(progress: float, message: str) -> None:
         _notify_progress(
@@ -625,6 +639,27 @@ def _assemble_material_clips_with_render_cache(
         on_progress=concat_progress,
         should_cancel=should_cancel,
     )
+
+
+def _write_rendered_clip_concat_list(
+    clip_paths: Sequence[Path],
+    cache_root: Path,
+    output_path: Path,
+) -> Path:
+    digest = hashlib.sha256(
+        "\n".join(str(path.resolve()) for path in clip_paths).encode("utf-8")
+    ).hexdigest()[:16]
+    list_path = cache_root / f"{output_path.stem}-{digest}.concat.txt"
+    list_path.write_text(
+        "\n".join(f"file '{_ffmpeg_concat_list_path(path)}'" for path in clip_paths) + "\n",
+        encoding="utf-8",
+    )
+    return list_path
+
+
+def _ffmpeg_concat_list_path(path: Path) -> str:
+    resolved = str(path.resolve()).replace("\\", "/")
+    return resolved.replace("'", "'\\''")
 
 
 def plan_material_stretch_clips(
@@ -783,7 +818,7 @@ def _build_material_filter_graph(
     if audio_filters:
         post_filters.append(audio_filters)
     if target_duration is not None:
-        post_filters.append(f"apad=whole_dur={target_duration:.6f}")
+        post_filters.extend(_target_duration_filters(target_duration))
     filters.append(f"{source_label}{','.join(post_filters)}[outa]")
     return ";".join(filters)
 
@@ -805,7 +840,7 @@ def _build_material_plan_filter_graph(
         ]
         if audio_filters:
             post_filters.append(audio_filters)
-        post_filters.append(f"apad=whole_dur={clip.target_duration_seconds:.6f}")
+        post_filters.extend(_target_duration_filters(clip.target_duration_seconds))
         filters.append(f"[{index}:a]{','.join(post_filters)}[{output_label}]")
         if len(clips) > 1:
             labels.append(f"[{output_label}]")
@@ -831,8 +866,16 @@ def _build_material_clip_filter(
     if audio_filters:
         filters.append(audio_filters)
     if target_duration is not None:
-        filters.append(f"apad=whole_dur={target_duration:.6f}")
+        filters.extend(_target_duration_filters(target_duration))
     return ",".join(filters)
+
+
+def _target_duration_filters(target_duration: float) -> list[str]:
+    return [
+        f"apad=whole_dur={target_duration:.6f}",
+        f"atrim=duration={target_duration:.6f}",
+        "asetpts=N/SR/TB",
+    ]
 
 
 def _rubberband_filter(tempo: float) -> str:
@@ -853,11 +896,14 @@ def _resolve_material_target_durations(
     if target_durations is not None and len(target_durations) == len(source_durations):
         explicit_targets = [_positive_optional_float(target) for target in target_durations]
         if any(target is not None for target in explicit_targets):
+            all_targets_explicit = all(target is not None for target in explicit_targets)
             resolved = _resolve_explicit_material_target_durations(
                 reference_duration,
                 source_durations,
                 explicit_targets,
             )
+            if all_targets_explicit:
+                return _clamp_durations_to_render_bounds(resolved, source_durations)
             return _fit_durations_to_render_bounds(resolved, source_durations, reference_duration)
 
     resolved = _fit_durations_to_total(source_durations, reference_duration)
@@ -875,10 +921,7 @@ def _resolve_explicit_material_target_durations(
         return _fit_durations_to_total(source_durations, reference_duration)
 
     if not unresolved_indices:
-        return _fit_durations_to_total(
-            [float(explicit_targets[index] or 0.0) for index in explicit_indices],
-            reference_duration,
-        )
+        return [float(target or 0.0) for target in explicit_targets]
 
     targets: list[float | None] = [None for _ in explicit_targets]
     explicit_sum = sum(float(explicit_targets[index] or 0.0) for index in explicit_indices)
@@ -1010,6 +1053,20 @@ def _fit_durations_to_render_bounds(
     return [float(value or lower_bounds[index]) for index, value in enumerate(resolved)]
 
 
+def _clamp_durations_to_render_bounds(
+    durations: Sequence[float],
+    source_durations: Sequence[float],
+) -> list[float]:
+    if len(durations) != len(source_durations):
+        return [max(float(duration), MIN_MATERIAL_TARGET_DURATION_SECONDS) for duration in durations]
+    resolved: list[float] = []
+    for duration, source in zip(durations, source_durations):
+        lower = max(MIN_MATERIAL_TARGET_DURATION_SECONDS, float(source) / RUBBERBAND_MAX_TEMPO)
+        upper = max(lower, float(source) / RUBBERBAND_MIN_TEMPO)
+        resolved.append(min(max(float(duration), lower), upper))
+    return resolved
+
+
 def _resolve_material_text_hints(count: int, hints: Sequence[str] | None) -> list[str]:
     if hints is None or len(hints) != count:
         return ["" for _ in range(count)]
@@ -1044,6 +1101,7 @@ def _material_render_cache_key(clip: MaterialStretchClip, options: ProcessOption
         "rubberband_tempo": round(clip.tempo, 10),
         "requested_rubberband_tempo": round(clip.requested_tempo if clip.requested_tempo is not None else clip.tempo, 10),
         "stretch_strategy": clip.stretch_strategy,
+        "filter_format": MATERIAL_RENDER_FILTER_FORMAT,
         "text_hint": clip.text_hint,
         "options": {
             "gain_db": options.gain_db,
@@ -1387,7 +1445,21 @@ def _open_progress_process(args: Sequence[str]) -> subprocess.Popen[str]:
             creationflags=_subprocess_creationflags(),
         )
     except FileNotFoundError as exc:
-        raise AudioProcessorError(f"Required tool not found: {args[0]}") from exc
+        raise _tool_launch_error(args, command_args, exc) from exc
+
+
+def _tool_launch_error(
+    args: Sequence[str],
+    resolved_args: Sequence[str],
+    exc: FileNotFoundError,
+) -> AudioProcessorError:
+    if getattr(exc, "winerror", None) == 206:
+        return AudioProcessorError(
+            "Command line is too long for Windows process creation while launching "
+            f"{args[0]}. Use concat-list rendering or reduce the number of direct input arguments."
+        )
+    command = subprocess.list2cmdline([str(arg) for arg in resolved_args[:4]])
+    return AudioProcessorError(f"Required tool not found: {args[0]} (resolved command starts with: {command})")
 
 
 def _run_progress_process(
