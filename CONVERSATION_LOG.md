@@ -1,5 +1,15 @@
 # Conversation Log
 
+## Latest Update - 2026-07-31 Japanese Mora Guard and JP ASR Backend Protection
+
+1. This continuation targeted the Japanese regression reported by the user. The runtime now carries CN/JP hints into reference analysis, material analysis, and cache keys, so JP references no longer reuse a Chinese FunASR result by accident.
+2. When a JP hint would otherwise route into `funasr`, the backend is guarded over to a multilingual backend and the reason is recorded in notes and cache fingerprints. This blocks the earlier failure mode where Japanese songs were transcribed as Chinese hallucinations and then fed into the ordering logic.
+3. The pronunciation layer now normalizes Japanese kana/romaji into mora-level units. Long vowels such as `ー`, repeated vowels, and common `ou/ei` lengthening no longer produce extra independent units, and sokuon/促音 no longer becomes a separate clip slot.
+4. Kana with dakuten/handakuten is now preserved during accent stripping, so `パ` stays `pa` instead of collapsing to `ha`. For JP language hints, compact substring fallback is also disabled so `u` cannot match inside `su`, which was the main cause of extra `u.wav` and `a.wav` decisions in long-vowel songs.
+5. Unit tests now cover `スーパー`, `がっこう`, `suupaa`, `gakkou`, `PlasticLove`, WhisperX char timing, lyric retargeting, and the FunASR skip guard for JP.
+6. Verification passed with `.venv311\Scripts\python.exe -m unittest discover` (155 tests), `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` with only CRLF warnings.
+7. A real JP single-case render smoke against `PlasticLove_JP__vmzJP` timed out before producing case-level results, so the only new real-eval artifact is the initial suite header with `planned_case_count=1`; it confirms the smoke started but not that it finished.
+
 ## Latest Update - 2026-07-31 FunASR Timestamp Resample for Unit Timing Coverage
 
 1. This continuation resumed from the latest rendered real-eval state and treated `tests_real\output\real-eval-20260731-102644\summary.json` as the acceptance signal after running the full suite through `scripts\run_real_eval_render_full.ps1`.

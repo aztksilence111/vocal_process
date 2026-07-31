@@ -1,5 +1,13 @@
 # Project Analysis
 
+## Latest Update - 2026-07-31 Japanese Mora Guard and JP ASR Backend Protection
+
+This continuation targeted the Japanese failure mode reported by the user: the previous evaluation path could still route Japanese reference/material analysis through the Chinese FunASR backend, and the timeline layer could split Japanese long vowels into extra clip slots. The runtime now carries CN/JP language hints into reference analysis, material analysis, and cache keys; when a JP hint would otherwise use `funasr`, the backend is guarded over to a multilingual backend instead of reusing the Chinese-only transcript path. The guard is recorded in notes and cache fingerprints so old FunASR Japanese results do not get reused silently.
+
+On the phonetic side, `audio_processor.model_assist` now normalizes Japanese kana/romaji into mora-level units. Long vowels such as `ー`, repeated vowels, and common `ou/ei` lengthening no longer produce extra independent units, and sokuon/促音 no longer becomes a separate clip slot. Japanese kana with dakuten/handakuten are preserved during accent stripping, so `パ` stays `pa` instead of collapsing to `ha`. For JP language hints, compact substring fallback is disabled so a unit like `u` cannot match inside `su`, which was the main cause of the extra `u.wav` and `a.wav` decisions in long-vowel songs.
+
+Verification passed again with `.venv311\Scripts\python.exe -m unittest discover` (155 tests) and `audio_processor check`. A real single-case JP render smoke was attempted against `PlasticLove_JP__vmzJP`, but it timed out before any case completed; the partial report only shows the suite header and planned case count, so it does not yet provide new render evidence. The code path itself is now covered by unit tests and by the direct `model_runtime._transcribe_audio(..., language_hint="JP")` guard test that proves FunASR is skipped for JP.
+
 ## Latest Update - 2026-07-31 FunASR Timestamp Resample for Missing Unit Coverage
 
 This continuation closed the remaining `missing_aligned_unit_timing` gap without changing score thresholds or adding corpus-specific exceptions. The failure class was a density mismatch between FunASR timestamp spans and the normalized reference unit lattice: the previous path returned an empty timing tuple when neither direct one-to-one timestamp mapping nor ASCII expansion explained the mismatch. That behavior was too brittle for no-lyrics references, where the original-vocal ASR/aligned pronunciation units are the only target-unit source.

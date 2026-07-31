@@ -27,6 +27,7 @@ from .model_assist import (
     MaterialOrderDecision,
     VoiceSegment,
     VoiceUnitTiming,
+    _japanese_timeline_unit_spans,
     _phonetic_units,
     list_model_candidates,
     plan_material_ordering,
@@ -148,8 +149,8 @@ DEFAULT_FUNASR_PUNC_MODEL = "ct-punc"
 DEFAULT_DEVICE = "cpu"
 DEFAULT_COMPUTE_TYPE = "int8"
 MATERIAL_CACHE_FILE = ".vocalprocess_material_cache.json"
-MATERIAL_CACHE_FORMAT = "vocal_process_material_cache_v2_filename_label_authority"
-REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v1"
+MATERIAL_CACHE_FORMAT = "vocal_process_material_cache_v3_language_asr_guard"
+REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v2_language_asr_guard"
 PYANNOTE_DIA_MODEL = "pyannote/speaker-diarization-community-1"
 SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 TORCH_NATIVE_RUNTIME_HINT = (
@@ -648,12 +649,17 @@ def build_model_ordering(
         material_paths=material_paths,
     )
     _raise_for_language_mismatch(language_compatibility)
+    reference_language_hint = str(language_compatibility.get("reference_language") or "")
+    material_language_hint = str(language_compatibility.get("material_set_language") or "")
+    if not reference_language_hint and material_language_hint and lyrics_file is not None:
+        reference_language_hint = material_language_hint
 
     _raise_if_cancelled(should_cancel)
     resolved_material_cache_dir = material_cache_dir or _default_material_cache_dir(
         work_root,
         material_directory,
         device,
+        language_hint=material_language_hint,
     )
     notes: list[str] = [f"compute device resolved: {device}"]
     backend_summary = backend_availability()
@@ -668,6 +674,7 @@ def build_model_ordering(
         on_progress=on_progress,
         notes=notes,
         should_cancel=should_cancel,
+        language_hint=reference_language_hint,
     )
     language_compatibility = reference_material_language_compatibility(
         normalized_reference,
@@ -679,6 +686,10 @@ def build_model_ordering(
     )
     _raise_for_language_mismatch(language_compatibility)
     notes.append(_language_compatibility_note(language_compatibility))
+    reference_language_hint = str(language_compatibility.get("reference_language") or reference_language_hint or "")
+    material_language_hint = str(language_compatibility.get("material_set_language") or material_language_hint or "")
+    if not reference_language_hint and material_language_hint and lyrics_file is not None:
+        reference_language_hint = material_language_hint
 
     _raise_if_cancelled(should_cancel)
     _notify_progress(on_progress, 0.25, "Preparing material analysis")
@@ -690,6 +701,7 @@ def build_model_ordering(
         on_progress=on_progress,
         notes=notes,
         should_cancel=should_cancel,
+        language_hint=material_language_hint,
     )
 
     _raise_if_cancelled(should_cancel)
@@ -704,10 +716,6 @@ def build_model_ordering(
             ),
         )
 
-    reference_language_hint = str(language_compatibility.get("reference_language") or "")
-    material_language_hint = str(language_compatibility.get("material_set_language") or "")
-    if not reference_language_hint and material_language_hint and lyrics_file is not None:
-        reference_language_hint = material_language_hint
     reference_segments = tuple(
         replace(segment, language_hint=reference_language_hint or segment.language_hint) for segment in reference_segments
     )
@@ -849,6 +857,7 @@ def analyze_reference(
     on_progress: ProgressCallback | None = None,
     notes: list[str] | None = None,
     should_cancel: CancelCallback | None = None,
+    language_hint: str = "",
 ) -> ReferenceAnalysis:
     _raise_if_cancelled(should_cancel)
     notes = notes if notes is not None else []
@@ -858,7 +867,14 @@ def analyze_reference(
 
     _raise_if_cancelled(should_cancel)
     work_root = _prepare_work_root(work_dir)
-    cache_path = _reference_cache_path(work_root, normalized_reference, lyrics_file, compute_device, source_separation)
+    cache_path = _reference_cache_path(
+        work_root,
+        normalized_reference,
+        lyrics_file,
+        compute_device,
+        source_separation,
+        language_hint=language_hint,
+    )
     cached = _load_reference_analysis_cache(cache_path, normalized_reference=normalized_reference)
     if cached is not None:
         _raise_if_cancelled(should_cancel)
@@ -889,6 +905,7 @@ def analyze_reference(
         work_dir=work_root,
         compute_device=compute_device,
         should_cancel=should_cancel,
+        language_hint=language_hint,
     )
     notes.extend(str(note) for note in transcript_result.get("notes", []) if isinstance(note, str))
     _raise_if_cancelled(should_cancel)
@@ -900,7 +917,14 @@ def analyze_reference(
     )
     _raise_if_cancelled(should_cancel)
     notes.extend(_lyric_timing_notes(lyrics_file, transcript_result["segments"]))
-    segments = _segments_from_transcript(transcript_result["segments"], lyrics_file=lyrics_file)
+    transcript_language_hint = language_hint or _language_from_asr_notes(
+        tuple(str(note) for note in transcript_result.get("notes", ()) if isinstance(note, str))
+    )
+    segments = _segments_from_transcript(
+        transcript_result["segments"],
+        lyrics_file=lyrics_file,
+        language_hint=transcript_language_hint,
+    )
     if not segments:
         segments = (
             VoiceSegment(
@@ -909,6 +933,7 @@ def analyze_reference(
                 text=transcript_result["text"],
                 confidence=0.0,
                 timing_source="asr_full_text_fallback",
+                language_hint=transcript_language_hint,
             ),
         )
 
@@ -936,6 +961,7 @@ def analyze_material_library(
     on_progress: ProgressCallback | None = None,
     notes: list[str] | None = None,
     should_cancel: CancelCallback | None = None,
+    language_hint: str = "",
 ) -> MaterialLibraryAnalysis:
     _raise_if_cancelled(should_cancel)
     notes = notes if notes is not None else []
@@ -959,6 +985,7 @@ def analyze_material_library(
         material_directory=material_directory,
         snapshot=snapshot,
         filename_label_policy=filename_label_policy,
+        language_hint=language_hint or filename_label_policy.language,
     )
     if cached_library is not None:
         _raise_if_cancelled(should_cancel)
@@ -978,6 +1005,7 @@ def analyze_material_library(
             work_dir=work_dir,
             compute_device=compute_device,
             should_cancel=should_cancel,
+            language_hint=language_hint or filename_label_policy.language,
         )
         _raise_if_cancelled(should_cancel)
         vad_segments = _detect_vad_segments(path, compute_device=compute_device, should_cancel=should_cancel)
@@ -1031,6 +1059,7 @@ def analyze_material_library(
         library=library,
         snapshot=snapshot,
         filename_label_policy=filename_label_policy,
+        language_hint=language_hint or filename_label_policy.language,
     )
     updated_notes = list(notes)
     if cache_written:
@@ -1059,6 +1088,7 @@ def render_reference_analysis(reference: ReferenceAnalysis) -> dict[str, Any]:
                 "confidence": segment.confidence,
                 "speaker_id": segment.speaker_id,
                 "timing_source": segment.timing_source,
+                "language_hint": segment.language_hint,
                 "unit_timings": [
                     {
                         "position": timing.position,
@@ -1826,6 +1856,7 @@ def _transcribe_audio(
     work_dir: Path | None = None,
     compute_device: str = DEFAULT_DEVICE,
     should_cancel: CancelCallback | None = None,
+    language_hint: str = "",
 ) -> dict[str, Any]:
     _raise_if_cancelled(should_cancel)
     _prepare_text_output_encoding()
@@ -1833,8 +1864,11 @@ def _transcribe_audio(
     _ensure_model_download_tls()
     work_root = _prepare_work_root(work_dir)
     device = _resolve_compute_device(compute_device)
-    preferred_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower()
+    requested_backend = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower() or "auto"
+    preferred_backend = _language_compatible_asr_backend(requested_backend, language_hint)
     fallback_notes: list[str] = []
+    if preferred_backend != requested_backend:
+        fallback_notes.append(_asr_backend_language_guard_note(requested_backend, preferred_backend, language_hint))
     allow_model_download = os.environ.get("VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD") == "1"
     runtime_issue = _speech_runtime_issue(preferred_backend, allow_model_download)
     if runtime_issue:
@@ -1869,6 +1903,7 @@ def _transcribe_audio(
                     path,
                     compute_device=device,
                     should_cancel=should_cancel,
+                    language_hint=language_hint,
                 )
             except Exception as exc:
                 if preferred_backend in {"faster-whisper", "faster_whisper"}:
@@ -1899,8 +1934,10 @@ def _transcribe_audio(
                 _raise_if_cancelled(should_cancel)
                 result = model.transcribe(audio, batch_size=4)
                 _raise_if_cancelled(should_cancel)
+                language = str(result.get("language") or "")
+                align_language = _whisperx_alignment_language(language, language_hint)
                 align_model, metadata = whisperx.load_align_model(
-                    language_code=result["language"], device=device
+                    language_code=align_language, device=device
                 )
                 _raise_if_cancelled(should_cancel)
                 aligned = whisperx.align(
@@ -1929,12 +1966,18 @@ def _transcribe_audio(
                                 if _aligned_char_entries(segment)
                                 else "whisperx_alignment"
                             ),
-                            unit_timings=_unit_timings_from_aligned_chars(segment),
+                            unit_timings=_unit_timings_from_aligned_chars(
+                                segment,
+                                language_hint=_normalize_cn_jp_language(language_hint)
+                                or _normalize_cn_jp_language(language)
+                                or language,
+                            ),
                         )
                     )
                 text = " ".join(segment.text for segment in segments).strip()
-                language = str(result.get("language") or "")
                 notes = [*fallback_notes, f"language={language}"] if language else fallback_notes
+                if align_language and align_language != language:
+                    notes.append(f"alignment_language={align_language}")
                 return {"backend": "whisperx", "text": text, "segments": segments, "notes": notes}
             except _WhisperXAudioLoadFailed as exc:
                 if preferred_backend == "whisperx":
@@ -1953,7 +1996,21 @@ def _transcribe_audio(
         compute_device=device,
         fallback_note="; ".join(fallback_notes) if fallback_notes else "accelerated ASR backend unavailable",
         should_cancel=should_cancel,
+        language_hint=language_hint,
     )
+
+
+def _asr_language_code(language_hint: str = "") -> str:
+    language = _normalize_cn_jp_language(language_hint)
+    if language == "JP":
+        return "ja"
+    if language == "CN":
+        return "zh"
+    return ""
+
+
+def _whisperx_alignment_language(transcribed_language: str, language_hint: str = "") -> str:
+    return _asr_language_code(language_hint) or str(transcribed_language or "")
 
 
 def _transcribe_with_faster_whisper(
@@ -1961,6 +2018,7 @@ def _transcribe_with_faster_whisper(
     *,
     compute_device: str,
     should_cancel: CancelCallback | None = None,
+    language_hint: str = "",
 ) -> dict[str, Any]:
     _raise_if_cancelled(should_cancel)
     from faster_whisper import WhisperModel  # type: ignore
@@ -1969,12 +2027,15 @@ def _transcribe_with_faster_whisper(
     _raise_if_cancelled(should_cancel)
     model = _load_faster_whisper_model(DEFAULT_ASR_MODEL, device, _compute_type_for_device(device))
     _raise_if_cancelled(should_cancel)
-    raw_segments, info = model.transcribe(
-        str(path),
-        beam_size=5,
-        vad_filter=True,
-        word_timestamps=False,
-    )
+    transcribe_kwargs: dict[str, Any] = {
+        "beam_size": 5,
+        "vad_filter": True,
+        "word_timestamps": False,
+    }
+    language_code = _asr_language_code(language_hint)
+    if language_code:
+        transcribe_kwargs["language"] = language_code
+    raw_segments, info = model.transcribe(str(path), **transcribe_kwargs)
     segments: list[TranscriptSegment] = []
     for segment in raw_segments:
         _raise_if_cancelled(should_cancel)
@@ -2055,6 +2116,7 @@ def _transcribe_with_whisper(
     compute_device: str,
     fallback_note: str,
     should_cancel: CancelCallback | None = None,
+    language_hint: str = "",
 ) -> dict[str, Any]:
     _raise_if_cancelled(should_cancel)
     if not _module_available("whisper"):
@@ -2074,7 +2136,11 @@ def _transcribe_with_whisper(
         _raise_if_cancelled(should_cancel)
         model = _load_openai_whisper_model(DEFAULT_ASR_MODEL, device)
         _raise_if_cancelled(should_cancel)
-        result = model.transcribe(str(path), fp16=device == "cuda", verbose=None)
+        transcribe_kwargs: dict[str, Any] = {"fp16": device == "cuda", "verbose": None}
+        language_code = _asr_language_code(language_hint)
+        if language_code:
+            transcribe_kwargs["language"] = language_code
+        result = model.transcribe(str(path), **transcribe_kwargs)
         _raise_if_cancelled(should_cancel)
         segments: list[TranscriptSegment] = []
         for segment in result.get("segments", []):
@@ -2587,6 +2653,7 @@ def _load_material_library_cache(
     material_directory: Path,
     snapshot: Sequence[dict[str, Any]],
     filename_label_policy: _MaterialFilenameLabelPolicy,
+    language_hint: str = "",
 ) -> MaterialLibraryAnalysis | None:
     if not cache_path.exists():
         return None
@@ -2602,7 +2669,9 @@ def _load_material_library_cache(
         return None
     if raw.get("asr_model") != DEFAULT_ASR_MODEL:
         return None
-    if raw.get("asr_backend") != _asr_backend_cache_key():
+    if raw.get("asr_backend") != _asr_backend_cache_key(language_hint):
+        return None
+    if raw.get("language_hint", "") != _normalize_cn_jp_language(language_hint):
         return None
     if raw.get("material_filename_label_policy") != filename_label_policy.cache_key:
         return None
@@ -2631,11 +2700,13 @@ def _write_material_library_cache(
     library: MaterialLibraryAnalysis,
     snapshot: Sequence[dict[str, Any]],
     filename_label_policy: _MaterialFilenameLabelPolicy,
+    language_hint: str = "",
 ) -> bool:
     payload = {
         "format": MATERIAL_CACHE_FORMAT,
         "asr_model": DEFAULT_ASR_MODEL,
-        "asr_backend": _asr_backend_cache_key(),
+        "asr_backend": _asr_backend_cache_key(language_hint),
+        "language_hint": _normalize_cn_jp_language(language_hint),
         "material_filename_label_policy": filename_label_policy.cache_key,
         "snapshot": list(snapshot),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
@@ -2656,10 +2727,12 @@ def _current_asr_backend() -> str:
     return os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "auto").strip().lower() or "auto"
 
 
-def _asr_backend_cache_key() -> str:
-    backend = _current_asr_backend()
+def _asr_backend_cache_key(language_hint: str = "") -> str:
+    requested_backend = _current_asr_backend()
+    backend = _language_compatible_asr_backend(requested_backend, language_hint)
+    language = _normalize_cn_jp_language(language_hint) or "unknown"
     if backend in FUNASR_BACKENDS:
-        return ":".join(
+        backend_key = ":".join(
             [
                 backend,
                 _current_funasr_model(),
@@ -2667,14 +2740,49 @@ def _asr_backend_cache_key() -> str:
                 _current_funasr_punc_model() or "no-punc",
             ]
         )
-    return backend
+    else:
+        backend_key = backend
+    if backend != requested_backend:
+        backend_key = f"{backend_key}:requested={requested_backend}"
+    return f"{backend_key}:language={language}"
 
 
-def _default_material_cache_dir(work_root: Path, material_directory: Path, compute_device: str) -> Path:
+def _language_compatible_asr_backend(preferred_backend: str, language_hint: str = "") -> str:
+    backend = (preferred_backend or "auto").strip().lower() or "auto"
+    language = _normalize_cn_jp_language(language_hint)
+    funasr_would_run = backend in FUNASR_BACKENDS or (backend == "auto" and _auto_funasr_enabled())
+    if language != "JP" or not funasr_would_run:
+        return backend
+    for candidate, module_name in (
+        ("whisperx", "whisperx"),
+        ("faster-whisper", "faster_whisper"),
+        ("whisper", "whisper"),
+    ):
+        if _module_available(module_name):
+            return candidate
+    return "whisperx"
+
+
+def _asr_backend_language_guard_note(requested_backend: str, effective_backend: str, language_hint: str) -> str:
+    language = _normalize_cn_jp_language(language_hint) or "unknown"
+    return (
+        "asr_backend_language_guard: "
+        f"requested={requested_backend}; effective={effective_backend}; language={language}; "
+        "funasr_zh_skipped_for_japanese=True"
+    )
+
+
+def _default_material_cache_dir(
+    work_root: Path,
+    material_directory: Path,
+    compute_device: str,
+    language_hint: str = "",
+) -> Path:
     payload = {
         "material_directory": str(material_directory.expanduser().resolve()),
         "asr_model": DEFAULT_ASR_MODEL,
-        "asr_backend": _asr_backend_cache_key(),
+        "asr_backend": _asr_backend_cache_key(language_hint),
+        "language_hint": _normalize_cn_jp_language(language_hint),
         "compute_device": compute_device,
     }
     key = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -2687,12 +2795,15 @@ def _reference_cache_path(
     lyrics_file: Path | None,
     compute_device: str,
     source_separation: str,
+    *,
+    language_hint: str = "",
 ) -> Path:
     payload = {
         "reference": _file_snapshot(reference_path),
         "lyrics": _optional_file_snapshot(lyrics_file.expanduser()) if lyrics_file else None,
         "asr_model": DEFAULT_ASR_MODEL,
-        "asr_backend": _asr_backend_cache_key(),
+        "asr_backend": _asr_backend_cache_key(language_hint),
+        "language_hint": _normalize_cn_jp_language(language_hint),
         "reference_unit_timing_format": "voice_unit_timing_v1",
         "funasr_timestamp_mismatch_policy": "resample_to_reference_units_v1",
         "whisperx_return_char_alignments": True,
@@ -2757,6 +2868,7 @@ def _load_reference_analysis_cache(
                 speaker_id=_optional_string(segment.get("speaker_id")),
                 timing_source=str(segment.get("timing_source") or ""),
                 unit_timings=_voice_unit_timings_from_json(segment.get("unit_timings")),
+                language_hint=str(segment.get("language_hint") or ""),
             )
             for segment in reference.get("segments", [])
             if isinstance(segment, dict)
@@ -2850,6 +2962,7 @@ def _segments_from_transcript(
     segments: Sequence[TranscriptSegment],
     *,
     lyrics_file: Path | None = None,
+    language_hint: str = "",
 ) -> tuple[VoiceSegment, ...]:
     if lyrics_file is not None:
         lyric_segments = parse_lyrics_file(lyrics_file)
@@ -2914,6 +3027,7 @@ def _segments_from_transcript(
                 else "asr_segment"
             ),
             unit_timings=segment.unit_timings,
+            language_hint=language_hint,
         )
         for segment in segments
     )
@@ -3738,17 +3852,25 @@ def _decision_timeline_unit_count(decision: MaterialOrderDecision) -> int:
 
 def _timeline_units(text: str, *, language_hint: str = "") -> list[str]:
     hint = _normalize_cn_jp_language(language_hint)
-    if (hint == "JP" or re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text)) and re.search(
-        r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]",
-        text,
-    ):
+    if hint == "JP":
         units = _phonetic_units(text, language_hint=hint or "JP")
         if units:
             return list(units)
-    return [unit for unit, _, _ in _timeline_unit_spans(text)]
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", text) and re.search(
+        r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]",
+        text,
+    ):
+        units = _phonetic_units(text, language_hint="JP")
+        if units:
+            return list(units)
+    return [unit for unit, _, _ in _timeline_unit_spans(text, language_hint=hint)]
 
 
-def _timeline_unit_spans(text: str) -> list[tuple[str, int, int]]:
+def _timeline_unit_spans(text: str, *, language_hint: str = "") -> list[tuple[str, int, int]]:
+    if _normalize_cn_jp_language(language_hint) == "JP":
+        spans = _japanese_timeline_unit_spans(text)
+        if spans:
+            return spans
     normalized = text.replace("_", " ").replace("-", " ").lower()
     return [
         (match.group(0), match.start(), match.end())
@@ -4403,14 +4525,20 @@ def _vad_coverage(vad_segments: Sequence[tuple[float, float]], duration_seconds:
     return min(max(covered / duration_seconds, 0.0), 1.0)
 
 
-def _unit_timings_from_aligned_chars(segment: dict[str, Any]) -> tuple[VoiceUnitTiming, ...]:
+def _unit_timings_from_aligned_chars(
+    segment: dict[str, Any],
+    *,
+    language_hint: str = "",
+) -> tuple[VoiceUnitTiming, ...]:
     text = str(segment.get("text", "") or "")
     char_entries = _aligned_char_entries(segment)
     if not text.strip() or not char_entries:
         return ()
 
     timings: list[VoiceUnitTiming] = []
-    for position, (unit, start_index, end_index) in enumerate(_timeline_unit_spans(text)):
+    for position, (unit, start_index, end_index) in enumerate(
+        _timeline_unit_spans(text, language_hint=language_hint)
+    ):
         entries = char_entries[start_index:end_index]
         aligned_entries = [
             entry

@@ -12,6 +12,133 @@ from typing import Sequence
 
 
 KANA_PATTERN = re.compile(r"^[\u3040-\u30ff\u31f0-\u31ff]+$")
+_JAPANESE_VOWELS = {"a", "i", "u", "e", "o"}
+_JAPANESE_LONG_MARKS = {"\u30fc", "\uff70"}
+_JAPANESE_SMALL_TSU = {"\u3063", "\u30c3"}
+_JAPANESE_ROMAJI_MORA_UNITS = (
+    "kya",
+    "kyu",
+    "kyo",
+    "gya",
+    "gyu",
+    "gyo",
+    "sha",
+    "shu",
+    "sho",
+    "sya",
+    "syu",
+    "syo",
+    "jya",
+    "jyu",
+    "jyo",
+    "ja",
+    "ju",
+    "jo",
+    "zya",
+    "zyu",
+    "zyo",
+    "cha",
+    "chu",
+    "cho",
+    "tya",
+    "tyu",
+    "tyo",
+    "nya",
+    "nyu",
+    "nyo",
+    "hya",
+    "hyu",
+    "hyo",
+    "bya",
+    "byu",
+    "byo",
+    "pya",
+    "pyu",
+    "pyo",
+    "mya",
+    "myu",
+    "myo",
+    "rya",
+    "ryu",
+    "ryo",
+    "shi",
+    "chi",
+    "tsu",
+    "thi",
+    "ka",
+    "ki",
+    "ku",
+    "ke",
+    "ko",
+    "ga",
+    "gi",
+    "gu",
+    "ge",
+    "go",
+    "sa",
+    "si",
+    "su",
+    "se",
+    "so",
+    "za",
+    "zi",
+    "zu",
+    "ze",
+    "zo",
+    "ta",
+    "ti",
+    "tu",
+    "te",
+    "to",
+    "da",
+    "di",
+    "du",
+    "de",
+    "do",
+    "na",
+    "ni",
+    "nu",
+    "ne",
+    "no",
+    "ha",
+    "hi",
+    "hu",
+    "fu",
+    "he",
+    "ho",
+    "ba",
+    "bi",
+    "bu",
+    "be",
+    "bo",
+    "pa",
+    "pi",
+    "pu",
+    "pe",
+    "po",
+    "ma",
+    "mi",
+    "mu",
+    "me",
+    "mo",
+    "ya",
+    "yu",
+    "yo",
+    "ra",
+    "ri",
+    "ru",
+    "re",
+    "ro",
+    "wa",
+    "wo",
+    "a",
+    "i",
+    "u",
+    "e",
+    "o",
+    "n",
+)
+_JAPANESE_ROMAJI_CONSONANTS = set("bcdfghjklmnpqrstvwxyz")
 
 
 @dataclass(frozen=True)
@@ -671,8 +798,14 @@ def _should_use_phonetic_unit_sequence(
 ) -> bool:
     if re.search(r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]", reference_text):
         return True
-    if _normalize_language_hint(language_hint) in {"CN", "JP"} and re.search(r"[\u4e00-\u9fff]", reference_text):
+    normalized_hint = _normalize_language_hint(language_hint)
+    if normalized_hint in {"CN", "JP"} and re.search(r"[\u4e00-\u9fff]", reference_text):
         return True
+    if normalized_hint == "JP" and _phonetic_units(reference_text, language_hint=language_hint):
+        return any(
+            _position_candidates_for_material(reference_text, material, language_hint=language_hint)
+            for material, _score in scored_by_material
+        )
     return False
 
 
@@ -1472,6 +1605,12 @@ def _phonetic_units(text: str, *, language_hint: str = "") -> list[str]:
             result.extend(_pinyin_units(unit))
         elif KANA_PATTERN.fullmatch(unit):
             result.extend(_kana_romaji_units(unit))
+        elif normalized_hint == "JP" and re.fullmatch(r"[a-z0-9]+", unit):
+            romaji_units = _japanese_romaji_units(unit)
+            if romaji_units:
+                result.extend(romaji_units)
+            else:
+                result.append(_normalize_japanese_fallback_unit(unit))
         else:
             result.append(_normalize_phonetic_unit(unit))
     return [unit for unit in result if unit]
@@ -1498,6 +1637,12 @@ def _phonetic_tone_units(text: str, *, language_hint: str = "") -> list[str]:
             result.extend(_pinyin_tone_units(unit))
         elif KANA_PATTERN.fullmatch(unit):
             result.extend(_kana_romaji_units(unit))
+        elif normalized_hint == "JP" and re.fullmatch(r"[a-z0-9]+", unit):
+            romaji_units = _japanese_romaji_units(unit)
+            if romaji_units:
+                result.extend(romaji_units)
+            else:
+                result.append(_normalize_japanese_fallback_unit(unit))
         else:
             result.append(_normalize_phonetic_tone_unit(unit))
     return [unit for unit in result if unit]
@@ -1514,7 +1659,7 @@ def _japanese_phonetic_units(text: str) -> list[str]:
         if not reading or reading == "*":
             reading = getattr(token, "surface", "")
         result.extend(_kana_romaji_units(str(reading)))
-    return [unit for unit in result if unit]
+    return _normalize_japanese_mora_units(result)
 
 
 def _japanese_phonetic_tone_units(text: str) -> list[str]:
@@ -1536,13 +1681,22 @@ def _phonetic_match(reference_text: str, material_text: str, *, language_hint: s
     if not reference_units or not material_units:
         return _RawPhoneticMatch()
 
-    positions, span_units = _phonetic_positions_for_units(reference_units, material_units)
+    allow_compact_match = _normalize_language_hint(language_hint) != "JP"
+    positions, span_units = _phonetic_positions_for_units(
+        reference_units,
+        material_units,
+        allow_compact_match=allow_compact_match,
+    )
     tone_positions: list[int] = []
     tone_span_units = 0
     reference_tone_units = _phonetic_tone_units(reference_text, language_hint=language_hint)
     material_tone_units = _phonetic_tone_units(material_text, language_hint=language_hint)
     if _has_tone_evidence(material_tone_units):
-        tone_positions, tone_span_units = _phonetic_positions_for_units(reference_tone_units, material_tone_units)
+        tone_positions, tone_span_units = _phonetic_positions_for_units(
+            reference_tone_units,
+            material_tone_units,
+            allow_compact_match=allow_compact_match,
+        )
 
     return _RawPhoneticMatch(
         positions=tuple(positions),
@@ -1555,6 +1709,8 @@ def _phonetic_match(reference_text: str, material_text: str, *, language_hint: s
 def _phonetic_positions_for_units(
     reference_units: Sequence[str],
     material_units: Sequence[str],
+    *,
+    allow_compact_match: bool = True,
 ) -> tuple[list[int], int]:
     material_count = len(material_units)
     positions: list[int] = []
@@ -1563,6 +1719,8 @@ def _phonetic_positions_for_units(
             positions.append(start)
     if positions:
         return positions, material_count
+    if not allow_compact_match:
+        return [], 0
 
     reference_compact = "".join(reference_units)
     material_compact = "".join(material_units)
@@ -1644,7 +1802,170 @@ def _kana_romaji_units(text: str) -> list[str]:
         char = normalized[index]
         units.append(_KANA_ROMAJI_MAP.get(char, char))
         index += 1
-    return [unit for unit in units if unit]
+    return _normalize_japanese_mora_units(units)
+
+
+def _japanese_romaji_units(text: str) -> list[str]:
+    return [unit for unit, _start, _end in _japanese_romaji_unit_spans(text)]
+
+
+def _japanese_timeline_unit_spans(text: str) -> list[tuple[str, int, int]]:
+    normalized = _strip_accents(text)
+    spans: list[tuple[str, int, int]] = []
+    for match in re.finditer(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]+|[\u4e00-\u9fff]", normalized):
+        token = match.group(0)
+        if token.isdigit():
+            continue
+        if KANA_PATTERN.fullmatch(token):
+            spans.extend(_kana_romaji_unit_spans(token, match.start()))
+            continue
+        if re.fullmatch(r"[a-z0-9]+", token):
+            romaji_spans = _japanese_romaji_unit_spans(token, match.start())
+            if romaji_spans:
+                spans.extend(romaji_spans)
+            else:
+                normalized_token = _normalize_japanese_fallback_unit(token)
+                if normalized_token:
+                    spans.append((normalized_token, match.start(), match.end()))
+            continue
+        spans.extend(
+            (character, index, index + 1)
+            for index, character in enumerate(normalized[match.start() : match.end()], match.start())
+        )
+    return spans
+
+
+def _kana_romaji_unit_spans(text: str, offset: int = 0) -> list[tuple[str, int, int]]:
+    normalized = _strip_accents(text)
+    spans: list[tuple[str, int, int]] = []
+    pending_start: int | None = None
+    index = 0
+    while index < len(normalized):
+        if normalized[index] in _JAPANESE_LONG_MARKS:
+            if spans:
+                unit, start_index, _end_index = spans[-1]
+                spans[-1] = (unit, start_index, offset + index + 1)
+            index += 1
+            continue
+        if normalized[index] in _JAPANESE_SMALL_TSU:
+            pending_start = offset + index if pending_start is None else pending_start
+            index += 1
+            continue
+
+        token_start = index
+        unit = ""
+        for width in (3, 2, 1):
+            candidate = normalized[index : index + width]
+            if candidate in _KANA_ROMAJI_MAP:
+                unit = _KANA_ROMAJI_MAP[candidate]
+                index += width
+                break
+        if not unit and index == token_start:
+            unit = normalized[index]
+            index += 1
+        if not unit:
+            continue
+
+        start_index = pending_start if pending_start is not None else offset + token_start
+        pending_start = None
+        end_index = offset + index
+        while index < len(normalized):
+            if normalized[index] in _JAPANESE_LONG_MARKS:
+                end_index = offset + index + 1
+                index += 1
+                continue
+            next_unit = ""
+            for width in (3, 2, 1):
+                candidate = normalized[index : index + width]
+                if candidate in _KANA_ROMAJI_MAP:
+                    next_unit = _KANA_ROMAJI_MAP[candidate]
+                    break
+            if next_unit and _is_japanese_lengthener(unit, next_unit):
+                end_index = offset + index + width
+                index += width
+                continue
+            break
+        spans.append((_normalize_phonetic_unit(unit), start_index, end_index))
+    return [(unit, start, end) for unit, start, end in spans if unit]
+
+
+def _japanese_romaji_unit_spans(text: str, offset: int = 0) -> list[tuple[str, int, int]]:
+    normalized = _strip_accents(text)
+    normalized = re.sub(r"[0-9]+$", "", normalized)
+    if not normalized or not re.fullmatch(r"[a-z]+", normalized):
+        return []
+
+    spans: list[tuple[str, int, int]] = []
+    pending_start: int | None = None
+    index = 0
+    while index < len(normalized):
+        if (
+            index + 1 < len(normalized)
+            and normalized[index] == normalized[index + 1]
+            and normalized[index] in _JAPANESE_ROMAJI_CONSONANTS
+            and normalized[index] != "n"
+        ):
+            pending_start = offset + index if pending_start is None else pending_start
+            index += 1
+            continue
+
+        matched = ""
+        for candidate in _JAPANESE_ROMAJI_MORA_UNITS:
+            if normalized.startswith(candidate, index):
+                matched = candidate
+                break
+        if not matched:
+            return []
+
+        start_index = pending_start if pending_start is not None else offset + index
+        pending_start = None
+        index += len(matched)
+        end_index = offset + index
+        unit = _normalize_phonetic_unit(matched)
+        while index < len(normalized) and _is_japanese_lengthener(unit, normalized[index]):
+            end_index = offset + index + 1
+            index += 1
+        spans.append((unit, start_index, end_index))
+
+    if pending_start is not None:
+        return []
+    return [(unit, start, end) for unit, start, end in spans if unit]
+
+
+def _normalize_japanese_mora_units(units: Sequence[str]) -> list[str]:
+    result: list[str] = []
+    for raw_unit in units:
+        unit = _normalize_phonetic_unit(raw_unit)
+        if not unit:
+            continue
+        if result and _is_japanese_lengthener(result[-1], unit):
+            continue
+        result.append(unit)
+    return result
+
+
+def _normalize_japanese_fallback_unit(unit: str) -> str:
+    normalized = _strip_accents(unit)
+    normalized = re.sub(r"[0-9]+$", "", normalized)
+    return normalized
+
+
+def _is_japanese_lengthener(previous_unit: str, next_unit: str) -> bool:
+    previous_vowel = _japanese_unit_vowel(previous_unit)
+    normalized_next = _normalize_phonetic_unit(next_unit)
+    if not previous_vowel or normalized_next not in _JAPANESE_VOWELS:
+        return False
+    same_vowel = normalized_next == previous_vowel
+    common_ou_long_vowel = previous_vowel == "o" and normalized_next == "u"
+    common_ei_long_vowel = previous_vowel == "e" and normalized_next == "i"
+    return same_vowel or common_ou_long_vowel or common_ei_long_vowel
+
+
+def _japanese_unit_vowel(unit: str) -> str:
+    for character in reversed(_normalize_phonetic_unit(unit)):
+        if character in _JAPANESE_VOWELS:
+            return character
+    return ""
 
 
 _KANA_ROMAJI_MAP: dict[str, str] = {
@@ -2364,7 +2685,15 @@ def _has_tone_evidence(units: Sequence[str]) -> bool:
 
 def _strip_accents(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
-    return "".join(character for character in normalized if not unicodedata.combining(character)).lower()
+    characters: list[str] = []
+    for character in normalized:
+        if unicodedata.combining(character):
+            name = unicodedata.name(character, "")
+            if "KATAKANA-HIRAGANA" in name and "SOUND MARK" in name:
+                characters.append(character)
+            continue
+        characters.append(character)
+    return unicodedata.normalize("NFC", "".join(characters)).lower()
 
 
 def _normalize_language_hint(value: str | None) -> str:

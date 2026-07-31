@@ -2031,6 +2031,35 @@ class ModelAssistTests(unittest.TestCase):
         self.assertEqual([decision.phonetic_position for decision in decisions], [0, 1, 2, 3])
         self.assertTrue(all(decision.phonetic_score > 0.8 for decision in decisions))
 
+    def test_japanese_long_vowels_and_gemination_collapse_to_mora_units(self) -> None:
+        self.assertEqual(
+            model_assist._phonetic_units("\u30b9\u30fc\u30d1\u30fc", language_hint="JP"),
+            ["su", "pa"],
+        )
+        self.assertEqual(
+            model_assist._phonetic_units("\u304c\u3063\u3053\u3046", language_hint="JP"),
+            ["ga", "ko"],
+        )
+        self.assertEqual(model_assist._phonetic_units("\u304d\u3087\u3046", language_hint="JP"), ["kyo"])
+        self.assertEqual(model_assist._phonetic_units("suupaa", language_hint="JP"), ["su", "pa"])
+        self.assertEqual(model_assist._phonetic_units("gakkou", language_hint="JP"), ["ga", "ko"])
+        self.assertEqual(model_assist._phonetic_units("aishite", language_hint="JP"), ["a", "i", "shi", "te"])
+        self.assertEqual(model_assist._phonetic_units("PlasticLove", language_hint="JP"), ["plasticlove"])
+
+    def test_orders_japanese_long_vowel_romaji_without_extra_clip_slots(self) -> None:
+        decisions = order_materials_for_reference(
+            [VoiceSegment(0.0, 2.0, "suupaa", language_hint="JP")],
+            [
+                MaterialAnalysis(Path("pa.wav"), transcript="", filename_text="pa", duration_seconds=1.0, language_hint="JP"),
+                MaterialAnalysis(Path("su.wav"), transcript="", filename_text="su", duration_seconds=1.0, language_hint="JP"),
+                MaterialAnalysis(Path("u.wav"), transcript="", filename_text="u", duration_seconds=1.0, language_hint="JP"),
+                MaterialAnalysis(Path("a.wav"), transcript="", filename_text="a", duration_seconds=1.0, language_hint="JP"),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in decisions], ["su.wav", "pa.wav"])
+        self.assertEqual([decision.phonetic_position for decision in decisions], [0, 1])
+
     def test_orders_japanese_kanji_lyrics_by_janome_pronunciation(self) -> None:
         with patch("audio_processor.model_assist._janome_tokenizer", return_value=self._fake_janome_tokenizer()):
             decisions = order_materials_for_reference(
@@ -3068,6 +3097,49 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(timings[2].start_seconds, 0.82)
         self.assertEqual(timings[2].end_seconds, 1.1)
 
+    def test_japanese_whisperx_char_entries_merge_long_vowels_into_mora_timings(self) -> None:
+        segment = {
+            "text": "\u30b9\u30fc\u30d1\u30fc",
+            "chars": [
+                {"char": "\u30b9", "start": 0.0, "end": 0.18, "score": 0.9},
+                {"char": "\u30fc", "start": 0.18, "end": 0.55, "score": 0.8},
+                {"char": "\u30d1", "start": 0.55, "end": 0.74, "score": 0.9},
+                {"char": "\u30fc", "start": 0.74, "end": 1.2, "score": 0.8},
+            ],
+        }
+
+        timings = model_runtime._unit_timings_from_aligned_chars(segment, language_hint="JP")
+
+        self.assertEqual([timing.unit for timing in timings], ["su", "pa"])
+        self.assertEqual([timing.position for timing in timings], [0, 1])
+        self.assertEqual(
+            [(round(timing.start_seconds, 6), round(timing.end_seconds, 6)) for timing in timings],
+            [(0.0, 0.55), (0.55, 1.2)],
+        )
+
+    def test_japanese_romaji_timeline_units_collapse_long_vowels_and_gemination(self) -> None:
+        self.assertEqual(model_runtime._timeline_units("suupaa", language_hint="JP"), ["su", "pa"])
+        self.assertEqual(model_runtime._timeline_units("gakkou", language_hint="JP"), ["ga", "ko"])
+        self.assertEqual(model_runtime._timeline_units("PlasticLove", language_hint="JP"), ["plasticlove"])
+
+    def test_japanese_lyric_long_vowel_retarget_keeps_original_span_duration(self) -> None:
+        timings = model_runtime._retarget_unit_timings_to_text(
+            (
+                VoiceUnitTiming(0, "x0", 0.0, 0.2, timing_source="whisperx_char_alignment"),
+                VoiceUnitTiming(1, "x1", 0.2, 0.55, timing_source="whisperx_char_alignment"),
+                VoiceUnitTiming(2, "x2", 0.55, 0.75, timing_source="whisperx_char_alignment"),
+                VoiceUnitTiming(3, "x3", 0.75, 1.2, timing_source="whisperx_char_alignment"),
+            ),
+            "\u30b9\u30fc\u30d1\u30fc",
+            language_hint="JP",
+        )
+
+        self.assertEqual([timing.unit for timing in timings], ["su", "pa"])
+        self.assertEqual(
+            [(round(timing.start_seconds, 6), round(timing.end_seconds, 6)) for timing in timings],
+            [(0.0, 0.55), (0.55, 1.2)],
+        )
+
     def test_funasr_timestamps_become_timeline_unit_timings(self) -> None:
         timings = model_runtime._unit_timings_from_funasr_timestamps(
             "\u6211\u7231 you",
@@ -3126,6 +3198,46 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(result["text"], "\u4f60\u597d")
         self.assertEqual(result["segments"][0].timing_source, "funasr_timestamp")
         self.assertEqual([timing.unit for timing in result["segments"][0].unit_timings], ["\u4f60", "\u597d"])
+
+    def test_transcribe_audio_skips_funasr_for_japanese_language_hint(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "input.wav"
+            _write_test_wave(audio)
+
+            with patch.dict(
+                os.environ,
+                {"VOCAL_PROCESS_ASR_BACKEND": "funasr", "VOCAL_PROCESS_ALLOW_MODEL_DOWNLOAD": "1"},
+                clear=False,
+            ):
+                with patch("audio_processor.model_runtime.ensure_runtime_tool_paths", return_value=[]):
+                    with patch("audio_processor.model_runtime._ensure_model_download_tls", return_value=None):
+                        with patch("audio_processor.model_runtime._speech_runtime_issue", return_value=""):
+                            with patch(
+                                "audio_processor.model_runtime._module_available",
+                                side_effect=lambda name: name in {"funasr", "whisper"},
+                            ):
+                                with patch("audio_processor.model_runtime._transcribe_with_funasr") as funasr_mock:
+                                    with patch(
+                                        "audio_processor.model_runtime._transcribe_with_whisper",
+                                        return_value={
+                                            "backend": "whisper",
+                                            "text": "\u3042\u3044",
+                                            "segments": [],
+                                            "notes": ["fallback"],
+                                        },
+                                    ) as whisper_mock:
+                                        result = model_runtime._transcribe_audio(
+                                            audio,
+                                            compute_device="cpu",
+                                            language_hint="JP",
+                                        )
+
+        self.assertEqual(result["backend"], "whisper")
+        funasr_mock.assert_not_called()
+        whisper_mock.assert_called_once()
+        self.assertIn("asr_backend_language_guard", whisper_mock.call_args.kwargs["fallback_note"])
+        self.assertEqual(whisper_mock.call_args.kwargs["language_hint"], "JP")
 
     def test_lrc_timestamps_are_parsed_but_conflicts_are_not_trusted_silently(self) -> None:
         with TemporaryDirectory() as temp_dir:
