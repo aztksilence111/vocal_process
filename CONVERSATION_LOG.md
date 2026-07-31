@@ -1,5 +1,25 @@
 # Conversation Log
 
+# Latest Update - 2026-07-31 Timeline Lattice Resample for Expanded Target Units
+
+1. This continuation kept the project context anchored on pronunciation-first ordering and pronunciation-level timing accuracy, then changed the timeline bridge so positioned spans can use a resampled unit lattice whenever the reference text unit count differs from the available aligned unit timings.
+2. `audio_processor.model_runtime` now builds a segment-level resampled lattice for positioned timing spans instead of dropping straight to proportional segment split when the original aligned unit timing count is shorter than the text/unit lattice implied by the reference segment and decision positions.
+3. Added a regression covering a 4-unit positioned sequence over only 2 aligned source units. The expected outcome is full aligned-duration coverage with resampled unit boundaries rather than partial fallback coverage.
+4. Full rendered real-eval verification at `tests_real\output\real-eval-20260731-080741\summary.json` completed 13/13 rendered cases. `missing_aligned_unit_timing` dropped from 5 to 1, `planning_alignment_score.mean` moved from 0.736374 to 0.764292, and `rendered_audio_alignment_score.mean` moved from 0.717274 to 0.740518.
+5. JP cohort timing coverage improved materially: `by_language JP` planning mean rose from 0.56293 to 0.64081 and render mean rose from 0.559459 to 0.625362. `1000nenyikiteru_JP__vmzJP`, `kamippoina_JP__vmzJP`, and `LAB=01_JP__vmzJP` now have `timed_target_duration_count` matching `positioned_decision_count`.
+6. The remaining `missing_aligned_unit_timing` warning is now isolated to `PlasticLove_JP__vmzJP`, which still has no aligned unit timings to resample.
+7. Verification passed: `.venv311\Scripts\python.exe -m unittest discover` with 146 tests, `.venv311\Scripts\python.exe -m compileall -q audio_processor tests`, `.venv311\Scripts\python.exe -m audio_processor check`, and the full rendered real-eval script.
+
+## Latest Update - 2026-07-31 Lyric Unit Retarget Resampling
+
+1. This continuation read the requested project context before editing. `E:\Workplace\demo\AGENTS.md` is still absent, so the AGENTS rules supplied in the user prompt were followed together with `PROJECT_RULES.md`.
+2. Current branch is `codex/cancel-phonetic-accuracy`; the worktree was clean before editing.
+3. `audio_processor.model_runtime._retarget_unit_timings_to_text()` now keeps exact one-to-one unit timing mapping when lyric and source unit counts match, and resamples source timing boundaries across lyric units when they differ.
+4. Added a regression covering Japanese lyric annotation collapse with shorter source timing coverage. The lyric text `愛して（あいして） / aishite` now collapses to one target phrase while still expanding to `a / i / shi / te` unit timings that preserve the full source span.
+5. Verification passed: the new targeted lyric tests, full `tests.test_engine.ModelRuntimeTests`, `python -m unittest discover` with 145 tests, `compileall -q audio_processor tests`, and `audio_processor check`.
+6. The new timing path keeps lyric text as the target-unit authority while preserving the original vocal timing span for rendered alignment.
+7. Remaining follow-up for the next cycle: observe whether any real-eval cases still need segment-level lyric/source pairing beyond the current per-segment unit retargeting.
+
 ## Latest Update - 2026-07-30 Autonomous Cycle 1 Cancellation and Runtime Repair
 
 1. This continuation read the requested project context before editing. `E:\Workplace\demo\AGENTS.md` is still absent, so the AGENTS rules supplied in the user prompt were followed together with `PROJECT_RULES.md`.

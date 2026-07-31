@@ -1,5 +1,22 @@
 # Project Analysis
 
+## Latest Update - 2026-07-31 Lyric Timing Resample for Target-Unit Authority
+# Latest Update - 2026-07-31 Timeline Lattice Resample for Target-Unit Coverage
+
+This continuation widened the timing bridge in `audio_processor.model_runtime` beyond the previous lyric-retarget path. When a reference segment has fewer aligned unit timings than the unit lattice implied by its text and positioned decisions, the runtime now resamples the segment-level timing lattice first and then resolves positioned spans against that complete lattice. That keeps positioned timing on the aligned-unit path instead of dropping later decisions to proportional segment split just because the source alignment is coarser than the text lattice.
+
+The change is intentionally general. It does not special-case songs or filenames, and it does not lower duration tolerances. It treats the original aligned timing span as the source truth, but projects it onto the target unit lattice whenever the existing timing density is too sparse for one-to-one coverage. A regression now covers the 4-target-unit / 2-source-unit case so the coverage behavior stays locked in.
+
+Full rendered real-eval verification at `tests_real\output\real-eval-20260731-080741\summary.json` completed 13/13 rendered cases. Suite metrics improved from the prior full run: `planning_alignment_score.mean` 0.736374 -> 0.764292, `rendered_audio_alignment_score.mean` 0.717274 -> 0.740518, `render_duration_delta_ratio.mean` 0.340026 -> 0.330804, and `missing_aligned_unit_timing` 5 -> 1. JP timing coverage improved most: `by_language JP` planning mean 0.56293 -> 0.64081 and render mean 0.559459 -> 0.625362. `1000nenyikiteru_JP__vmzJP`, `kamippoina_JP__vmzJP`, and `LAB=01_JP__vmzJP` now report `timed_target_duration_count == positioned_decision_count`; only `PlasticLove_JP__vmzJP` still lacks aligned unit timings entirely.
+
+## Latest Update - 2026-07-31 Lyric Timing Resample for Target-Unit Authority
+
+This continuation tightened the lyric-to-timing bridge in `audio_processor.model_runtime`. `_retarget_unit_timings_to_text()` now preserves exact source timings when the lyric unit count matches the original aligned timing count, and falls back to a monotonic resample across the source timing span when the counts differ. That means Japanese lyric collapse can still keep one target phrase while expanding to pronunciation units without dropping timing coverage.
+
+The practical effect is that lyric text remains the absolute target-unit authority, while original vocal timing still defines the rendered start/end span for each unit whenever aligned source timing exists. This reduces the chance that annotation collapse, kana/romaji normalization, or coarse source alignment will zero out `unit_timings` and force duration planning back to a weaker proportional split.
+
+Verification passed with the new lyric coverage regression, the full `tests.test_engine.ModelRuntimeTests` class, `python -m unittest discover` with 145 tests, `compileall -q audio_processor tests`, and `audio_processor check`. The remaining architectural gap is segment-level pairing when lyric and transcript segment counts diverge more than the current per-segment retargeting can cover.
+
 ## Latest Update - 2026-07-30 Cancellation-Aware Real-Eval Repair
 
 This continuation focused on making the rendered real-eval loop recoverable enough for the next pronunciation-ordering pass. The latest full rendered run reached real model execution but failed 12 of 13 compatible cases because Python/SpeechBrain introspection loaded the optional `speechbrain.integrations.k2_fsa` module and then failed on missing `k2`. The retained compatibility layer keeps unloaded SpeechBrain lazy modules from resolving `__file__` through optional imports, while preserving normal lazy import behavior for real attributes.

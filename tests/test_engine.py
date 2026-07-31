@@ -2510,6 +2510,90 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(summary["target_duration_total_seconds"], 0.9)
         self.assertEqual(summary["timed_target_duration_count"], 2)
 
+    def test_positioned_decisions_resample_unit_timing_lattice_when_target_units_expand(self) -> None:
+        reference_segments = [
+            VoiceSegment(
+                0.0,
+                4.0,
+                "a b c d",
+                unit_timings=(
+                    VoiceUnitTiming(0, "a", 0.0, 1.0, timing_source="test_alignment"),
+                    VoiceUnitTiming(1, "b", 1.0, 4.0, timing_source="test_alignment"),
+                ),
+            )
+        ]
+        decisions = [
+            MaterialOrderDecision(
+                rank=1,
+                material_path=Path("a.wav"),
+                score=0.9,
+                reference_text="a b c d",
+                material_text="a",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=0,
+                phonetic_position=0,
+                phonetic_position_count=1,
+                phonetic_span_units=1,
+                confidence_label="strong",
+            ),
+            MaterialOrderDecision(
+                rank=2,
+                material_path=Path("b.wav"),
+                score=0.9,
+                reference_text="a b c d",
+                material_text="b",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=1,
+                phonetic_position=1,
+                phonetic_position_count=1,
+                phonetic_span_units=1,
+                confidence_label="strong",
+            ),
+            MaterialOrderDecision(
+                rank=3,
+                material_path=Path("c.wav"),
+                score=0.9,
+                reference_text="a b c d",
+                material_text="c",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=2,
+                phonetic_position=2,
+                phonetic_position_count=1,
+                phonetic_span_units=1,
+                confidence_label="strong",
+            ),
+            MaterialOrderDecision(
+                rank=4,
+                material_path=Path("d.wav"),
+                score=0.9,
+                reference_text="a b c d",
+                material_text="d",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=3,
+                phonetic_position=3,
+                phonetic_position_count=1,
+                phonetic_span_units=1,
+                confidence_label="strong",
+            ),
+        ]
+
+        target_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=4.0,
+        )
+        summary = model_runtime._render_timeline_alignment_summary(reference_segments, decisions, target_durations)
+
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (0.5, 0.5, 1.5, 1.5))
+        self.assertEqual(summary["timed_target_duration_count"], 4)
+        self.assertEqual(summary["mode"], "aligned_unit_timing")
+        self.assertTrue(all(detail["target_duration_source"] == "aligned_unit_timing" for detail in summary["decision_details"]))
+        self.assertTrue(all(detail["timing_lattice_resampled"] for detail in summary["decision_details"]))
+
     def test_funasr_unit_slots_are_scaled_to_reference_duration_when_gaps_are_sparse(self) -> None:
         reference_segments = [
             VoiceSegment(
@@ -2985,6 +3069,34 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(segments[0].timing_source, "asr_segment_with_lyric_text")
         self.assertEqual([timing.unit for timing in segments[0].unit_timings], ["a", "i", "shi", "te"])
         self.assertEqual([round(timing.duration_seconds, 6) for timing in segments[0].unit_timings], [0.2, 0.5, 0.7, 0.6])
+
+    def test_japanese_lyrics_annotations_keep_full_timing_coverage_when_units_expand(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "song_JP.txt"
+            lyrics.write_text("\u611b\u3057\u3066\uff08\u3042\u3044\u3057\u3066\uff09 / aishite\n", encoding="utf-8")
+            transcript_segments = [
+                model_runtime.TranscriptSegment(
+                    0.0,
+                    1.0,
+                    "ignored",
+                    timing_source="whisperx_char_alignment",
+                    unit_timings=(
+                        VoiceUnitTiming(0, "x0", 0.0, 0.3, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(1, "x1", 0.3, 1.0, timing_source="whisperx_char_alignment"),
+                    ),
+                )
+            ]
+
+            with patch("audio_processor.model_assist._janome_tokenizer", return_value=ModelAssistTests._fake_janome_tokenizer()):
+                segments = model_runtime._segments_from_transcript(transcript_segments, lyrics_file=lyrics)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].text, "\u611b\u3057\u3066")
+        self.assertEqual([timing.unit for timing in segments[0].unit_timings], ["a", "i", "shi", "te"])
+        self.assertAlmostEqual(segments[0].unit_timings[0].start_seconds, 0.0)
+        self.assertAlmostEqual(segments[0].unit_timings[-1].end_seconds, 1.0)
+        self.assertAlmostEqual(sum(timing.duration_seconds for timing in segments[0].unit_timings), 1.0)
 
     def test_auto_asr_skips_uncached_accelerated_backends(self) -> None:
         with TemporaryDirectory() as temp_dir:

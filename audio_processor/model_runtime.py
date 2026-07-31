@@ -2866,19 +2866,118 @@ def _retarget_unit_timings_to_text(
     if not timings:
         return ()
     units = _timeline_units(text, language_hint=language_hint)
-    if len(units) != len(timings):
+    if not units:
         return ()
+    if len(units) == len(timings):
+        source_timing_source = timings[0].timing_source
+        if source_timing_source:
+            source_timing_source = f"{source_timing_source}_retargeted_to_lyrics"
+        else:
+            source_timing_source = "retargeted_to_lyrics"
+        return tuple(
+            VoiceUnitTiming(
+                position=index,
+                unit=unit,
+                start_seconds=timing.start_seconds,
+                end_seconds=timing.end_seconds,
+                confidence=timing.confidence,
+                timing_source=source_timing_source,
+            )
+            for index, (unit, timing) in enumerate(zip(units, timings))
+        )
+    return _retarget_unit_timings_by_resampling(timings, units)
+
+
+def _retarget_unit_timings_by_resampling(
+    timings: Sequence[VoiceUnitTiming],
+    units: Sequence[str],
+) -> tuple[VoiceUnitTiming, ...]:
+    if not timings or not units:
+        return ()
+
+    source_start = min(timing.start_seconds for timing in timings)
+    source_end = max(timing.end_seconds for timing in timings)
+    if source_end <= source_start:
+        return ()
+
+    source_weights = [max(timing.duration_seconds, 0.0) for timing in timings]
+    if sum(source_weights) <= 0:
+        source_weights = [1.0 for _ in timings]
+
+    source_boundaries = _retarget_boundary_points(source_start, source_end, source_weights)
+    if len(source_boundaries) <= 1:
+        return ()
+
+    confidence = _mean_optional_float(timing.confidence for timing in timings)
+    timing_source = timings[0].timing_source
+    if timing_source:
+        timing_source = f"{timing_source}_retargeted_to_lyrics"
+    else:
+        timing_source = "retargeted_to_lyrics"
+
+    source_count = len(timings)
+    target_count = len(units)
     return tuple(
         VoiceUnitTiming(
             position=index,
             unit=unit,
-            start_seconds=timing.start_seconds,
-            end_seconds=timing.end_seconds,
-            confidence=timing.confidence,
-            timing_source=f"{timing.timing_source}_retargeted_to_lyrics",
+            start_seconds=_interpolate_boundary_point(source_boundaries, (index * source_count) / target_count),
+            end_seconds=_interpolate_boundary_point(
+                source_boundaries,
+                ((index + 1) * source_count) / target_count,
+            ),
+            confidence=confidence,
+            timing_source=timing_source,
         )
-        for index, (unit, timing) in enumerate(zip(units, timings))
+        for index, unit in enumerate(units)
     )
+
+
+def _retarget_boundary_points(
+    source_start: float,
+    source_end: float,
+    weights: Sequence[float],
+) -> list[float]:
+    total_weight = sum(max(float(weight), 0.0) for weight in weights)
+    if total_weight <= 0:
+        count = max(len(weights), 1)
+        span = max(source_end - source_start, 0.0)
+        return [
+            source_start + (span * index / count)
+            for index in range(count + 1)
+        ]
+
+    span = max(source_end - source_start, 0.0)
+    boundaries = [source_start]
+    cumulative = 0.0
+    for weight in weights:
+        cumulative += max(float(weight), 0.0)
+        boundaries.append(source_start + (span * cumulative / total_weight))
+    return boundaries
+
+
+def _interpolate_boundary_point(boundaries: Sequence[float], position: float) -> float:
+    if not boundaries:
+        return 0.0
+    if position <= 0:
+        return float(boundaries[0])
+    last_index = len(boundaries) - 1
+    if position >= last_index:
+        return float(boundaries[-1])
+
+    left_index = int(position)
+    right_index = min(left_index + 1, last_index)
+    fraction = position - left_index
+    left_value = float(boundaries[left_index])
+    right_value = float(boundaries[right_index])
+    return left_value + ((right_value - left_value) * fraction)
+
+
+def _mean_optional_float(values: Iterable[float | None]) -> float | None:
+    collected = [float(value) for value in values if value is not None]
+    if not collected:
+        return None
+    return sum(collected) / len(collected)
 
 
 def reference_duration_for(path: Path) -> float:
@@ -2892,6 +2991,7 @@ class _TimedUnitSpan:
     aligned_unit_count: int
     expected_unit_count: int
     timing_source: str
+    resampled: bool = False
 
     @property
     def duration_seconds(self) -> float:
@@ -3045,6 +3145,8 @@ def _render_timeline_alignment_details(
             continue
 
         unit_count = _positioned_group_unit_count(segment, group)
+        segment_timings = _segment_unit_timings_for_lattice(segment, unit_count)
+        lattice_resampled = _timing_lattice_needs_resampling(segment.unit_timings, unit_count)
         complete_position_cover = _positioned_group_covers_segment(group, unit_count)
         ordered_group = sorted(group, key=lambda item: (_decision_position(item[1]) or 0, item[1].rank))
         for group_index, (decision_index, decision) in enumerate(ordered_group):
@@ -3066,7 +3168,12 @@ def _render_timeline_alignment_details(
                 end_unit = start_unit + material_units
 
             span_units = max(min(end_unit, unit_count) - start_unit, 1)
-            timed_span = _timed_unit_span(segment, start_unit, end_unit)
+            timed_span = _timed_unit_span(
+                segment_timings,
+                start_unit,
+                end_unit,
+                resampled=lattice_resampled,
+            )
             target_duration = target_durations[decision_index]
             language_hint = decision.language_hint or segment.language_hint
             reference_text_units = list(_timeline_units(segment.text, language_hint=language_hint))
@@ -3112,6 +3219,9 @@ def _render_timeline_alignment_details(
                 ),
                 "aligned_unit_count": timed_span.aligned_unit_count if timed_span is not None else 0,
                 "expected_unit_count": timed_span.expected_unit_count if timed_span is not None else span_units,
+                "timing_lattice_resampled": (
+                    timed_span.resampled if timed_span is not None else lattice_resampled
+                ),
                 "target_duration_ratio": (
                     float(target_duration) / segment.duration_seconds
                     if target_duration is not None and segment.duration_seconds > 0
@@ -3218,6 +3328,8 @@ def _positioned_target_durations(
             continue
 
         unit_count = _positioned_group_unit_count(segment, group)
+        segment_timings = _segment_unit_timings_for_lattice(segment, unit_count)
+        lattice_resampled = _timing_lattice_needs_resampling(segment.unit_timings, unit_count)
         complete_position_cover = _positioned_group_covers_segment(group, unit_count)
         ordered_group = sorted(group, key=lambda item: (_decision_position(item[1]) or 0, item[1].rank))
         if len(ordered_group) == 1:
@@ -3225,7 +3337,12 @@ def _positioned_target_durations(
             start_unit = min(max(_decision_position(decision) or 0, 0), unit_count - 1)
             material_units = _decision_timeline_unit_count(decision)
             end_unit = min(start_unit + max(material_units, 1), unit_count)
-            timed_span = _timed_unit_span(segment, start_unit, end_unit)
+            timed_span = _timed_unit_span(
+                segment_timings,
+                start_unit,
+                end_unit,
+                resampled=lattice_resampled,
+            )
             if timed_span is not None and timed_span.duration_seconds > 0:
                 targets[decision_index] = timed_span.duration_seconds
             else:
@@ -3248,7 +3365,12 @@ def _positioned_target_durations(
                 end_unit = start_unit + material_units
 
             span_units = max(min(end_unit, unit_count) - start_unit, 1)
-            timed_span = _timed_unit_span(segment, start_unit, end_unit)
+            timed_span = _timed_unit_span(
+                segment_timings,
+                start_unit,
+                end_unit,
+                resampled=lattice_resampled,
+            )
             if timed_span is not None and timed_span.duration_seconds > 0:
                 targets[decision_index] = timed_span.duration_seconds
             else:
@@ -3301,36 +3423,77 @@ def _can_preserve_positioned_target_total(
     return 0.92 <= ratio <= 1.08
 
 
-def _timed_unit_span(segment: VoiceSegment, start_unit: int, end_unit: int) -> _TimedUnitSpan | None:
+def _timed_unit_span(
+    timings: Sequence[VoiceUnitTiming],
+    start_unit: int,
+    end_unit: int,
+    *,
+    resampled: bool = False,
+) -> _TimedUnitSpan | None:
     expected_unit_count = max(end_unit - start_unit, 1)
-    if not segment.unit_timings or expected_unit_count <= 0:
+    if not timings or expected_unit_count <= 0:
         return None
 
     by_position = {
         timing.position: timing
-        for timing in segment.unit_timings
+        for timing in timings
         if timing.duration_seconds > 0
     }
-    timings: list[VoiceUnitTiming] = []
+    timings_in_range: list[VoiceUnitTiming] = []
     for position in range(start_unit, end_unit):
         timing = by_position.get(position)
         if timing is None:
             return None
-        timings.append(timing)
-    if len(timings) != expected_unit_count:
+        timings_in_range.append(timing)
+    if len(timings_in_range) != expected_unit_count:
         return None
 
-    start_seconds = min(timing.start_seconds for timing in timings)
-    end_seconds = _slot_timing_end_seconds(by_position, end_unit, timings[-1])
+    start_seconds = min(timing.start_seconds for timing in timings_in_range)
+    end_seconds = _slot_timing_end_seconds(by_position, end_unit, timings_in_range[-1])
     if end_seconds <= start_seconds:
         return None
     return _TimedUnitSpan(
         start_seconds=start_seconds,
         end_seconds=end_seconds,
-        aligned_unit_count=len(timings),
+        aligned_unit_count=len(timings_in_range),
         expected_unit_count=expected_unit_count,
         timing_source="aligned_unit_timing",
+        resampled=resampled,
     )
+
+
+def _segment_unit_timings_for_lattice(
+    segment: VoiceSegment,
+    unit_count: int,
+) -> tuple[VoiceUnitTiming, ...]:
+    timings = tuple(
+        sorted(
+            (
+                timing
+                for timing in segment.unit_timings
+                if timing.duration_seconds > 0
+            ),
+            key=lambda timing: (timing.position, timing.start_seconds, timing.end_seconds),
+        )
+    )
+    if not timings:
+        return ()
+    if not _timing_lattice_needs_resampling(timings, unit_count):
+        return timings
+    if unit_count <= 0:
+        return timings
+    placeholder_units = [str(index) for index in range(unit_count)]
+    return _retarget_unit_timings_by_resampling(timings, placeholder_units)
+
+
+def _timing_lattice_needs_resampling(
+    timings: Sequence[VoiceUnitTiming],
+    unit_count: int,
+) -> bool:
+    if unit_count <= 0 or not timings:
+        return False
+    positions = sorted(timing.position for timing in timings)
+    return positions != list(range(unit_count))
 
 
 def _slot_timing_end_seconds(
