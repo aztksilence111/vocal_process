@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -54,6 +55,9 @@ class MaterialStretchClip:
     requested_tempo: float | None = None
     stretch_strategy: str = "rubberband_full_clip"
     text_hint: str = ""
+    fade_seconds: float = 0.0
+    stretch_naturalness_score: float = 1.0
+    continuity_warning: str = ""
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {
@@ -73,7 +77,11 @@ RUBBERBAND_MAX_TEMPO = 100.0
 DAW_WAV_CODEC = "pcm_s24le"
 MIN_MATERIAL_TARGET_DURATION_SECONDS = 0.001
 RENDERED_CLIP_CONCAT_LIST_THRESHOLD = 64
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v2_exact_target_atrim"
+MATERIAL_RENDER_FADE_SECONDS = 0.010
+MATERIAL_RENDER_MIN_FADE_SECONDS = 0.002
+MATERIAL_RENDER_MIN_FADE_TARGET_SECONDS = 0.050
+MATERIAL_RENDER_FADE_TARGET_FRACTION = 0.08
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v3_exact_target_fade"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -713,6 +721,9 @@ def plan_material_stretch_clips(
                 requested_tempo=requested_tempo,
                 stretch_strategy=strategy,
                 text_hint=text_hint,
+                fade_seconds=_material_clip_fade_seconds(target_duration),
+                stretch_naturalness_score=_stretch_naturalness_score(requested_tempo, text_hint),
+                continuity_warning=_stretch_continuity_warning(requested_tempo, text_hint),
             )
         )
     return clips
@@ -730,6 +741,11 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "stretch_strategy": clip.stretch_strategy,
             "text_hint": clip.text_hint,
             "quality_warning": clip.quality_warning,
+            "fade_seconds": clip.fade_seconds,
+            "boundary_conditioning": "fade_in_out" if clip.fade_seconds > 0 else "",
+            "formant_preservation": "rubberband_formant_preserved",
+            "stretch_naturalness_score": clip.stretch_naturalness_score,
+            "continuity_warning": clip.continuity_warning,
         }
         for clip in clips
     ]
@@ -871,11 +887,20 @@ def _build_material_clip_filter(
 
 
 def _target_duration_filters(target_duration: float) -> list[str]:
-    return [
+    filters = [
         f"apad=whole_dur={target_duration:.6f}",
         f"atrim=duration={target_duration:.6f}",
-        "asetpts=N/SR/TB",
     ]
+    fade_seconds = _material_clip_fade_seconds(target_duration)
+    if fade_seconds > 0:
+        filters.extend(
+            [
+                f"afade=t=in:st=0:d={fade_seconds:.6f}",
+                f"afade=t=out:st={max(target_duration - fade_seconds, 0.0):.6f}:d={fade_seconds:.6f}",
+            ]
+        )
+    filters.append("asetpts=N/SR/TB")
+    return filters
 
 
 def _rubberband_filter(tempo: float) -> str:
@@ -1087,6 +1112,42 @@ def _is_short_material_text(text: str) -> bool:
     units = re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", text.lower())
     compact = "".join(units)
     return 0 < len(compact) <= 4
+
+
+def _material_clip_fade_seconds(target_duration: float) -> float:
+    if target_duration < MATERIAL_RENDER_MIN_FADE_TARGET_SECONDS:
+        return 0.0
+    fade = min(MATERIAL_RENDER_FADE_SECONDS, target_duration * MATERIAL_RENDER_FADE_TARGET_FRACTION)
+    return max(fade, MATERIAL_RENDER_MIN_FADE_SECONDS)
+
+
+def _stretch_naturalness_score(requested_tempo: float, text_hint: str = "") -> float:
+    if requested_tempo <= 0:
+        return 0.0
+    ratio = max(requested_tempo, 1.0 / requested_tempo)
+    if ratio <= 1.0:
+        score = 1.0
+    else:
+        score = max(1.0 - (math.log(ratio, 2) / 2.5), 0.0)
+    if _is_short_material_text(text_hint):
+        if ratio >= 2.0:
+            score *= 0.65
+        elif ratio >= 1.5:
+            score *= 0.85
+    return max(min(score, 1.0), 0.0)
+
+
+def _stretch_continuity_warning(requested_tempo: float, text_hint: str = "") -> str:
+    if requested_tempo <= 0:
+        return "invalid_stretch_ratio"
+    ratio = max(requested_tempo, 1.0 / requested_tempo)
+    if _is_short_material_text(text_hint) and ratio >= 2.0:
+        return "single_syllable_boundary_risk"
+    if ratio >= 3.0:
+        return "extreme_boundary_risk"
+    if ratio >= 1.75:
+        return "moderate_boundary_risk"
+    return ""
 
 
 def _material_render_cache_key(clip: MaterialStretchClip, options: ProcessOptions) -> str:

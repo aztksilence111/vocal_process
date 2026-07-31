@@ -39,6 +39,7 @@ def build_preflight_report(
         reference_path,
         ordering.ordered_paths,
         target_durations=ordering.target_durations,
+        material_text_hints=[decision.material_text for decision in ordering.decisions],
     )
     warnings = _preflight_warnings(ordering, stretch_plan)
     lyric_conflict_count = sum(1 for warning in warnings if warning.get("kind") == "lyric_timing_conflict")
@@ -64,6 +65,11 @@ def build_preflight_report(
             ),
             "moderate_stretch_count": sum(
                 1 for clip in stretch_plan if clip.quality_warning == "moderate_stretch_ratio"
+            ),
+            "continuity_warning_count": sum(1 for clip in stretch_plan if clip.continuity_warning),
+            "fade_applied_clip_count": sum(1 for clip in stretch_plan if clip.fade_seconds > 0),
+            "stretch_naturalness_score_mean": _mean(
+                [clip.stretch_naturalness_score for clip in stretch_plan]
             ),
         },
         "warnings": warnings,
@@ -235,7 +241,32 @@ def _preflight_warnings(
                 "source_duration_seconds": clip.source_duration_seconds,
                 "target_duration_seconds": clip.target_duration_seconds,
                 "rubberband_tempo": clip.tempo,
+                "requested_rubberband_tempo": clip.requested_tempo,
+                "stretch_naturalness_score": clip.stretch_naturalness_score,
+                "fade_seconds": clip.fade_seconds,
                 "message": "Stretch ratio may damage pronunciation intelligibility.",
+            }
+        )
+
+    for clip in stretch_plan:
+        if not clip.continuity_warning:
+            continue
+        warnings.append(
+            {
+                "severity": "warning",
+                "kind": clip.continuity_warning,
+                "rank": clip.index,
+                "material_path": str(clip.source_path),
+                "source_duration_seconds": clip.source_duration_seconds,
+                "target_duration_seconds": clip.target_duration_seconds,
+                "rubberband_tempo": clip.tempo,
+                "requested_rubberband_tempo": clip.requested_tempo,
+                "stretch_naturalness_score": clip.stretch_naturalness_score,
+                "fade_seconds": clip.fade_seconds,
+                "message": (
+                    "Rendered clip uses exact target duration with short boundary fades, but this stretch ratio "
+                    "can still sound discontinuous at syllable boundaries."
+                ),
             }
         )
 
@@ -275,6 +306,12 @@ def _positive_int(value: Any) -> int:
         return 0
 
 
+def _mean(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
 def _optimization_report(
     ordering: ModelOrderingResult,
     stretch_plan: Sequence[MaterialStretchClip],
@@ -282,11 +319,22 @@ def _optimization_report(
     duplicate_render_groups = _duplicate_render_groups(stretch_plan)
     repeated_text_groups = _repeated_reference_text_groups(ordering)
     backend_summary = ordering.analysis_report.get("backend_summary", {})
+    continuity_warning_groups = _continuity_warning_groups(stretch_plan)
     return {
         "format": "vocal_process_optimization_report_v1",
         "safe_duplicate_clip_render_reuse_count": sum(len(group["ranks"]) - 1 for group in duplicate_render_groups),
         "duplicate_clip_render_groups": duplicate_render_groups,
         "repeated_reference_text_groups": repeated_text_groups,
+        "render_continuity": {
+            "formant_preservation": "rubberband_formant_preserved",
+            "boundary_conditioning": "per_clip_fade_in_out",
+            "fade_applied_clip_count": sum(1 for clip in stretch_plan if clip.fade_seconds > 0),
+            "continuity_warning_count": sum(1 for clip in stretch_plan if clip.continuity_warning),
+            "stretch_naturalness_score_mean": _mean(
+                [clip.stretch_naturalness_score for clip in stretch_plan]
+            ),
+            "continuity_warning_groups": continuity_warning_groups,
+        },
         "available_acceleration": {
             "faster_whisper": bool(backend_summary.get("Faster Whisper")),
             "cuda_requested_or_available": ordering.analysis_report.get("compute_device") == "cuda",
@@ -298,6 +346,7 @@ def _optimization_report(
         "notes": [
             "Rendered audio is reused only when source file, target duration, tempo, and render options match exactly.",
             "Verse/chorus similarity is reported as a planning hint; it is not used to skip ASR or change words automatically.",
+            "Formant-preserved Rubber Band stretching is used for each material clip before exact-duration trim and short boundary fades.",
         ],
     }
 
@@ -321,6 +370,23 @@ def _duplicate_render_groups(stretch_plan: Sequence[MaterialStretchClip]) -> lis
         }
         for clips in groups.values()
         if len(clips) > 1
+    ]
+
+
+def _continuity_warning_groups(stretch_plan: Sequence[MaterialStretchClip]) -> list[dict[str, Any]]:
+    groups: dict[str, list[MaterialStretchClip]] = {}
+    for clip in stretch_plan:
+        if clip.continuity_warning:
+            groups.setdefault(clip.continuity_warning, []).append(clip)
+
+    return [
+        {
+            "kind": kind,
+            "count": len(clips),
+            "ranks": [clip.index for clip in clips[:20]],
+            "worst_stretch_naturalness_score": min(clip.stretch_naturalness_score for clip in clips),
+        }
+        for kind, clips in sorted(groups.items())
     ]
 
 

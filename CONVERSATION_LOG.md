@@ -1395,3 +1395,13 @@ Remaining after this continuation:
 6. GUI 新增“帮助”和“更新日志”按钮，均以弹窗显示中英文说明，不把长说明堆到主界面。
 7. 依赖与打包同步加入 `janome>=0.5,<0.6`，便携打包收集 Janome，`audio_processor check` 现在会显示 `Janome: available`。
 8. 验证通过：`.venv311\Scripts\python.exe -m compileall -q audio_processor tests`；`.venv311\Scripts\python.exe -m unittest discover` 共 144 项通过；`.venv311\Scripts\python.exe -m audio_processor check` 通过；`git diff --check` 仅有 CRLF 提示。
+### 2026-07-31: 渲染连续性、自然拉伸评分与边界风险诊断
+
+1. 用户反馈导出拼接音频连续性较差，并怀疑拉伸没有保持共振峰。检查后确认现有渲染链路已经使用 FFmpeg Rubber Band 的 `pitch=1:formant=preserved`，因此本轮没有取消共振峰保护，而是在其后补齐边界和过度拉伸问题。
+2. `engine.py` 的素材 clip 渲染 filter 已升级为 `material_render_filter_v3_exact_target_fade`：每段素材先走 Rubber Band 共振峰保持拉伸，再 `apad` / `atrim` 到目标时长，最后按目标时长加入短淡入淡出，降低硬拼接边界爆音和断裂感。渲染缓存 key 已随 filter 版本变化，避免复用旧缓存。
+3. 每个 `MaterialStretchClip` 现在记录 `fade_seconds`、`stretch_naturalness_score`、`continuity_warning` 和 `formant_preservation`。自然度分按请求变速倍率衰减，短字音素材在 1.5x/2x 以上额外扣分，边界风险区分 `single_syllable_boundary_risk`、`moderate_boundary_risk`、`extreme_boundary_risk`。
+4. preflight 现在把排序决策中的 `material_text` 传入渲染计划，避免单字/短音素材被当成无文本素材处理；报告 summary 增加 `continuity_warning_count`、`fade_applied_clip_count` 和 `stretch_naturalness_score_mean`，optimization 增加 `render_continuity` 分组，方便复查失败原因和后续自动优化。
+5. real-eval 评分不再只用 `extreme_stretch_count` / `moderate_stretch_count` 粗略扣分；新增 `stretch_warning_score`、`stretch_naturalness_score`、`continuity_warning_ratio`、`continuity_score` 和综合 `stretch_quality_score`，并纳入 `planning_alignment_score` 的拉伸质量部分。严格验收条件没有放松，低匹配、未对齐时长和错误告警仍会阻止 strict pass。
+6. 排序逻辑在同发音候选和 fallback 候选之间加入自然拉伸因素，仍保持发音匹配为主，不用听感分覆盖错字音。这样能优先选择更接近原人声单字目标时长的同音素材，减少后续极端拉伸。
+7. 单元测试已覆盖：FFmpeg filter 包含淡入淡出、短字音极端拉伸风险、preflight 文本 hint 贯通、同音候选自然拉伸优先、real-eval 套件汇总和 Markdown 报告新增拉伸/边界指标。
+8. 验证通过：`.venv311\Scripts\python.exe -m compileall -q audio_processor tests`；相关 93 项单测；完整 `.venv311\Scripts\python.exe -m unittest discover` 共 149 项；`.venv311\Scripts\python.exe -m audio_processor check`；`git diff --check` 仅有 CRLF 提示；临时双素材真实 FFmpeg 渲染 smoke 输出时长为 2.000000 秒。

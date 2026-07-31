@@ -735,14 +735,20 @@ def _reference_position_selection_score(
         if target_duration is not None and target_duration > 0
         else 0.0
     )
+    stretch_naturalness_score = _stretch_naturalness_score_for_target(
+        target_duration,
+        material.duration_seconds,
+        _material_display_text(material),
+    )
     source_bonus = 0.10 if position_candidate.source.startswith("filename") else 0.0
     tone_bonus = 0.06 if position_candidate.tone_matched else 0.0
     ambiguity_count = score.phonetic_tone_position_count if position_candidate.tone_matched else score.phonetic_position_count
     ambiguity_penalty = 0.05 if ambiguity_count > 1 else 0.0
     phonetic_score = max(score.phonetic_score, score.phonetic_tone_score if position_candidate.tone_matched else 0.0)
     selection_score = (
-        (0.58 * phonetic_score)
-        + (0.24 * duration_score)
+        (0.56 * phonetic_score)
+        + (0.14 * duration_score)
+        + (0.12 * stretch_naturalness_score)
         + (0.07 * score.vad_score)
         + (0.06 * score.speaker_score)
         + source_bonus
@@ -766,10 +772,16 @@ def _fallback_reference_position_selection_score(
         if target_duration is not None and target_duration > 0
         else 0.0
     )
+    stretch_naturalness_score = _stretch_naturalness_score_for_target(
+        target_duration,
+        material.duration_seconds,
+        _material_display_text(material),
+    )
     unit_similarity = _target_unit_similarity(reference_units, position, material_units)
     selection_score = (
-        (0.42 * unit_similarity)
-        + (0.26 * duration_score)
+        (0.38 * unit_similarity)
+        + (0.16 * duration_score)
+        + (0.14 * stretch_naturalness_score)
         + (0.08 * score.vad_score)
         + (0.04 * score.speaker_score)
     )
@@ -2416,6 +2428,26 @@ def _duration_similarity(reference_seconds: float, material_seconds: float | Non
 
     distance = abs(math.log(ratio))
     return max(min(math.exp(-distance), 1.0), 0.0)
+
+
+def _stretch_naturalness_score_for_target(
+    target_seconds: float | None,
+    material_seconds: float | None,
+    text_hint: str,
+) -> float:
+    if target_seconds is None or target_seconds <= 0 or material_seconds is None or material_seconds <= 0:
+        return 0.0
+    requested_tempo = material_seconds / target_seconds
+    if requested_tempo <= 0:
+        return 0.0
+    ratio = max(requested_tempo, 1.0 / requested_tempo)
+    score = max(1.0 - (math.log(ratio, 2) / 2.5), 0.0)
+    if _is_short_reference_text(text_hint):
+        if ratio >= 2.0:
+            score *= 0.65
+        elif ratio >= 1.5:
+            score *= 0.85
+    return max(min(score, 1.0), 0.0)
 
 
 def _candidate_score(

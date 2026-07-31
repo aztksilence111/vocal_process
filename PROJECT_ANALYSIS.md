@@ -1414,3 +1414,25 @@ Acceptance impact:
 1. 优先跑完整 rendered real-eval，直接用 `timed_target_duration_ratio`、`aligned_timing_score`、`missing_aligned_unit_timing`、`rendered_audio_alignment_score` 和 `render_duration_delta_ratio` 判断时间轴对齐。
 2. 修改必须来自真实失败分布和最差 group，不允许针对歌曲名、素材名或单个案例硬编码。
 3. 若真实跑分仍显示时间轴问题，优先检查 unit timing 覆盖、歌词单元数与 ASR timing 数不一致、multi-unit span 合并过宽、以及 extreme stretch 是否来自素材缺失而不是渲染 bug。
+### 2026-07-31: 渲染连续性与拉伸质量进入验收指标
+
+本轮把“拼接音频连续性差”从主观听感问题拆成三个可度量层：渲染 filter 是否保持共振峰并处理边界、素材相对目标时长的自然拉伸程度、以及短字音/极端变速导致的边界风险。现有 Rubber Band `formant=preserved` 已经存在，因此架构上不应把问题误判为“未启用共振峰保护”；更直接的风险来自单字素材被过度扩展或压缩、clip 边界硬切、素材覆盖不足导致近音 fallback。
+
+已落实的设计决策：
+
+1. 渲染链路继续使用 Rubber Band 共振峰保持拉伸，并在 exact-duration `apad` / `atrim` 之后加入短淡入淡出。该处理是通用边界缓冲，不依赖歌曲名、素材名或语言特例。
+2. `stretch_naturalness_score` 与 `continuity_warning` 成为 `stretch_plan` 的一等诊断字段。后续 full rendered real-eval 可以直接统计它们，而不是只看 `extreme_stretch_ratio` 和人工听感。
+3. real-eval 新增 `stretch_quality_score`、`stretch_naturalness_score`、`continuity_warning_ratio` 等套件和分组指标，能判断某次修改是否真正改善了拉伸/连续性，同时仍保留严格的匹配、时长、timed unit coverage 验收门槛。
+4. 排序侧只在同发音候选或 fallback 候选中使用自然拉伸因素，不允许听感分覆盖发音匹配。这是为了降低过拟合有限素材集和错字音排序的风险。
+
+剩余风险：
+
+1. 淡入淡出只能降低硬切边界，不等同于真正的音素级共振峰轨迹连续，也不能修复素材本身缺失目标字音的问题。
+2. 多 clip 的真正 crossfade、能量/F0/formant 轨迹平滑、voiced-core 级别拉伸仍未实现；这些需要在完整 rendered real-eval 的 worst group 上验证后再推进。
+3. 如果 full suite 仍显示大量 `single_syllable_boundary_risk` 或 `stretch_naturalness_score` 低分，下一步应优先做素材缺失报告、近音替代策略和更细粒度的目标音素/音节切分，而不是放松 strict pass。
+
+验证结论：
+
+1. 编译、149 项单测、`audio_processor check` 和 `git diff --check` 已通过。
+2. 临时双素材 FFmpeg 渲染 smoke 输出 2.000000 秒，说明新 filter 在当前 FFmpeg 环境可执行。
+3. 完整 rendered real-eval 仍需由后台自治恢复运行，用新增 `stretch_quality_score`、`stretch_naturalness_score`、`continuity_warning_ratio`、`rendered_audio_alignment_score`、`render_duration_delta_ratio` 和 worst group 共同判断是否比上一轮改善。

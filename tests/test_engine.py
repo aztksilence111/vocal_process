@@ -46,6 +46,7 @@ from audio_processor.engine import (
     list_audio_files,
     plan_material_stretch_clips,
     probe_audio,
+    render_material_stretch_plan,
     resolve_tool,
     summarize_probe,
     _run_progress_process,
@@ -205,6 +206,8 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("rubberband=tempo=1.25000000:pitch=1:formant=preserved", graph)
         self.assertIn("apad=whole_dur=3.500000", graph)
         self.assertIn("atrim=duration=3.500000", graph)
+        self.assertIn("afade=t=in:st=0:d=0.010000", graph)
+        self.assertIn("afade=t=out:st=3.490000:d=0.010000", graph)
         self.assertNotIn("stream_loop", graph)
 
     def test_single_material_file_uses_same_stretch_chain(self) -> None:
@@ -231,6 +234,8 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
         self.assertIn("apad=whole_dur=2.000000", filters)
         self.assertIn("atrim=duration=2.000000", filters)
+        self.assertIn("afade=t=in:st=0:d=0.010000", filters)
+        self.assertIn("afade=t=out:st=1.990000:d=0.010000", filters)
         self.assertNotIn("stream_loop", args)
 
     def test_material_assembly_uses_per_clip_stretch_plan(self) -> None:
@@ -255,6 +260,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("[1:a]rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
         self.assertIn("[clip0][clip1]concat=n=2:v=0:a=1[outa]", filters)
         self.assertIn("atrim=duration=2.000000", filters)
+        self.assertIn("afade=t=in:st=0:d=0.010000", filters)
         self.assertNotIn("stream_loop", filters)
 
     def test_material_stretch_plan_flags_extreme_ratios(self) -> None:
@@ -272,6 +278,9 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(clips[0].target_duration_seconds, 10.0)
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
+        self.assertEqual(clips[0].continuity_warning, "extreme_boundary_risk")
+        self.assertLess(clips[0].stretch_naturalness_score, 0.1)
+        self.assertEqual(clips[0].fade_seconds, 0.01)
 
     def test_material_stretch_plan_preserves_partial_model_target_durations(self) -> None:
         with patch(
@@ -351,6 +360,11 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertAlmostEqual(clips[0].tempo, 0.75)
         self.assertEqual(clips[0].stretch_strategy, "syllable_safe_expand_with_tail_padding")
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
+        self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
+        self.assertLess(clips[0].stretch_naturalness_score, 0.2)
+        rendered = render_material_stretch_plan(clips)
+        self.assertEqual(rendered[0]["boundary_conditioning"], "fade_in_out")
+        self.assertEqual(rendered[0]["formant_preservation"], "rubberband_formant_preserved")
 
     def test_flat_wav_assembly_reuses_duplicate_render_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1056,8 +1070,20 @@ class RealEvalTests(unittest.TestCase):
                     },
                 },
                 "stretch_plan": [
-                    {"target_duration_seconds": 1.5, "quality_warning": ""},
-                    {"target_duration_seconds": 2.5, "quality_warning": ""},
+                    {
+                        "target_duration_seconds": 1.5,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.96,
+                        "continuity_warning": "",
+                        "fade_seconds": 0.01,
+                    },
+                    {
+                        "target_duration_seconds": 2.5,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.94,
+                        "continuity_warning": "",
+                        "fade_seconds": 0.01,
+                    },
                 ],
             }
 
@@ -1096,12 +1122,19 @@ class RealEvalTests(unittest.TestCase):
         self.assertAlmostEqual(case_summary["match_score_mean"], 0.86)
         self.assertGreater(case_summary["planning_alignment_score"], 0.9)
         self.assertGreater(case_summary["rendered_audio_alignment_score"], 0.9)
+        self.assertAlmostEqual(case_summary["stretch_naturalness_score"], 0.95)
+        self.assertEqual(case_summary["continuity_warning_count"], 0)
+        self.assertIn("stretch_quality_score", summary_payload["suite"]["score_summary"])
+        self.assertIn("stretch_naturalness_score", summary_payload["suite"]["score_summary"])
+        self.assertIn("continuity_warning_ratio", summary_payload["suite"]["score_summary"])
         self.assertIn("score_summary", summary_payload["suite"])
         self.assertIn("group_score_summary", summary_payload["suite"])
         self.assertIn("song_CN", summary_payload["suite"]["group_score_summary"]["by_reference"])
         self.assertIn("vmzCN", summary_payload["suite"]["group_score_summary"]["by_material_set"])
         self.assertIn("Group Scores", markdown)
         self.assertIn("Render Score", markdown)
+        self.assertIn("Stretch Quality", markdown)
+        self.assertIn("Boundary Risks", markdown)
         self.assertIn("Timed", markdown)
         self.assertIn("Strict Pass", markdown)
 
@@ -1913,6 +1946,28 @@ class ModelAssistTests(unittest.TestCase):
         self.assertEqual([decision.material_path.name for decision in plan.decisions], ["ni.wav", "ai.wav", "ni.wav", "ai.wav"])
         self.assertEqual([decision.phonetic_position for decision in plan.decisions], [0, 1, 2, 3])
         self.assertEqual(len(plan.decisions), 4)
+
+    def test_reference_sequence_prefers_natural_stretch_for_same_pronunciation(self) -> None:
+        reference_segments = [
+            VoiceSegment(
+                0.0,
+                0.5,
+                "\u4f60",
+                unit_timings=(VoiceUnitTiming(0, "ni", 0.0, 0.5, timing_source="aligned"),),
+                language_hint="CN",
+            )
+        ]
+        materials = [
+            MaterialAnalysis(Path("ni_too_long.wav"), transcript="", filename_text="ni", duration_seconds=2.0, language_hint="CN"),
+            MaterialAnalysis(Path("ni_close.wav"), transcript="", filename_text="ni", duration_seconds=0.5, language_hint="CN"),
+        ]
+
+        plan = plan_material_ordering(reference_segments, materials)
+
+        self.assertEqual(plan.strategy, "reference_phonetic_unit_sequence")
+        self.assertEqual(plan.decisions[0].material_path.name, "ni_close.wav")
+        self.assertGreater(plan.decisions[0].duration_score, 0.9)
+        self.assertLess(model_assist._stretch_naturalness_score_for_target(0.5, 2.0, "ni"), 0.2)
 
     def test_orders_tone_number_pinyin_filenames_by_phonetic_position(self) -> None:
         decisions = order_materials_for_reference(
@@ -2766,6 +2821,62 @@ class ModelRuntimeTests(unittest.TestCase):
         warnings = preflight._preflight_warnings(ordering, [])
 
         self.assertTrue(any(warning["kind"] == "ambiguous_phonetic_position" for warning in warnings))
+
+    def test_preflight_passes_material_text_to_stretch_continuity_diagnostics(self) -> None:
+        decision = model_runtime.OrderingDecision(
+            rank=1,
+            source_path=Path("wo.wav"),
+            score=0.9,
+            transcript_score=0.0,
+            filename_score=0.9,
+            duration_score=0.9,
+            speaker_score=0.0,
+            vad_score=1.0,
+            phonetic_score=0.9,
+            evidence_count=3,
+            confidence_label="strong",
+            reference_text="\u6211",
+            material_text="wo",
+            reason="reference_text_position",
+            reference_segment_index=0,
+            phonetic_position=0,
+            target_duration_seconds=2.0,
+        )
+        ordering = model_runtime.ModelOrderingResult(
+            reference=model_runtime.ReferenceAnalysis(
+                source_path=Path("reference.wav"),
+                vocal_path=Path("reference.wav"),
+                transcript="\u6211",
+                segments=(VoiceSegment(0.0, 2.0, "\u6211", timing_source="lyric_text"),),
+                speaker_embedding=None,
+                backend="test",
+            ),
+            library=model_runtime.MaterialLibraryAnalysis(
+                material_directory=Path("materials"),
+                materials=(),
+                backend_summary={},
+            ),
+            ordered_paths=(Path("wo.wav"),),
+            target_durations=(2.0,),
+            decisions=(decision,),
+            analysis_report={"backend_summary": {}},
+        )
+
+        with patch("audio_processor.preflight.build_model_ordering", return_value=ordering):
+            with patch(
+                "audio_processor.engine.probe_audio",
+                side_effect=[
+                    {"format": {"duration": "2.0"}, "streams": []},
+                    {"format": {"duration": "0.5"}, "streams": []},
+                ],
+            ):
+                report = preflight.build_preflight_report(Path("reference.wav"), Path("materials"))
+
+        self.assertEqual(report["summary"]["continuity_warning_count"], 1)
+        self.assertEqual(report["summary"]["fade_applied_clip_count"], 1)
+        self.assertLess(report["summary"]["stretch_naturalness_score_mean"] or 1.0, 0.2)
+        self.assertEqual(report["stretch_plan"][0]["continuity_warning"], "single_syllable_boundary_risk")
+        self.assertTrue(any(warning["kind"] == "single_syllable_boundary_risk" for warning in report["warnings"]))
 
     def test_preflight_requires_aligned_unit_timing_for_positioned_decisions(self) -> None:
         decision = model_runtime.OrderingDecision(

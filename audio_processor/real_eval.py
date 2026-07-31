@@ -1001,6 +1001,13 @@ def _case_summary(
             "timed_target_duration_ratio": scorecard["timed_target_duration_ratio"],
             "aligned_timing_score": scorecard["aligned_timing_score"],
             "target_duration_alignment_score": scorecard["target_duration_alignment_score"],
+            "stretch_warning_score": scorecard["stretch_warning_score"],
+            "stretch_naturalness_score": scorecard["stretch_naturalness_score"],
+            "continuity_warning_count": scorecard["continuity_warning_count"],
+            "continuity_warning_ratio": scorecard["continuity_warning_ratio"],
+            "continuity_score": scorecard["continuity_score"],
+            "fade_applied_clip_count": scorecard["fade_applied_clip_count"],
+            "stretch_quality_score": scorecard["stretch_quality_score"],
             "planning_alignment_score": scorecard["planning_alignment_score"],
             "rendered_audio_alignment_score": scorecard["rendered_audio_alignment_score"],
             "strict_render_pass": scorecard["strict_render_pass"],
@@ -1035,6 +1042,7 @@ def _alignment_scorecard(
     error_warning_count = _positive_int(report_summary.get("error_warning_count"))
     extreme_stretch_count = _positive_int(report_summary.get("extreme_stretch_count"))
     moderate_stretch_count = _positive_int(report_summary.get("moderate_stretch_count"))
+    stretch_plan = report.get("stretch_plan", [])
 
     review_ratio = _ratio(review_required_count, material_count)
     match_ordering_score = _clamp01((match_score_mean or 0.0) * (1.0 - review_ratio))
@@ -1049,7 +1057,22 @@ def _alignment_scorecard(
     aligned_timing_score = timed_target_duration_ratio
 
     stretch_penalty = _ratio(extreme_stretch_count + 0.5 * moderate_stretch_count, material_count)
-    stretch_quality_score = _clamp01(1.0 - stretch_penalty)
+    stretch_warning_score = _clamp01(1.0 - stretch_penalty)
+    stretch_naturalness_values = _stretch_plan_float_values(stretch_plan, "stretch_naturalness_score")
+    stretch_naturalness_score = _mean(stretch_naturalness_values)
+    if stretch_naturalness_score is None:
+        stretch_naturalness_score = stretch_warning_score
+    continuity_warning_count = _stretch_plan_non_empty_count(stretch_plan, "continuity_warning")
+    continuity_warning_ratio = _ratio(continuity_warning_count, material_count)
+    continuity_score = _clamp01(1.0 - continuity_warning_ratio)
+    fade_applied_clip_count = _stretch_plan_positive_float_count(stretch_plan, "fade_seconds")
+    stretch_quality_score = _weighted_score(
+        [
+            (stretch_warning_score, 0.45),
+            (stretch_naturalness_score, 0.40),
+            (continuity_score, 0.15),
+        ]
+    )
 
     reference_duration_seconds = _probe_duration(reference_path)
     target_duration_total_seconds = _safe_float(timeline_alignment.get("target_duration_total_seconds"))
@@ -1121,6 +1144,12 @@ def _alignment_scorecard(
         "target_duration_alignment_score": _round_float(target_duration_alignment_score),
         "extreme_stretch_count": extreme_stretch_count,
         "moderate_stretch_count": moderate_stretch_count,
+        "stretch_warning_score": _round_float(stretch_warning_score),
+        "stretch_naturalness_score": _round_float(stretch_naturalness_score),
+        "continuity_warning_count": continuity_warning_count,
+        "continuity_warning_ratio": _round_float(continuity_warning_ratio),
+        "continuity_score": _round_float(continuity_score),
+        "fade_applied_clip_count": fade_applied_clip_count,
         "stretch_quality_score": _round_float(stretch_quality_score),
         "planning_alignment_score": _round_float(planning_alignment_score),
         "render_validation": render_validation,
@@ -1169,6 +1198,9 @@ def _suite_score_summary(results: Sequence[RealCaseResult]) -> dict[str, Any]:
     planning_scores = _summary_values(results, "planning_alignment_score")
     render_scores = _summary_values(results, "rendered_audio_alignment_score")
     match_scores = _summary_values(results, "match_ordering_score")
+    stretch_quality_scores = _summary_values(results, "stretch_quality_score")
+    stretch_naturalness_scores = _summary_values(results, "stretch_naturalness_score")
+    continuity_warning_ratios = _summary_values(results, "continuity_warning_ratio")
     render_duration_ratios = [
         value
         for value in (
@@ -1184,6 +1216,9 @@ def _suite_score_summary(results: Sequence[RealCaseResult]) -> dict[str, Any]:
         "planning_alignment_score": _stats(planning_scores),
         "rendered_audio_alignment_score": _stats(render_scores),
         "match_ordering_score": _stats(match_scores),
+        "stretch_quality_score": _stats(stretch_quality_scores),
+        "stretch_naturalness_score": _stats(stretch_naturalness_scores),
+        "continuity_warning_ratio": _stats(continuity_warning_ratios),
         "render_duration_delta_ratio": _stats(render_duration_ratios),
         "strict_render_pass_count": strict_pass_count,
         "strict_render_fail_count": len(results) - strict_pass_count,
@@ -1358,6 +1393,29 @@ def _stretch_target_total(stretch_plan: Any) -> float | None:
     return sum(values)
 
 
+def _stretch_plan_float_values(stretch_plan: Any, key: str) -> list[float]:
+    if not isinstance(stretch_plan, list):
+        return []
+    values = [_safe_float(entry.get(key)) for entry in stretch_plan if isinstance(entry, dict)]
+    return [value for value in values if value is not None]
+
+
+def _stretch_plan_non_empty_count(stretch_plan: Any, key: str) -> int:
+    if not isinstance(stretch_plan, list):
+        return 0
+    return sum(1 for entry in stretch_plan if isinstance(entry, dict) and bool(entry.get(key)))
+
+
+def _stretch_plan_positive_float_count(stretch_plan: Any, key: str) -> int:
+    if not isinstance(stretch_plan, list):
+        return 0
+    return sum(
+        1
+        for entry in stretch_plan
+        if isinstance(entry, dict) and (_safe_float(entry.get(key)) or 0.0) > 0.0
+    )
+
+
 def _duration_delta(value: float | None, reference: float | None) -> float | None:
     if value is None or reference is None:
         return None
@@ -1471,11 +1529,12 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         "",
         (
             "| 用例 Case | Split | Language | Status | 规划分 Plan Score | 渲染分 Render Score | "
+            "拉伸质量 Stretch Quality | 拉伸自然度 Stretch Naturalness | 边界风险 Boundary Risks | "
             "最低匹配 Min Match | 平均匹配 Mean Match | 定位率 Positioned | 计时率 Timed | "
             "目标时长差 Target Delta | 渲染时长差 Render Delta | 严格通过 Strict Pass | "
             "需复查 Review Needed | 输出音频 Output Audio |"
         ),
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for result in results:
         case_summary = result.summary
@@ -1485,6 +1544,9 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         mean_score = case_summary.get("match_score_mean", "")
         plan_score = case_summary.get("planning_alignment_score", "")
         render_score = case_summary.get("rendered_audio_alignment_score", "")
+        stretch_quality = case_summary.get("stretch_quality_score", "")
+        stretch_naturalness = case_summary.get("stretch_naturalness_score", "")
+        continuity_warnings = case_summary.get("continuity_warning_count", "")
         positioned_ratio = case_summary.get("positioned_decision_ratio", "")
         timed_ratio = case_summary.get("timed_target_duration_ratio", "")
         target_delta = scorecard.get("target_duration_delta_seconds", "") if isinstance(scorecard, dict) else ""
@@ -1495,6 +1557,8 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         lines.append(
             f"| {result.case.name} | {result.case.split} | {result.case.language or 'unknown'} | "
             f"{result.status} | {_markdown_value(plan_score)} | {_markdown_value(render_score)} | "
+            f"{_markdown_value(stretch_quality)} | {_markdown_value(stretch_naturalness)} | "
+            f"{_markdown_value(continuity_warnings)} | "
             f"{_markdown_value(min_score)} | {_markdown_value(mean_score)} | {_markdown_value(positioned_ratio)} | "
             f"{_markdown_value(timed_ratio)} | {_markdown_value(target_delta)} | {_markdown_value(render_delta)} | "
             f"{case_summary.get('strict_render_pass', False)} | {review_count} | "
@@ -1538,9 +1602,10 @@ def _render_group_score_markdown(summary: dict[str, Any]) -> list[str]:
         "",
         (
             "| 分组 Group | 名称 Name | 用例数 Cases | 规划均分 Plan Mean | 渲染均分 Render Mean | "
-            "匹配均分 Match Mean | 严格通过/失败 Strict Pass/Fail | 状态统计 Status Counts |"
+            "匹配均分 Match Mean | 拉伸均分 Stretch Mean | 边界风险均值 Boundary Risk Mean | "
+            "严格通过/失败 Strict Pass/Fail | 状态统计 Status Counts |"
         ),
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     row_count = 0
     for group_name in ("by_language", "by_reference", "by_material_set", "by_split"):
@@ -1560,6 +1625,8 @@ def _render_group_score_markdown(summary: dict[str, Any]) -> list[str]:
                 f"{_markdown_value(_score_stat_mean(score_summary, 'planning_alignment_score'))} | "
                 f"{_markdown_value(_score_stat_mean(score_summary, 'rendered_audio_alignment_score'))} | "
                 f"{_markdown_value(_score_stat_mean(score_summary, 'match_ordering_score'))} | "
+                f"{_markdown_value(_score_stat_mean(score_summary, 'stretch_quality_score'))} | "
+                f"{_markdown_value(_score_stat_mean(score_summary, 'continuity_warning_ratio'))} | "
                 f"{strict_pass}/{strict_fail} | "
                 f"{_markdown_value(json.dumps(payload.get('status_counts', {}), ensure_ascii=False))} |"
             )
