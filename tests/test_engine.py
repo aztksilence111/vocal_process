@@ -240,6 +240,22 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("afade=t=out:st=1.990000:d=0.010000", filters)
         self.assertNotIn("stream_loop", args)
 
+    def test_tiny_target_material_clip_skips_rubberband_failure_path(self) -> None:
+        args = build_material_clip_args(
+            Path("clip.wav"),
+            Path("clip_tiny.wav"),
+            8.88310734,
+            ProcessOptions(input_path=Path("clip.wav"), output_path=Path("clip_tiny.wav")),
+            target_duration=0.014074,
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertNotIn("rubberband=", filters)
+        self.assertIn("apad=whole_dur=0.014074", filters)
+        self.assertIn("atrim=duration=0.014074", filters)
+        self.assertNotIn("afade=", filters)
+
     def test_material_assembly_uses_per_clip_stretch_plan(self) -> None:
         with patch(
             "audio_processor.engine.probe_audio",
@@ -264,6 +280,26 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("atrim=duration=2.000000", filters)
         self.assertIn("afade=t=in:st=0:d=0.010000", filters)
         self.assertNotIn("stream_loop", filters)
+
+    def test_tiny_target_stretch_plan_uses_direct_trim_strategy(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "0.125"}, "streams": []},
+            ],
+        ):
+            clips = plan_material_stretch_clips(
+                Path("reference.wav"),
+                [Path("ka1.wav")],
+                target_durations=[0.014074],
+                material_text_hints=["ka1"],
+            )
+
+        self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
+        self.assertAlmostEqual(clips[0].target_duration_seconds, 0.014074)
+        rendered = render_material_stretch_plan(clips)
+        self.assertEqual(rendered[0]["formant_preservation"], "direct_trim_no_pitch_shift")
 
     def test_material_stretch_plan_flags_extreme_ratios(self) -> None:
         with patch(
@@ -999,6 +1035,35 @@ class DiagnosticsTests(unittest.TestCase):
         failure = next(record for record in records if record["stage"] == "batch.item.failed")
         self.assertIn("elapsed_seconds", failure["fields"])
 
+    def test_batch_overwrite_removes_stale_output_before_rendering(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "reference.wav"
+            input_path.write_bytes(b"placeholder")
+            settings = ProcessingSettings(output_directory=str(root / "out"), overwrite=True)
+            item = create_queue([input_path], settings)[0]
+            item.output_path.parent.mkdir(parents=True)
+            _write_test_wave(item.output_path, duration_seconds=0.25)
+
+            probe_data = {
+                "streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}],
+                "format": {"duration": "1.0", "format_name": "wav"},
+            }
+            with patch("audio_processor.batch.probe_audio", return_value=probe_data):
+                with patch(
+                    "audio_processor.batch.process_audio_with_progress",
+                    side_effect=AudioProcessorError("render failed"),
+                ):
+                    summary = run_batch_queue([item], settings)
+
+            log_path = diagnostic_log_path(item.output_path)
+            records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+            output_exists = item.output_path.exists()
+
+        self.assertEqual(summary.failed, 1)
+        self.assertFalse(output_exists)
+        self.assertIn("outputs.stale_removed", [record["stage"] for record in records])
+
     def test_input_diagnostics_do_not_abort_when_material_probe_fails(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1213,6 +1278,24 @@ class RealEvalTests(unittest.TestCase):
         self.assertIn("Boundary Risks", markdown)
         self.assertIn("Timed", markdown)
         self.assertIn("Strict Pass", markdown)
+
+    def test_real_eval_render_failed_validation_ignores_stale_output_duration(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "output.wav"
+            _write_test_wave(output, duration_seconds=1.0)
+
+            validation = real_eval._render_validation(
+                {"batch_summary": {"total": 1, "completed": 0, "failed": 1, "cancelled": 0}},
+                4.0,
+                output,
+            )
+
+        self.assertEqual(validation["status"], "render_failed")
+        self.assertTrue(validation["output_exists"])
+        self.assertTrue(validation["render_failed"])
+        self.assertIsNone(validation["output_duration_seconds"])
+        self.assertIsNone(validation["duration_delta_ratio"])
 
     def test_real_eval_flushes_partial_summary_after_case_failure(self) -> None:
         with TemporaryDirectory() as temp_dir:

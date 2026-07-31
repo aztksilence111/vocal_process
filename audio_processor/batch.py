@@ -107,6 +107,7 @@ def run_batch_queue(
             if should_cancel is not None and should_cancel():
                 raise AudioProcessorError("Processing cancelled")
             options = settings.to_process_options(item.input_path, item.output_path)
+            _remove_stale_output_before_overwrite(item.output_path, options.overwrite, diagnostics)
             if settings.material_directory:
                 diagnostics.event(
                     "model.runtime.preflight",
@@ -252,6 +253,24 @@ def run_batch_queue(
         _notify_queue(on_queue_progress, (index + 1) / total, f"{index + 1}/{total}: complete")
 
     return BatchSummary(total=total, completed=completed, failed=failed, cancelled=cancelled)
+
+
+def _remove_stale_output_before_overwrite(
+    output_path: Path,
+    overwrite: bool,
+    diagnostics: DiagnosticLogger,
+) -> None:
+    if not overwrite or not output_path.exists() or not output_path.is_file():
+        return
+    try:
+        output_path.unlink()
+    except OSError as exc:
+        raise AudioProcessorError(f"Could not remove existing output before overwrite: {output_path}") from exc
+    diagnostics.event(
+        "outputs.stale_removed",
+        "Removed existing output before overwrite rendering",
+        output_path=output_path,
+    )
 
 
 def _mark_remaining_cancelled(

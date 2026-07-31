@@ -1,5 +1,17 @@
 # Project Analysis
 
+## Latest Update - 2026-07-31 极短片段安全路径与失败输出隔离
+
+这轮修复把真实验收里的两个边界问题拆开处理。第一个问题是极短目标片段在 FFmpeg Rubber Band 路径上会失败：`1000nenyikiteru_JP__vmzJP` 中最短片段 `ka1.wav` 的目标时长只有 `0.014074s`，原先直接走 `rubberband` 时触发 `Operation not permitted`。第二个问题是渲染失败后旧输出还留在原路径，`real_eval` 继续 probe 旧 wav 时长，导致“渲染失败却看起来有输出”的假阳性。
+
+现在 `audio_processor.engine` 对 `target_duration <= 0.030s` 的片段不再调用 Rubber Band，而是直接用 `apad + atrim + asetpts` 做安全截断/补齐。这一层仍保持精确时长控制，但避免了极短压缩比下的 FFmpeg 音频过滤器错误。`MaterialStretchClip.stretch_strategy` 会标记为 `tiny_target_direct_trim`，`render_material_stretch_plan()` 也会把 formant 说明切换成 `direct_trim_no_pitch_shift`，让诊断更直观。
+
+`audio_processor.batch` 在 overwrite 模式下会先删除旧输出文件，再启动渲染，并写入 `outputs.stale_removed` 诊断事件。`audio_processor.real_eval._render_validation()` 则对 `render_failed` 的 batch 结果直接跳过输出时长 probe，避免旧文件污染分数。这样渲染失败和真实输出短缺不再混在一起。
+
+验证已经闭环：`python -m unittest discover` 通过 162 项，`python -m audio_processor check` 通过，真实 FFmpeg 烟测中 14ms 目标片段可稳定输出 `0.014083s`，单 case 真实验收 `1000nenyikiteru_JP__vmzJP` 也恢复为 `rendered`，`render_duration_delta_ratio=0.0`，输出 wav 时长重新对齐到原人声 `194.155102s`。说明这次修复真正把“短片段滤镜失败”和“旧输出污染评分”从评分链路里剥离了。
+
+下一轮完整 real-eval 仍要继续盯 `stretch_quality_score`、`continuity_warning_ratio` 和 JP/vmzJP 的长尾单字连续性，但这已经不再受最短片段 FFmpeg 失败和旧输出误判干扰。
+
 ## Latest Update - 2026-07-31 渲染时长强校验与短字音 formant 拉伸
 
 本轮把渲染链路从“计划层时长正确”推进到“输出文件真实时长必须正确”。最新自治跑分中 `1000nenyikiteru_JP__vmzJP` 暴露了关键矛盾：timeline 目标总时长已经等于原人声 `194.155102s`，但渲染 wav 实际只有 `123.641062s`。这说明继续只优化 ASR/排序无法解决验收问题，必须在 FFmpeg 输出边界加真实 probe 和自动修复。

@@ -1165,13 +1165,16 @@ def _render_validation(
     output_path: Path | None,
 ) -> dict[str, Any]:
     render_requested = bool(render_summary)
+    render_failed = _render_summary_failed(render_summary)
     output_exists = bool(output_path and output_path.exists())
-    output_duration_seconds = _probe_duration(output_path) if output_exists else None
+    output_duration_seconds = _probe_duration(output_path) if output_exists and not render_failed else None
     delta_seconds = _duration_delta(output_duration_seconds, reference_duration_seconds)
     delta_ratio = _duration_delta_ratio(output_duration_seconds, reference_duration_seconds)
     duration_alignment_score = _duration_alignment_score(delta_ratio)
     if not render_requested:
         status = "not_requested"
+    elif render_failed:
+        status = "render_failed"
     elif not output_exists:
         status = "missing_output"
     elif output_duration_seconds is None or reference_duration_seconds is None:
@@ -1184,6 +1187,7 @@ def _render_validation(
         "format": "vocal_process_render_validation_v1",
         "status": status,
         "render_requested": render_requested,
+        "render_failed": render_failed,
         "output_exists": output_exists,
         "output_path": str(output_path) if output_path else "",
         "output_duration_seconds": _round_float(output_duration_seconds),
@@ -1192,6 +1196,17 @@ def _render_validation(
         "duration_delta_ratio": _round_float(delta_ratio),
         "duration_alignment_score": _round_float(duration_alignment_score),
     }
+
+
+def _render_summary_failed(render_summary: dict[str, Any]) -> bool:
+    if not render_summary:
+        return False
+    if render_summary.get("error"):
+        return True
+    batch_summary = render_summary.get("batch_summary")
+    if not isinstance(batch_summary, dict):
+        return False
+    return _positive_int(batch_summary.get("failed")) > 0
 
 
 def _suite_score_summary(results: Sequence[RealCaseResult]) -> dict[str, Any]:

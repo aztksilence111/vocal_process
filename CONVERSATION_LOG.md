@@ -1,5 +1,16 @@
 # Conversation Log
 
+## Latest Update - 2026-07-31 极短片段安全渲染与旧输出污染修复
+
+1. 本轮继续修复真实跑分暴露的渲染失败点。问题本质不是总时长规划错，而是某些极短目标片段在进入 FFmpeg `rubberband` 时会直接报错。最新失败样本是 `ka1.wav`，目标时长只有 `0.014074s`，`tempo=8.88310734` 时触发 `Operation not permitted`，导致整条 case 失败。
+2. `audio_processor.engine` 现在对 `target_duration <= 0.030s` 的片段自动走“直接截断/补齐”安全路径，不再调用 Rubber Band。这个路径仍保留 `apad + atrim + asetpts` 的精确时长校正，但不会对极短片段做危险的频率保持拉伸，因此可以稳定通过 FFmpeg。
+3. `audio_processor.batch` 在 `overwrite=True` 且输出文件已存在时，会先删除旧输出再开始渲染，并写入 `outputs.stale_removed` 诊断事件。这样渲染失败后不会再留下旧 wav 伪装成新结果。
+4. `audio_processor.real_eval._render_validation()` 现在会识别 `render_failed` 的 batch 结果；只要渲染失败，就不再读取输出文件时长，避免旧输出污染真实验收分数。
+5. 新增测试覆盖：极短片段命令不再包含 `rubberband`，极短片段策略标记为 `tiny_target_direct_trim`，overwrite 模式会删除旧输出，`render_failed` 验证不会读取旧 wav 时长。
+6. 验证结果：`python -m unittest discover` 通过 162 项，`python -m audio_processor check` 通过，`git diff --check` 仅有 CRLF 提示。真实 FFmpeg 烟测也通过：`0.014074s` 的目标片段渲染输出为 `0.014083s`，在容差内。
+7. 单例真实验收通过：`python -m audio_processor.real_eval --root tests_real --render --source-separation never --output-root tests_real\\output\\tiny-target-smoke --case 1000nenyikiteru_JP__vmzJP` 完成后，`status=rendered`，`render_duration_delta_ratio=0.0`，`render_validation.status=ok`，输出 `tests_real\\output\\1000nenyikiteru_JP\\vmzJP\\1000nenyikiteru_JP.wav` 的实际时长回到 `194.155102s`，与原人声一致。
+8. 这次结果说明两类问题已分别拆开：短片段报错由安全渲染路径解决，旧输出污染评分由 overwrite 删除和 render_failed 验证逻辑解决。下一轮继续观察完整 real-eval 跑分里 JP/vmzJP 的其余材料选择与连续性指标是否还能继续改善。
+
 ## Latest Update - 2026-07-31 渲染时长校正与短字音拉伸改良
 
 1. 本轮针对用户指出的“拉伸质量低、拼接连续性差、输出音频没有严格贴合原人声时长”继续修复。最新后台自治在 `real-eval-render-full` 中被人工停止，已完成的 `1000nenyikiteru_JP__vmzJP` 案例显示计划时长总和为 `194.155102s`，但输出 wav 只有 `123.641062s`，说明问题不只是识别和排序，而是渲染成品没有被真实时长校验。

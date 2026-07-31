@@ -82,9 +82,10 @@ MATERIAL_RENDER_FADE_SECONDS = 0.010
 MATERIAL_RENDER_MIN_FADE_SECONDS = 0.002
 MATERIAL_RENDER_MIN_FADE_TARGET_SECONDS = 0.050
 MATERIAL_RENDER_FADE_TARGET_FRACTION = 0.08
+MATERIAL_RENDER_TINY_TARGET_SECONDS = 0.030
 MATERIAL_RENDER_DURATION_TOLERANCE_SECONDS = 0.025
 MATERIAL_RENDER_DURATION_TOLERANCE_RATIO = 0.001
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v4_probe_corrected_formant_expand"
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v5_tiny_target_direct_trim"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -890,7 +891,7 @@ def plan_material_stretch_clips(
         start=1,
     ):
         requested_tempo = source_duration / target_duration
-        tempo, strategy = _resolve_stretch_strategy(requested_tempo, text_hint)
+        tempo, strategy = _resolve_stretch_strategy(requested_tempo, text_hint, target_duration)
         _validate_rubberband_tempo(tempo)
         clips.append(
             MaterialStretchClip(
@@ -925,7 +926,11 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "quality_warning": clip.quality_warning,
             "fade_seconds": clip.fade_seconds,
             "boundary_conditioning": "fade_in_out" if clip.fade_seconds > 0 else "",
-            "formant_preservation": "rubberband_formant_preserved",
+            "formant_preservation": (
+                "direct_trim_no_pitch_shift"
+                if clip.stretch_strategy == "tiny_target_direct_trim"
+                else "rubberband_formant_preserved"
+            ),
             "stretch_naturalness_score": clip.stretch_naturalness_score,
             "continuity_warning": clip.continuity_warning,
         }
@@ -1010,13 +1015,7 @@ def _build_material_filter_graph(
         filters.append(f"{concat_inputs}concat=n={material_count}:v=0:a=1[cat]")
         source_label = "[cat]"
 
-    audio_filters = _build_audio_filters(options)
-    stretch_filter = f"rubberband=tempo={tempo:.8f}:pitch=1:formant=preserved:transients=crisp:phase=laminar"
-    post_filters = [stretch_filter]
-    if audio_filters:
-        post_filters.append(audio_filters)
-    if target_duration is not None:
-        post_filters.extend(_target_duration_filters(target_duration))
+    post_filters = _material_post_filters(tempo, options, target_duration=target_duration)
     filters.append(f"{source_label}{','.join(post_filters)}[outa]")
     return ";".join(filters)
 
@@ -1033,12 +1032,11 @@ def _build_material_plan_filter_graph(
     labels: list[str] = []
     for index, clip in enumerate(clips):
         output_label = "outa" if len(clips) == 1 else f"clip{index}"
-        post_filters = [
-            _rubberband_filter(clip.tempo),
-        ]
-        if audio_filters:
-            post_filters.append(audio_filters)
-        post_filters.extend(_target_duration_filters(clip.target_duration_seconds))
+        post_filters = _material_post_filters(
+            clip.tempo,
+            options,
+            target_duration=clip.target_duration_seconds,
+        )
         filters.append(f"[{index}:a]{','.join(post_filters)}[{output_label}]")
         if len(clips) > 1:
             labels.append(f"[{output_label}]")
@@ -1058,14 +1056,37 @@ def _build_material_clip_filter(
         raise AudioProcessorError("target_duration must be greater than 0")
 
     audio_filters = _build_audio_filters(options)
-    filters = [
-        _rubberband_filter(tempo)
-    ]
+    filters = []
+    if not _should_direct_trim_tiny_target(target_duration):
+        filters.append(_rubberband_filter(tempo))
     if audio_filters:
         filters.append(audio_filters)
     if target_duration is not None:
         filters.extend(_target_duration_filters(target_duration))
     return ",".join(filters)
+
+
+def _material_post_filters(
+    tempo: float,
+    options: ProcessOptions,
+    *,
+    target_duration: float | None,
+) -> list[str]:
+    audio_filters = _build_audio_filters(options)
+    filters: list[str] = []
+    if not _should_direct_trim_tiny_target(target_duration):
+        filters.append(_rubberband_filter(tempo))
+    if audio_filters:
+        filters.append(audio_filters)
+    if target_duration is not None:
+        filters.extend(_target_duration_filters(target_duration))
+    if not filters:
+        filters.append("anull")
+    return filters
+
+
+def _should_direct_trim_tiny_target(target_duration: float | None) -> bool:
+    return target_duration is not None and target_duration <= MATERIAL_RENDER_TINY_TARGET_SECONDS
 
 
 def _target_duration_filters(target_duration: float) -> list[str]:
@@ -1284,9 +1305,15 @@ def _resolve_material_text_hints(count: int, hints: Sequence[str] | None) -> lis
     return [str(hint or "") for hint in hints]
 
 
-def _resolve_stretch_strategy(requested_tempo: float, text_hint: str) -> tuple[float, str]:
+def _resolve_stretch_strategy(
+    requested_tempo: float,
+    text_hint: str,
+    target_duration: float | None = None,
+) -> tuple[float, str]:
     if requested_tempo > RUBBERBAND_MAX_TEMPO:
         return RUBBERBAND_MAX_TEMPO, "rubberband_max_compression_floor"
+    if _should_direct_trim_tiny_target(target_duration):
+        return max(min(requested_tempo, RUBBERBAND_MAX_TEMPO), RUBBERBAND_MIN_TEMPO), "tiny_target_direct_trim"
     if _is_short_material_text(text_hint) and requested_tempo < RUBBERBAND_SHORT_TEXT_MIN_TEMPO:
         return RUBBERBAND_SHORT_TEXT_MIN_TEMPO, "syllable_formant_expand_with_tail_fill"
     if requested_tempo < RUBBERBAND_MIN_TEMPO:
