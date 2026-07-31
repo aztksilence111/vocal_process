@@ -74,6 +74,7 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 }
 RUBBERBAND_MIN_TEMPO = 0.01
 RUBBERBAND_MAX_TEMPO = 100.0
+RUBBERBAND_SHORT_TEXT_MIN_TEMPO = 0.35
 DAW_WAV_CODEC = "pcm_s24le"
 MIN_MATERIAL_TARGET_DURATION_SECONDS = 0.001
 RENDERED_CLIP_CONCAT_LIST_THRESHOLD = 64
@@ -81,7 +82,9 @@ MATERIAL_RENDER_FADE_SECONDS = 0.010
 MATERIAL_RENDER_MIN_FADE_SECONDS = 0.002
 MATERIAL_RENDER_MIN_FADE_TARGET_SECONDS = 0.050
 MATERIAL_RENDER_FADE_TARGET_FRACTION = 0.08
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v3_exact_target_fade"
+MATERIAL_RENDER_DURATION_TOLERANCE_SECONDS = 0.025
+MATERIAL_RENDER_DURATION_TOLERANCE_RATIO = 0.001
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v4_probe_corrected_formant_expand"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -416,6 +419,145 @@ def _build_rendered_clip_concat_args(
     return args
 
 
+def _build_duration_correction_args(
+    input_path: Path,
+    output_path: Path,
+    target_duration: float,
+    options: ProcessOptions,
+    *,
+    fade: bool = False,
+    progress: bool = False,
+) -> list[str]:
+    _validate_options(options)
+    if target_duration <= 0:
+        raise AudioProcessorError("target_duration must be greater than 0")
+
+    args = ["ffmpeg", "-hide_banner"]
+    if progress:
+        args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+
+    args.extend(
+        [
+            "-y",
+            "-i",
+            str(input_path),
+            "-af",
+            ",".join(_exact_duration_filters(target_duration, fade=fade)),
+        ]
+    )
+
+    if options.sample_rate is not None:
+        args.extend(["-ar", str(options.sample_rate)])
+
+    if options.channels is not None:
+        args.extend(["-ac", str(options.channels)])
+
+    codec = options.codec or _default_audio_codec(output_path)
+    if codec:
+        args.extend(["-codec:a", codec])
+
+    args.append(str(output_path))
+    return args
+
+
+def _ensure_audio_duration(
+    path: Path,
+    target_duration: float,
+    options: ProcessOptions,
+    *,
+    on_progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+    progress_message: str = "Correcting audio duration",
+    fade: bool = False,
+) -> float:
+    if target_duration <= 0:
+        raise AudioProcessorError("target_duration must be greater than 0")
+
+    actual_duration = _probe_audio_duration_seconds(path)
+    if _duration_matches_target(actual_duration, target_duration):
+        return float(actual_duration or 0.0)
+    if not path.exists():
+        raise AudioProcessorError(f"Rendered audio was not created: {path}")
+
+    temp_path = _duration_correction_temp_path(path)
+    correction_options = ProcessOptions(
+        input_path=path,
+        output_path=temp_path,
+        overwrite=True,
+        sample_rate=options.sample_rate,
+        channels=options.channels,
+        codec=options.codec,
+    )
+    args = _build_duration_correction_args(
+        path,
+        temp_path,
+        target_duration,
+        correction_options,
+        fade=fade,
+        progress=True,
+    )
+
+    def correction_progress(progress: float, message: str) -> None:
+        _notify_progress(on_progress, progress, f"{progress_message}: {message}")
+
+    try:
+        _run_progress_process(
+            args,
+            duration_seconds=target_duration,
+            on_progress=correction_progress,
+            should_cancel=should_cancel,
+        )
+        corrected_duration = _probe_audio_duration_seconds(temp_path)
+        if not _duration_matches_target(corrected_duration, target_duration):
+            actual_text = "unknown" if corrected_duration is None else f"{corrected_duration:.6f}s"
+            raise AudioProcessorError(
+                "Duration correction failed for "
+                f"{path}: target={target_duration:.6f}s actual={actual_text}"
+            )
+        temp_path.replace(path)
+        return float(corrected_duration or target_duration)
+    finally:
+        _remove_file_if_exists(temp_path)
+
+
+def _duration_correction_temp_path(path: Path) -> Path:
+    suffix = path.suffix or ".wav"
+    return path.with_name(f"{path.stem}.duration-fix-{os.getpid()}-{time.time_ns()}{suffix}")
+
+
+def _probe_audio_duration_seconds(path: Path) -> float | None:
+    if not path.exists():
+        return None
+    try:
+        duration = get_audio_duration_seconds(probe_audio(path))
+    except AudioProcessorError:
+        return None
+    if duration <= 0:
+        return None
+    return duration
+
+
+def _duration_matches_target(actual_duration: float | None, target_duration: float) -> bool:
+    if actual_duration is None or target_duration <= 0:
+        return False
+    tolerance = _duration_tolerance_seconds(target_duration)
+    return abs(actual_duration - target_duration) <= tolerance
+
+
+def _duration_tolerance_seconds(target_duration: float) -> float:
+    return max(
+        MATERIAL_RENDER_DURATION_TOLERANCE_SECONDS,
+        abs(target_duration) * MATERIAL_RENDER_DURATION_TOLERANCE_RATIO,
+    )
+
+
+def _remove_file_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
 def process_audio(options: ProcessOptions) -> None:
     run_command(build_process_args(_normalize_options(options)))
 
@@ -484,6 +626,16 @@ def process_material_clip_with_progress(
         on_progress=on_progress,
         should_cancel=should_cancel,
     )
+    if target_duration is not None:
+        _ensure_audio_duration(
+            normalized_output,
+            target_duration,
+            options,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+            progress_message="Correcting material clip duration",
+            fade=False,
+        )
 
 
 def assemble_material_to_reference_with_progress(
@@ -550,6 +702,15 @@ def assemble_material_to_reference_with_progress(
         on_progress=on_progress,
         should_cancel=should_cancel,
     )
+    _ensure_audio_duration(
+        normalized_output,
+        reference_duration,
+        options,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
+        progress_message="Correcting assembled audio duration",
+        fade=False,
+    )
 
 
 def _assemble_material_clips_with_render_cache(
@@ -584,13 +745,16 @@ def _assemble_material_clips_with_render_cache(
 
         cache_path = cache_root / f"{_material_render_cache_key(clip, options)}.wav"
         if cache_path.exists():
-            rendered_paths.append(cache_path)
-            _notify_progress(
-                on_progress,
-                clip.index / total_steps,
-                f"Reused rendered material clip {clip.index}/{len(clips)}",
-            )
-            continue
+            cached_duration = _probe_audio_duration_seconds(cache_path)
+            if _duration_matches_target(cached_duration, clip.target_duration_seconds):
+                rendered_paths.append(cache_path)
+                _notify_progress(
+                    on_progress,
+                    clip.index / total_steps,
+                    f"Reused rendered material clip {clip.index}/{len(clips)}",
+                )
+                continue
+            _remove_file_if_exists(cache_path)
 
         cache_options = ProcessOptions(
             input_path=clip.source_path,
@@ -621,6 +785,15 @@ def _assemble_material_clips_with_render_cache(
             on_progress=clip_progress,
             should_cancel=should_cancel,
         )
+        _ensure_audio_duration(
+            cache_path,
+            clip.target_duration_seconds,
+            cache_options,
+            on_progress=clip_progress,
+            should_cancel=should_cancel,
+            progress_message="Correcting rendered material clip duration",
+            fade=False,
+        )
         rendered_paths.append(cache_path)
 
     concat_list_path = None
@@ -646,6 +819,15 @@ def _assemble_material_clips_with_render_cache(
         duration_seconds=reference_duration,
         on_progress=concat_progress,
         should_cancel=should_cancel,
+    )
+    _ensure_audio_duration(
+        output_path,
+        reference_duration,
+        options,
+        on_progress=concat_progress,
+        should_cancel=should_cancel,
+        progress_message="Correcting concatenated material audio duration",
+        fade=False,
     )
 
 
@@ -887,11 +1069,15 @@ def _build_material_clip_filter(
 
 
 def _target_duration_filters(target_duration: float) -> list[str]:
+    return _exact_duration_filters(target_duration, fade=True)
+
+
+def _exact_duration_filters(target_duration: float, *, fade: bool) -> list[str]:
     filters = [
         f"apad=whole_dur={target_duration:.6f}",
         f"atrim=duration={target_duration:.6f}",
     ]
-    fade_seconds = _material_clip_fade_seconds(target_duration)
+    fade_seconds = _material_clip_fade_seconds(target_duration) if fade else 0.0
     if fade_seconds > 0:
         filters.extend(
             [
@@ -1101,8 +1287,8 @@ def _resolve_material_text_hints(count: int, hints: Sequence[str] | None) -> lis
 def _resolve_stretch_strategy(requested_tempo: float, text_hint: str) -> tuple[float, str]:
     if requested_tempo > RUBBERBAND_MAX_TEMPO:
         return RUBBERBAND_MAX_TEMPO, "rubberband_max_compression_floor"
-    if _is_short_material_text(text_hint) and requested_tempo < 0.75:
-        return 0.75, "syllable_safe_expand_with_tail_padding"
+    if _is_short_material_text(text_hint) and requested_tempo < RUBBERBAND_SHORT_TEXT_MIN_TEMPO:
+        return RUBBERBAND_SHORT_TEXT_MIN_TEMPO, "syllable_formant_expand_with_tail_fill"
     if requested_tempo < RUBBERBAND_MIN_TEMPO:
         return RUBBERBAND_MIN_TEMPO, "rubberband_max_expansion_ceiling"
     return requested_tempo, "rubberband_full_clip"

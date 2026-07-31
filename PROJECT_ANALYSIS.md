@@ -1,5 +1,17 @@
 # Project Analysis
 
+## Latest Update - 2026-07-31 渲染时长强校验与短字音 formant 拉伸
+
+本轮把渲染链路从“计划层时长正确”推进到“输出文件真实时长必须正确”。最新自治跑分中 `1000nenyikiteru_JP__vmzJP` 暴露了关键矛盾：timeline 目标总时长已经等于原人声 `194.155102s`，但渲染 wav 实际只有 `123.641062s`。这说明继续只优化 ASR/排序无法解决验收问题，必须在 FFmpeg 输出边界加真实 probe 和自动修复。
+
+实现上，`audio_processor.engine` 现在对每个缓存素材片段、新渲染素材片段、单素材直出和最终拼接成品都执行目标时长校验。缓存文件只有在实际时长落入严格容差内才允许复用；错长缓存会被删除并重渲染。新渲染或最终 concat 输出如果仍有偏差，会先写入同目录临时文件，用 `apad/atrim/asetpts` 做精确时长校正并再次 probe，校验通过后再替换原文件。缓存 key 已随 `MATERIAL_RENDER_FILTER_FORMAT` 升级，避免旧 filter 版本输出继续污染新评估。
+
+听感连续性方面，短字音极端扩展不再只把 Rubber Band 限制到 `tempo=0.75` 后大量补静音；新的 `syllable_formant_expand_with_tail_fill` 使用 `tempo=0.35` 的共振峰保持拉伸，再做尾部补齐。该策略仍会把极端素材短缺标记为风险，因为 0.1-0.5 秒字音硬拉到长音本质上受素材质量限制，但它减少了长音中无声空白的占比，适合下一轮真实输出听感复查。
+
+DAW 导出现在复用同一套 `_ensure_audio_duration()` 保护，避免 flat wav 输出和 DAW timeline clip 的实际时长不一致。验证已经覆盖 mock 层和真实 FFmpeg 小样本：0.5 秒素材按新短字音策略拉伸/补齐到 2.0 秒，probe 输出为 `2.0s`。全量单测在补齐 `pypinyin` 与 `huggingface_hub` 后通过 158 项，`audio_processor check` 通过，`git diff --check` 仅剩 CRLF 提示。
+
+剩余评估重点是完整 rendered real-eval 的实际分数，而不是单个 smoke：下一轮后台自治必须关注 `render_duration_delta_ratio` 是否从约 `0.33` 降到接近 0、`render_validation.status` 是否转为 `ok`，以及 `stretch_quality_score` / `continuity_warning_ratio` 是否随短字音策略改善。如果真实听感仍有明显断裂，下一步应在候选选择层增加“同音/近音但更长、更稳定素材优先”的全局排序约束，并评估跨片段边界平滑。
+
 ## Latest Update - 2026-07-31 Japanese Mora Guard and JP ASR Backend Protection
 
 This continuation targeted the Japanese failure mode reported by the user: the previous evaluation path could still route Japanese reference/material analysis through the Chinese FunASR backend, and the timeline layer could split Japanese long vowels into extra clip slots. The runtime now carries CN/JP language hints into reference analysis, material analysis, and cache keys; when a JP hint would otherwise use `funasr`, the backend is guarded over to a multilingual backend instead of reusing the Chinese-only transcript path. The guard is recorded in notes and cache fingerprints so old FunASR Japanese results do not get reused silently.

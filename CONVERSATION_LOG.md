@@ -1,5 +1,17 @@
 # Conversation Log
 
+## Latest Update - 2026-07-31 渲染时长校正与短字音拉伸改良
+
+1. 本轮针对用户指出的“拉伸质量低、拼接连续性差、输出音频没有严格贴合原人声时长”继续修复。最新后台自治在 `real-eval-render-full` 中被人工停止，已完成的 `1000nenyikiteru_JP__vmzJP` 案例显示计划时长总和为 `194.155102s`，但输出 wav 只有 `123.641062s`，说明问题不只是识别和排序，而是渲染成品没有被真实时长校验。
+2. 根因判断：原有 FFmpeg filter 已包含 `rubberband=formant=preserved`、`apad` 和 `atrim`，但 `.vocalprocess_render_cache` 命中时没有 probe 真实时长，最终 concat 后也没有二次校正；因此旧缓存或异常渲染可能让“计划时长正确、实际输出短很多”的错误继续进入跑分。
+3. `audio_processor.engine` 新增真实音频时长保护：每个素材片段缓存命中前先 probe 实际时长，不匹配目标字音时长就删除缓存并重渲染；新渲染片段、单素材直出、最终拼接 wav 都会通过临时文件执行 `apad/atrim/asetpts` 校正，校验通过后再替换原输出。
+4. 为改善短字音被拉成长音时的大段静音问题，短文本素材的极端扩展策略从 `tempo=0.75` 改为 `tempo=0.35` 的 Rubber Band 共振峰保持拉伸，再做尾部补齐；策略名更新为 `syllable_formant_expand_with_tail_fill`。这不会掩盖素材过短的根本风险，但会减少长音/拖音只靠空白填充的比例。
+5. `audio_processor.daw` 也接入同一套时长校正，保证导出的 DAW timeline clip 的 `actual_duration_seconds` 来自校正后的文件，避免平铺 wav 与 DAW 工程表现不一致。
+6. 新增测试覆盖：错误时长缓存不会复用、时长校正不会重复添加边界淡入淡出、错长音频会被替换为目标时长、重复素材仍只渲染一次、短字音新拉伸策略生效。
+7. 验证结果：`python -m compileall audio_processor tests` 通过；聚焦测试 `python -m unittest tests.test_engine.MaterialAssemblyTests tests.test_engine.DawRenderReuseTests` 通过 16 项；补齐当前环境缺失的 `pypinyin` 和 `huggingface_hub` 后，`python -m unittest discover` 通过 158 项；`python -m audio_processor check` 通过；`git diff --check` 仅保留 CRLF 换行提示。
+8. 真实 FFmpeg 小样本验证通过：0.5 秒素材按 `syllable_formant_expand_with_tail_fill` 以 `tempo=0.35` 拉伸/补齐到 2.0 秒，最终输出 probe 为 `2.0s`。
+9. 下一步恢复后台自治跑完整 rendered real-eval，重点观察 `render_duration_delta_ratio`、`render_validation.status`、`stretch_quality_score`、`continuity_warning_ratio` 和 JP/vmzJP 最差组是否改善；如果仍然听感断裂，继续从候选选择层提高“更长同音素材优先”和跨字音边界平滑。
+
 ## Latest Update - 2026-07-31 Japanese Mora Guard and JP ASR Backend Protection
 
 1. This continuation targeted the Japanese regression reported by the user. The runtime now carries CN/JP hints into reference analysis, material analysis, and cache keys, so JP references no longer reuse a Chinese FunASR result by accident.

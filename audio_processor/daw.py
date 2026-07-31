@@ -12,6 +12,7 @@ from typing import Callable, Sequence
 from .engine import (
     AudioProcessorError,
     ProcessOptions,
+    _ensure_audio_duration,
     get_audio_duration_seconds,
     list_audio_files,
     plan_material_stretch_clips,
@@ -197,6 +198,15 @@ def export_daw_timeline_with_progress(
             )
             rendered_cache[cache_key] = clip.rendered_path
 
+        _ensure_audio_duration(
+            clip.rendered_path,
+            clip.target_duration_seconds,
+            clip_options,
+            on_progress=clip_progress,
+            should_cancel=should_cancel,
+            progress_message=f"Correcting DAW clip {clip.index}/{len(plan.clips)} duration",
+            fade=False,
+        )
         actual_duration = get_audio_duration_seconds(probe_audio(clip.rendered_path))
         rendered_clips.append(
             DawTimelineClip(

@@ -34,8 +34,10 @@ from audio_processor.handoff import (
 from audio_processor.engine import (
     AudioProcessorError,
     ProcessOptions,
+    _build_duration_correction_args,
     _build_material_filter_graph,
     _build_rendered_clip_concat_args,
+    _ensure_audio_duration,
     _write_rendered_clip_concat_list,
     assemble_material_to_reference_with_progress,
     build_material_assembly_args,
@@ -357,14 +359,50 @@ class MaterialAssemblyTests(unittest.TestCase):
             )
 
         self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 0.25)
-        self.assertAlmostEqual(clips[0].tempo, 0.75)
-        self.assertEqual(clips[0].stretch_strategy, "syllable_safe_expand_with_tail_padding")
+        self.assertAlmostEqual(clips[0].tempo, 0.35)
+        self.assertEqual(clips[0].stretch_strategy, "syllable_formant_expand_with_tail_fill")
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
         self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
         self.assertLess(clips[0].stretch_naturalness_score, 0.2)
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["boundary_conditioning"], "fade_in_out")
         self.assertEqual(rendered[0]["formant_preservation"], "rubberband_formant_preserved")
+
+    def test_duration_correction_command_preserves_exact_duration_without_extra_fades(self) -> None:
+        args = _build_duration_correction_args(
+            Path("clip.wav"),
+            Path("clip.fixed.wav"),
+            2.0,
+            ProcessOptions(input_path=Path("clip.wav"), output_path=Path("clip.fixed.wav"), overwrite=True),
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertIn("apad=whole_dur=2.000000", filters)
+        self.assertIn("atrim=duration=2.000000", filters)
+        self.assertIn("asetpts=N/SR/TB", filters)
+        self.assertNotIn("afade=", filters)
+
+    def test_duration_correction_replaces_mismatched_audio(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clip = root / "clip.wav"
+            _write_test_wave(clip, duration_seconds=0.5)
+
+            def fake_correction(args: list[str], **_: object) -> None:
+                _write_test_wave(Path(args[-1]), duration_seconds=2.0)
+
+            with patch("audio_processor.engine._run_progress_process", side_effect=fake_correction) as run_mock:
+                corrected = _ensure_audio_duration(
+                    clip,
+                    2.0,
+                    ProcessOptions(input_path=clip, output_path=clip, overwrite=True),
+                )
+                final_duration = get_audio_duration_seconds(probe_audio(clip))
+
+        self.assertAlmostEqual(corrected, 2.0)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertAlmostEqual(final_duration, 2.0)
 
     def test_flat_wav_assembly_reuses_duplicate_render_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -387,17 +425,54 @@ class MaterialAssemblyTests(unittest.TestCase):
             ) -> None:
                 _write_test_wave(output_path, duration_seconds=target_duration or 1.0)
 
-            with patch(
-                "audio_processor.engine.probe_audio",
-                side_effect=[
-                    {"format": {"duration": "2.0"}, "streams": []},
-                    {"format": {"duration": "2.0"}, "streams": []},
-                    {"format": {"duration": "1.0"}, "streams": []},
-                    {"format": {"duration": "1.0"}, "streams": []},
-                ],
-            ):
+            def fake_concat(args: list[str], **_: object) -> None:
+                _write_test_wave(Path(args[-1]), duration_seconds=2.0)
+
+            with patch("audio_processor.engine.process_material_clip_with_progress", side_effect=fake_render) as render_mock:
+                with patch("audio_processor.engine._run_progress_process", side_effect=fake_concat) as concat_mock:
+                    assemble_material_to_reference_with_progress(
+                        reference,
+                        root,
+                        output,
+                        ProcessOptions(input_path=reference, output_path=output, overwrite=True),
+                        material_paths=[material, material],
+                        material_target_durations=[1.0, 1.0],
+                    )
+
+        self.assertEqual(render_mock.call_count, 1)
+        concat_mock.assert_called_once()
+
+    def test_flat_wav_assembly_regenerates_wrong_duration_render_cache(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "material.wav"
+            output = root / "output.wav"
+            cache_root = root / ".vocalprocess_render_cache"
+            cache_root.mkdir()
+            stale_cache = cache_root / "fixed-cache-key.wav"
+            _write_test_wave(reference, duration_seconds=2.0)
+            _write_test_wave(material, duration_seconds=1.0)
+            _write_test_wave(stale_cache, duration_seconds=0.25)
+
+            def fake_render(
+                input_path: Path,
+                output_path: Path,
+                tempo: float,
+                options: ProcessOptions,
+                *,
+                target_duration: float | None = None,
+                on_progress=None,
+                should_cancel=None,
+            ) -> None:
+                _write_test_wave(output_path, duration_seconds=target_duration or 1.0)
+
+            def fake_concat(args: list[str], **_: object) -> None:
+                _write_test_wave(Path(args[-1]), duration_seconds=2.0)
+
+            with patch("audio_processor.engine._material_render_cache_key", return_value="fixed-cache-key"):
                 with patch("audio_processor.engine.process_material_clip_with_progress", side_effect=fake_render) as render_mock:
-                    with patch("audio_processor.engine._run_progress_process") as concat_mock:
+                    with patch("audio_processor.engine._run_progress_process", side_effect=fake_concat):
                         assemble_material_to_reference_with_progress(
                             reference,
                             root,
@@ -406,9 +481,10 @@ class MaterialAssemblyTests(unittest.TestCase):
                             material_paths=[material, material],
                             material_target_durations=[1.0, 1.0],
                         )
+                        final_cache_duration = get_audio_duration_seconds(probe_audio(stale_cache))
 
         self.assertEqual(render_mock.call_count, 1)
-        concat_mock.assert_called_once()
+        self.assertAlmostEqual(final_cache_duration, 1.0)
 
     def test_large_rendered_clip_concat_uses_concat_list_to_avoid_windows_command_limit(self) -> None:
         with TemporaryDirectory() as temp_dir:
