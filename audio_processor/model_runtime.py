@@ -2030,7 +2030,11 @@ def _transcribe_with_funasr(
         f"funasr_vad_model={vad_model or 'disabled'}",
         f"funasr_punc_model={punc_model or 'disabled'}",
     ]
-    if timestamps and not unit_timings:
+    if any(timing.timing_source == "funasr_timestamp_resampled" for timing in unit_timings):
+        notes.append(
+            "funasr_timestamp_resampled: timestamp count did not match normalized transcript units"
+        )
+    elif timestamps and not unit_timings:
         notes.append(
             "funasr_timestamp_mismatch: timestamp count did not match normalized transcript units"
         )
@@ -2163,7 +2167,7 @@ def _unit_timings_from_funasr_timestamps(
             for unit, _, _ in spans
         ]
         if sum(expanded_counts) != len(timestamps):
-            return ()
+            return _resampled_unit_timings_from_funasr_timestamps(spans, timestamps)
         groups = []
         cursor = 0
         for count in expanded_counts:
@@ -2190,6 +2194,63 @@ def _unit_timings_from_funasr_timestamps(
             )
         )
     return tuple(timings)
+
+
+def _resampled_unit_timings_from_funasr_timestamps(
+    spans: Sequence[tuple[str, int, int]],
+    timestamps: Sequence[tuple[float, float]],
+) -> tuple[VoiceUnitTiming, ...]:
+    if not spans or not timestamps:
+        return ()
+
+    boundaries = _funasr_timestamp_boundary_points(timestamps)
+    if len(boundaries) <= 1:
+        return ()
+
+    source_count = len(boundaries) - 1
+    target_count = len(spans)
+    timings: list[VoiceUnitTiming] = []
+    for index, (unit, _start_index, _end_index) in enumerate(spans):
+        start_seconds = _interpolate_boundary_point(boundaries, (index * source_count) / target_count)
+        end_seconds = _interpolate_boundary_point(boundaries, ((index + 1) * source_count) / target_count)
+        if end_seconds <= start_seconds:
+            continue
+        timings.append(
+            VoiceUnitTiming(
+                position=index,
+                unit=unit,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                confidence=None,
+                timing_source="funasr_timestamp_resampled",
+            )
+        )
+    return tuple(timings)
+
+
+def _funasr_timestamp_boundary_points(
+    timestamps: Sequence[tuple[float, float]],
+) -> tuple[float, ...]:
+    ordered = [
+        (float(start), float(end))
+        for start, end in timestamps
+        if end > start
+    ]
+    if not ordered:
+        return ()
+
+    boundaries = [ordered[0][0]]
+    for index in range(1, len(ordered)):
+        previous_end = ordered[index - 1][1]
+        current_start = ordered[index][0]
+        boundary = max(current_start, previous_end, boundaries[-1])
+        boundaries.append(boundary)
+
+    final_end = max(ordered[-1][1], boundaries[-1])
+    if final_end <= boundaries[0]:
+        return ()
+    boundaries.append(final_end)
+    return tuple(boundaries)
 
 
 def _funasr_transcript_segment(
@@ -2633,6 +2694,7 @@ def _reference_cache_path(
         "asr_model": DEFAULT_ASR_MODEL,
         "asr_backend": _asr_backend_cache_key(),
         "reference_unit_timing_format": "voice_unit_timing_v1",
+        "funasr_timestamp_mismatch_policy": "resample_to_reference_units_v1",
         "whisperx_return_char_alignments": True,
         "speaker_model": SPEAKER_EMBEDDING_MODEL,
         "compute_device": compute_device,

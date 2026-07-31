@@ -1,7 +1,16 @@
 # Project Analysis
 
-## Latest Update - 2026-07-31 Lyric Timing Resample for Target-Unit Authority
-# Latest Update - 2026-07-31 Timeline Lattice Resample for Target-Unit Coverage
+## Latest Update - 2026-07-31 FunASR Timestamp Resample for Missing Unit Coverage
+
+This continuation closed the remaining `missing_aligned_unit_timing` gap without changing score thresholds or adding corpus-specific exceptions. The failure class was a density mismatch between FunASR timestamp spans and the normalized reference unit lattice: the previous path returned an empty timing tuple when neither direct one-to-one timestamp mapping nor ASCII expansion explained the mismatch. That behavior was too brittle for no-lyrics references, where the original-vocal ASR/aligned pronunciation units are the only target-unit source.
+
+`audio_processor.model_runtime` now keeps the original FunASR timing span as the source authority and resamples its monotonic timestamp boundary lattice onto the normalized reference units. Exact timestamp/unit matches still use the precise direct mapping; the new path only activates when the timestamp count is incompatible with the target unit lattice. The resulting units are tagged as `funasr_timestamp_resampled`, which keeps them gap-sensitive while making diagnostics distinguish precise timestamp mapping from mismatch recovery. The reference cache key was bumped to prevent stale empty unit-timing reports from masking the change.
+
+Full rendered verification at `tests_real\output\real-eval-20260731-102644\summary.json` completed 13/13 rendered cases. Compared with `real-eval-20260731-091722`, suite timing quality improved: `missing_aligned_unit_timing` 1 -> 0, `planning_alignment_score.mean` 0.764292 -> 0.783788, `planning_alignment_score.min` 0.442402 -> 0.695851, `rendered_audio_alignment_score.mean` 0.740518 -> 0.755482, `rendered_audio_alignment_score.min` 0.482704 -> 0.644692, and `render_duration_delta_ratio.mean` 0.330804 -> 0.329436. The worst affected reference `PlasticLove_JP__vmzJP` moved from no aligned timing coverage to `reference_unit_timing_count=361`, `positioned_decision_count=658`, `timed_target_duration_count=658`, `timed_target_duration_ratio=1.0`, and `aligned_timing_score=1.0`.
+
+The change did not materially affect CN groups, and JP/vmzJP remains the worst cohort. Residual issues shifted toward render/stretch duration mismatch and low-confidence material ordering: `strict_render_pass_count` remains 0, `low_match_score` rose 128 -> 133, `moderate_stretch_ratio` rose 1191 -> 1200, `single_syllable_extreme_stretch` improved 1910 -> 1878, and `ambiguous_phonetic_position` remained 0. The next durable improvement should target render bounds and stretch allocation so exported concatenated material audio duration tracks the reference after unit timing coverage is complete.
+
+## Latest Update - 2026-07-31 Timeline Lattice Resample for Target-Unit Coverage
 
 This continuation widened the timing bridge in `audio_processor.model_runtime` beyond the previous lyric-retarget path. When a reference segment has fewer aligned unit timings than the unit lattice implied by its text and positioned decisions, the runtime now resamples the segment-level timing lattice first and then resolves positioned spans against that complete lattice. That keeps positioned timing on the aligned-unit path instead of dropping later decisions to proportional segment split just because the source alignment is coarser than the text lattice.
 

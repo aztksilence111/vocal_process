@@ -2969,6 +2969,20 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(timings[2].start_seconds, 0.6)
         self.assertEqual(timings[2].end_seconds, 1.0)
 
+    def test_funasr_timestamp_mismatch_resamples_to_reference_units(self) -> None:
+        timings = model_runtime._unit_timings_from_funasr_timestamps(
+            "a b c d",
+            ((0.0, 1.0), (1.0, 4.0)),
+        )
+
+        self.assertEqual([timing.unit for timing in timings], ["a", "b", "c", "d"])
+        self.assertEqual([timing.position for timing in timings], [0, 1, 2, 3])
+        self.assertTrue(all(timing.timing_source == "funasr_timestamp_resampled" for timing in timings))
+        self.assertEqual(
+            [(round(timing.start_seconds, 6), round(timing.end_seconds, 6)) for timing in timings],
+            [(0.0, 0.5), (0.5, 1.0), (1.0, 2.5), (2.5, 4.0)],
+        )
+
     def test_transcribe_audio_uses_funasr_when_requested(self) -> None:
         class FakeFunasrModel:
             def generate(self, **kwargs: object) -> list[dict[str, object]]:

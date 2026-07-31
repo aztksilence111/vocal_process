@@ -1,6 +1,17 @@
 # Conversation Log
 
-# Latest Update - 2026-07-31 Timeline Lattice Resample for Expanded Target Units
+## Latest Update - 2026-07-31 FunASR Timestamp Resample for Unit Timing Coverage
+
+1. This continuation resumed from the latest rendered real-eval state and treated `tests_real\output\real-eval-20260731-102644\summary.json` as the acceptance signal after running the full suite through `scripts\run_real_eval_render_full.ps1`.
+2. `audio_processor.model_runtime._unit_timings_from_funasr_timestamps()` now handles FunASR timestamp/text unit count mismatches by building a monotonic timestamp boundary lattice and resampling it onto the reference pronunciation/text units instead of returning no unit timings.
+3. The change is general to timestamp density mismatches. It does not hard-code references, material sets, song names, filenames, language exceptions, or looser thresholds. Resampled units are marked with `timing_source="funasr_timestamp_resampled"` and the reference cache key was bumped so stale empty timing caches are not reused.
+4. Added a focused regression proving two FunASR timestamp spans can be resampled onto four reference units while preserving ordered start/end boundaries across the full timing span.
+5. Compared with `real-eval-20260731-091722`, the new full rendered run completed 13/13 rendered cases with `missing_aligned_unit_timing` 1 -> 0, `planning_alignment_score.mean` 0.764292 -> 0.783788, `planning_alignment_score.min` 0.442402 -> 0.695851, `rendered_audio_alignment_score.mean` 0.740518 -> 0.755482, and `render_duration_delta_ratio.mean` 0.330804 -> 0.329436.
+6. `PlasticLove_JP__vmzJP` was the affected worst case: `reference_unit_timing_count` 0 -> 361, `timed_target_duration_count` 0 -> 658, `timed_target_duration_ratio` 0 -> 1, `aligned_timing_score` 0 -> 1, planning score 0.442402 -> 0.695851, and render score 0.482704 -> 0.677236. Its target duration total now matches the 308.723810s reference duration, while rendered output duration is still short at 191.838271s.
+7. Residual risks are recorded rather than hidden: `strict_render_pass_count` remains 0, `low_match_score` rose 128 -> 133, `moderate_stretch_ratio` rose 1191 -> 1200, `single_syllable_extreme_stretch` improved 1910 -> 1878, and `ambiguous_phonetic_position` remained 0. The next algorithmic target should be render/stretch duration alignment for the worst JP/vmzJP cohort.
+8. Verification passed: targeted FunASR/timeline unit tests, full `python -m unittest discover` with 147 tests, `compileall -q audio_processor tests`, `audio_processor check`, `git diff --check` with only CRLF warnings, and the full rendered real-eval run.
+
+## Latest Update - 2026-07-31 Timeline Lattice Resample for Expanded Target Units
 
 1. This continuation kept the project context anchored on pronunciation-first ordering and pronunciation-level timing accuracy, then changed the timeline bridge so positioned spans can use a resampled unit lattice whenever the reference text unit count differs from the available aligned unit timings.
 2. `audio_processor.model_runtime` now builds a segment-level resampled lattice for positioned timing spans instead of dropping straight to proportional segment split when the original aligned unit timing count is shorter than the text/unit lattice implied by the reference segment and decision positions.
