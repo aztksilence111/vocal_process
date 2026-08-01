@@ -1,5 +1,21 @@
 # Project Analysis
 
+## Latest Update - 2026-08-01 Short-Text Loop Fill for Extreme Expansion
+
+本轮把短字音长目标的渲染问题从“时长准确但后段静音”推进到“时长准确且有声音内容填充”。旧策略 `syllable_formant_expand_with_tail_fill` 在短文本素材扩展超过 Rubber Band 安全下限时，会先把素材拉到 `tempo=0.35`，再用 `apad` 补齐剩余目标时长。对于真实评测里 0.3-0.6 秒素材被分配到 2 秒、5 秒甚至更长目标时长的场景，这会形成大段静音尾部，正是用户此前反馈的拉伸听感差、拼接连续性弱的根源之一。
+
+新策略 `syllable_formant_expand_with_loop_fill` 保留 Rubber Band 的 `pitch=1:formant=preserved`，但在极限短文本扩展时用 FFmpeg `aloop=loop=-1:size=2147483647:start=0` 循环填充，再用 `atrim` 精确裁到目标时长，并保留短淡入淡出。渲染缓存 key 已通过 `material_render_filter_v6_short_text_loop_fill` 失效旧缓存，避免旧静音尾补结果复用。批量渲染和 DAW 导出都传递 `text_hint`，因此短文本判定在 flat wav 与 DAW timeline 中一致。
+
+诊断层同步更新：per-clip stretch plan 现在会写出 `loop_fill+fade_in_out`，preflight 的 `render_continuity.boundary_conditioning` 会聚合为 `short_text_loop_fill+per_clip_fade_in_out`。自然度评分对 loop fill 略微减轻短文本极限扩展惩罚，但仍保留 `single_syllable_boundary_risk`，因为循环填充只能消除静音尾部，不能保证真正的音素级 formant/F0 连续。
+
+验证结论：
+
+1. 单元验证通过：`compileall -q audio_processor tests packaging`，完整 `unittest discover` 163 项，`audio_processor check`，`git diff --check`（仅 CRLF 提示）。
+2. 真实 FFmpeg smoke 证明 0.5 秒输入经 `rubberband + aloop + atrim` 可稳定输出 `2.000000s`。
+3. 真实单 case render smoke：`.tmp\loop-fill-render-smoke\real-eval-20260801-160655\summary.json`。`FengZhongYouDuo_CN__newOTTO` 为 `rendered`，`render_validation.status=ok`，输出 `259.276576s`，参考 `259.276190s`，`duration_delta_ratio=1e-06`，`rendered_audio_alignment_score=0.839569`，`stretch_quality_score=0.692922`，`boundary_conditioning=short_text_loop_fill+per_clip_fade_in_out`。
+
+剩余架构风险仍在选材和素材覆盖层：loop fill 避免了静音尾部，但极长单音节目标仍可能出现循环边界感；严格通过失败仍来自 `reference_asr_unverified`、1 个低匹配和素材缺失/极端拉伸风险。下一轮完整 rendered real-eval 应重点比较 JP/vmzJP 最差组，并继续做低匹配候选选择、近音替代和素材缺失诊断，而不是放松 strict thresholds。
+
 ## Latest Update - 2026-07-31 极短片段安全路径与失败输出隔离
 
 这轮修复把真实验收里的两个边界问题拆开处理。第一个问题是极短目标片段在 FFmpeg Rubber Band 路径上会失败：`1000nenyikiteru_JP__vmzJP` 中最短片段 `ka1.wav` 的目标时长只有 `0.014074s`，原先直接走 `rubberband` 时触发 `Operation not permitted`。第二个问题是渲染失败后旧输出还留在原路径，`real_eval` 继续 probe 旧 wav 时长，导致“渲染失败却看起来有输出”的假阳性。

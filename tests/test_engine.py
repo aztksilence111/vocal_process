@@ -240,6 +240,25 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("afade=t=out:st=1.990000:d=0.010000", filters)
         self.assertNotIn("stream_loop", args)
 
+    def test_material_clip_command_uses_loop_fill_for_short_text_expansion(self) -> None:
+        args = build_material_clip_args(
+            Path("clip.wav"),
+            Path("clip_loop.wav"),
+            0.35,
+            ProcessOptions(input_path=Path("clip.wav"), output_path=Path("clip_loop.wav")),
+            target_duration=2.0,
+            text_hint="shi",
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertIn("rubberband=tempo=0.35000000:pitch=1:formant=preserved", filters)
+        self.assertIn("aloop=loop=-1:size=2147483647:start=0", filters)
+        self.assertIn("atrim=duration=2.000000", filters)
+        self.assertIn("afade=t=in:st=0:d=0.010000", filters)
+        self.assertIn("afade=t=out:st=1.990000:d=0.010000", filters)
+        self.assertNotIn("apad=whole_dur=2.000000", filters)
+
     def test_tiny_target_material_clip_skips_rubberband_failure_path(self) -> None:
         args = build_material_clip_args(
             Path("clip.wav"),
@@ -380,7 +399,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertAlmostEqual(clips[0].tempo, 100.0)
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
 
-    def test_short_material_expansion_uses_syllable_safe_tail_padding(self) -> None:
+    def test_short_material_expansion_uses_syllable_safe_loop_fill(self) -> None:
         with patch(
             "audio_processor.engine.probe_audio",
             side_effect=[
@@ -396,12 +415,12 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 0.25)
         self.assertAlmostEqual(clips[0].tempo, 0.35)
-        self.assertEqual(clips[0].stretch_strategy, "syllable_formant_expand_with_tail_fill")
+        self.assertEqual(clips[0].stretch_strategy, "syllable_formant_expand_with_loop_fill")
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
         self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
         self.assertLess(clips[0].stretch_naturalness_score, 0.2)
         rendered = render_material_stretch_plan(clips)
-        self.assertEqual(rendered[0]["boundary_conditioning"], "fade_in_out")
+        self.assertEqual(rendered[0]["boundary_conditioning"], "loop_fill+fade_in_out")
         self.assertEqual(rendered[0]["formant_preservation"], "rubberband_formant_preserved")
 
     def test_duration_correction_command_preserves_exact_duration_without_extra_fades(self) -> None:
@@ -456,6 +475,7 @@ class MaterialAssemblyTests(unittest.TestCase):
                 options: ProcessOptions,
                 *,
                 target_duration: float | None = None,
+                text_hint: str = "",
                 on_progress=None,
                 should_cancel=None,
             ) -> None:
@@ -498,6 +518,7 @@ class MaterialAssemblyTests(unittest.TestCase):
                 options: ProcessOptions,
                 *,
                 target_duration: float | None = None,
+                text_hint: str = "",
                 on_progress=None,
                 should_cancel=None,
             ) -> None:
@@ -3064,6 +3085,11 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(report["summary"]["fade_applied_clip_count"], 1)
         self.assertLess(report["summary"]["stretch_naturalness_score_mean"] or 1.0, 0.2)
         self.assertEqual(report["stretch_plan"][0]["continuity_warning"], "single_syllable_boundary_risk")
+        self.assertEqual(report["stretch_plan"][0]["boundary_conditioning"], "loop_fill+fade_in_out")
+        self.assertEqual(
+            report["optimization"]["render_continuity"]["boundary_conditioning"],
+            "short_text_loop_fill+per_clip_fade_in_out",
+        )
         self.assertTrue(any(warning["kind"] == "single_syllable_boundary_risk" for warning in report["warnings"]))
 
     def test_preflight_requires_aligned_unit_timing_for_positioned_decisions(self) -> None:
@@ -3770,6 +3796,7 @@ class DawRenderReuseTests(unittest.TestCase):
                 options: ProcessOptions,
                 *,
                 target_duration: float | None = None,
+                text_hint: str = "",
                 on_progress: object | None = None,
                 should_cancel: object | None = None,
             ) -> None:

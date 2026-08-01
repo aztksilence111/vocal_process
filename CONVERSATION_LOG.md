@@ -1,5 +1,18 @@
 # Conversation Log
 
+## Latest Update - 2026-08-01 Short-Text Loop Fill Render Repair
+
+1. 本轮按用户要求读取项目恢复摘要、项目规则、会话日志、项目分析和全局 memories，并运行 `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe`。预检通过，当前分支为 `codex/cancel-phonetic-accuracy`。
+2. 待修复问题确认：渲染时长对齐已基本恢复，剩余关键问题是短字音/单音节素材在长目标时长下会被 Rubber Band 拉到下限后用静音尾部补齐，导致听感连续性差，并继续产生 `single_syllable_boundary_risk` 与 `extreme_stretch_ratio`。
+3. `audio_processor.engine` 将短文本极限扩展策略从 `syllable_formant_expand_with_tail_fill` 改为 `syllable_formant_expand_with_loop_fill`。短文本素材超过 `RUBBERBAND_SHORT_TEXT_MIN_TEMPO=0.35` 的扩展时，现在使用 `rubberband=tempo=0.35` 后接 `aloop=loop=-1:size=2147483647:start=0`，再 `atrim` 到目标时长，避免大段静音尾补。
+4. 渲染缓存版本升级为 `material_render_filter_v6_short_text_loop_fill`，避免旧静音尾部缓存污染新结果。单 clip、批量素材渲染缓存和 DAW 导出都传递 `text_hint`，保证真实输出和 DAW timeline clip 走同一策略。
+5. `render_material_stretch_plan()` 和 `audio_processor.preflight` 现在会报告 `loop_fill+fade_in_out` / `short_text_loop_fill+per_clip_fade_in_out`，并把说明文字更新为极限短文本扩展使用 loop fill 而不是 silent tail padding。
+6. 测试覆盖新增/更新：短文本扩展命令包含 `aloop` 且不再包含 `apad=whole_dur`；stretch plan 策略名变为 `syllable_formant_expand_with_loop_fill`；preflight 报告能显示 loop-fill 边界处理；旧 render-cache/DAW mock 支持新增 `text_hint` 参数。
+7. 验证通过：`compileall -q audio_processor tests packaging`、完整 `.venv311\Scripts\python.exe -m unittest discover` 共 163 项、`.venv311\Scripts\python.exe -m audio_processor check`、`git diff --check`（仅 CRLF 提示）。
+8. 真实 FFmpeg smoke 通过：0.5s sine 经 `rubberband + aloop + atrim` 输出为 `2.000000s`。
+9. 真实单 case 渲染 smoke 通过：`.tmp\loop-fill-render-smoke\real-eval-20260801-160655\summary.json`，`FengZhongYouDuo_CN__newOTTO` 状态 `rendered`，`render_validation.status=ok`，输出时长 `259.276576s` 对参考 `259.276190s`，`duration_delta_ratio=1e-06`，`rendered_audio_alignment_score=0.839569`，`stretch_quality_score=0.692922`，`boundary_conditioning=short_text_loop_fill+per_clip_fade_in_out`。
+10. 剩余问题未隐藏：严格通过仍为 False，主要原因是 `reference_asr_unverified`、1 个 `low_match_score`、以及素材缺失/极端拉伸带来的边界风险。下一轮应跑完整 rendered real-eval，继续针对 JP/vmzJP、低匹配和近音替代做通用排序优化。
+
 ## Latest Update - 2026-07-31 极短片段安全渲染与旧输出污染修复
 
 1. 本轮继续修复真实跑分暴露的渲染失败点。问题本质不是总时长规划错，而是某些极短目标片段在进入 FFmpeg `rubberband` 时会直接报错。最新失败样本是 `ka1.wav`，目标时长只有 `0.014074s`，`tempo=8.88310734` 时触发 `Operation not permitted`，导致整条 case 失败。

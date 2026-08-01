@@ -264,7 +264,7 @@ def _preflight_warnings(
                 "stretch_naturalness_score": clip.stretch_naturalness_score,
                 "fade_seconds": clip.fade_seconds,
                 "message": (
-                    "Rendered clip uses exact target duration with short boundary fades, but this stretch ratio "
+                    "Rendered clip uses exact target duration with boundary conditioning, but this stretch ratio "
                     "can still sound discontinuous at syllable boundaries."
                 ),
             }
@@ -327,7 +327,7 @@ def _optimization_report(
         "repeated_reference_text_groups": repeated_text_groups,
         "render_continuity": {
             "formant_preservation": "rubberband_formant_preserved",
-            "boundary_conditioning": "per_clip_fade_in_out",
+            "boundary_conditioning": _render_boundary_conditioning(stretch_plan),
             "fade_applied_clip_count": sum(1 for clip in stretch_plan if clip.fade_seconds > 0),
             "continuity_warning_count": sum(1 for clip in stretch_plan if clip.continuity_warning),
             "stretch_naturalness_score_mean": _mean(
@@ -346,7 +346,7 @@ def _optimization_report(
         "notes": [
             "Rendered audio is reused only when source file, target duration, tempo, and render options match exactly.",
             "Verse/chorus similarity is reported as a planning hint; it is not used to skip ASR or change words automatically.",
-            "Formant-preserved Rubber Band stretching is used for each material clip before exact-duration trim and short boundary fades.",
+            "Formant-preserved Rubber Band stretching is used before exact-duration trim; extreme short-text expansion uses loop fill instead of silent tail padding.",
         ],
     }
 
@@ -371,6 +371,21 @@ def _duplicate_render_groups(stretch_plan: Sequence[MaterialStretchClip]) -> lis
         for clips in groups.values()
         if len(clips) > 1
     ]
+
+
+def _render_boundary_conditioning(stretch_plan: Sequence[MaterialStretchClip]) -> str:
+    has_fades = any(clip.fade_seconds > 0 for clip in stretch_plan)
+    has_loop_fill = any(
+        clip.stretch_strategy == "syllable_formant_expand_with_loop_fill"
+        for clip in stretch_plan
+    )
+    if has_loop_fill and has_fades:
+        return "short_text_loop_fill+per_clip_fade_in_out"
+    if has_loop_fill:
+        return "short_text_loop_fill"
+    if has_fades:
+        return "per_clip_fade_in_out"
+    return ""
 
 
 def _continuity_warning_groups(stretch_plan: Sequence[MaterialStretchClip]) -> list[dict[str, Any]]:

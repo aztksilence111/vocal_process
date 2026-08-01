@@ -193,6 +193,7 @@ def export_daw_timeline_with_progress(
                 clip.tempo,
                 clip_options,
                 target_duration=clip.target_duration_seconds,
+                text_hint=clip.text_hint,
                 on_progress=clip_progress,
                 should_cancel=should_cancel,
             )

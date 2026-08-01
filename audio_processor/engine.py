@@ -85,7 +85,8 @@ MATERIAL_RENDER_FADE_TARGET_FRACTION = 0.08
 MATERIAL_RENDER_TINY_TARGET_SECONDS = 0.030
 MATERIAL_RENDER_DURATION_TOLERANCE_SECONDS = 0.025
 MATERIAL_RENDER_DURATION_TOLERANCE_RATIO = 0.001
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v5_tiny_target_direct_trim"
+MATERIAL_RENDER_LOOP_FILL_SIZE_SAMPLES = 2_147_483_647
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v6_short_text_loop_fill"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -352,10 +353,12 @@ def build_material_clip_args(
     options: ProcessOptions,
     *,
     target_duration: float | None = None,
+    text_hint: str = "",
     progress: bool = False,
 ) -> list[str]:
     _validate_options(options)
-    _validate_rubberband_tempo(tempo)
+    resolved_tempo, _ = _resolve_stretch_strategy(tempo, text_hint, target_duration)
+    _validate_rubberband_tempo(resolved_tempo)
 
     args = ["ffmpeg", "-hide_banner"]
     if progress:
@@ -363,7 +366,15 @@ def build_material_clip_args(
 
     args.append("-y" if options.overwrite else "-n")
     args.extend(["-i", str(input_path)])
-    args.extend(["-af", _build_material_clip_filter(tempo, options, target_duration=target_duration)])
+    args.extend([
+        "-af",
+        _build_material_clip_filter(
+            resolved_tempo,
+            options,
+            target_duration=target_duration,
+            text_hint=text_hint,
+        ),
+    ])
 
     if options.sample_rate is not None:
         args.extend(["-ar", str(options.sample_rate)])
@@ -587,6 +598,7 @@ def process_material_clip_with_progress(
     options: ProcessOptions,
     *,
     target_duration: float | None = None,
+    text_hint: str = "",
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> None:
@@ -599,11 +611,12 @@ def process_material_clip_with_progress(
         normalized_output.parent.mkdir(parents=True, exist_ok=True)
 
     input_duration = get_audio_duration_seconds(probe_audio(normalized_input))
-    expected_duration = target_duration or (input_duration / tempo if tempo > 0 else input_duration)
+    resolved_tempo, _ = _resolve_stretch_strategy(tempo, text_hint, target_duration)
+    expected_duration = target_duration or (input_duration / resolved_tempo if resolved_tempo > 0 else input_duration)
     args = build_material_clip_args(
         normalized_input,
         normalized_output,
-        tempo,
+        resolved_tempo,
         ProcessOptions(
             input_path=normalized_input,
             output_path=normalized_output,
@@ -619,6 +632,7 @@ def process_material_clip_with_progress(
             codec=options.codec,
         ),
         target_duration=target_duration,
+        text_hint=text_hint,
         progress=True,
     )
     _run_progress_process(
@@ -783,6 +797,7 @@ def _assemble_material_clips_with_render_cache(
             clip.tempo,
             cache_options,
             target_duration=clip.target_duration_seconds,
+            text_hint=clip.text_hint,
             on_progress=clip_progress,
             should_cancel=should_cancel,
         )
@@ -905,7 +920,11 @@ def plan_material_stretch_clips(
                 stretch_strategy=strategy,
                 text_hint=text_hint,
                 fade_seconds=_material_clip_fade_seconds(target_duration),
-                stretch_naturalness_score=_stretch_naturalness_score(requested_tempo, text_hint),
+                stretch_naturalness_score=_stretch_naturalness_score_with_fill_mode(
+                    requested_tempo,
+                    text_hint,
+                    loop_fill=strategy == "syllable_formant_expand_with_loop_fill",
+                ),
                 continuity_warning=_stretch_continuity_warning(requested_tempo, text_hint),
             )
         )
@@ -925,7 +944,13 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "text_hint": clip.text_hint,
             "quality_warning": clip.quality_warning,
             "fade_seconds": clip.fade_seconds,
-            "boundary_conditioning": "fade_in_out" if clip.fade_seconds > 0 else "",
+            "boundary_conditioning": (
+                "loop_fill+fade_in_out"
+                if clip.stretch_strategy == "syllable_formant_expand_with_loop_fill" and clip.fade_seconds > 0
+                else "loop_fill"
+                if clip.stretch_strategy == "syllable_formant_expand_with_loop_fill"
+                else "fade_in_out" if clip.fade_seconds > 0 else ""
+            ),
             "formant_preservation": (
                 "direct_trim_no_pitch_shift"
                 if clip.stretch_strategy == "tiny_target_direct_trim"
@@ -1036,6 +1061,7 @@ def _build_material_plan_filter_graph(
             clip.tempo,
             options,
             target_duration=clip.target_duration_seconds,
+            text_hint=clip.text_hint,
         )
         filters.append(f"[{index}:a]{','.join(post_filters)}[{output_label}]")
         if len(clips) > 1:
@@ -1051,6 +1077,7 @@ def _build_material_clip_filter(
     options: ProcessOptions,
     *,
     target_duration: float | None = None,
+    text_hint: str = "",
 ) -> str:
     if target_duration is not None and target_duration <= 0:
         raise AudioProcessorError("target_duration must be greater than 0")
@@ -1062,7 +1089,12 @@ def _build_material_clip_filter(
     if audio_filters:
         filters.append(audio_filters)
     if target_duration is not None:
-        filters.extend(_target_duration_filters(target_duration))
+        filters.extend(
+            _target_duration_filters(
+                target_duration,
+                loop_fill=_should_loop_fill_short_material(tempo, text_hint, target_duration),
+            )
+        )
     return ",".join(filters)
 
 
@@ -1071,6 +1103,7 @@ def _material_post_filters(
     options: ProcessOptions,
     *,
     target_duration: float | None,
+    text_hint: str = "",
 ) -> list[str]:
     audio_filters = _build_audio_filters(options)
     filters: list[str] = []
@@ -1079,7 +1112,12 @@ def _material_post_filters(
     if audio_filters:
         filters.append(audio_filters)
     if target_duration is not None:
-        filters.extend(_target_duration_filters(target_duration))
+        filters.extend(
+            _target_duration_filters(
+                target_duration,
+                loop_fill=_should_loop_fill_short_material(tempo, text_hint, target_duration),
+            )
+        )
     if not filters:
         filters.append("anull")
     return filters
@@ -1089,15 +1127,21 @@ def _should_direct_trim_tiny_target(target_duration: float | None) -> bool:
     return target_duration is not None and target_duration <= MATERIAL_RENDER_TINY_TARGET_SECONDS
 
 
-def _target_duration_filters(target_duration: float) -> list[str]:
-    return _exact_duration_filters(target_duration, fade=True)
+def _target_duration_filters(target_duration: float, *, loop_fill: bool = False) -> list[str]:
+    return _exact_duration_filters(target_duration, fade=True, loop_fill=loop_fill)
 
 
-def _exact_duration_filters(target_duration: float, *, fade: bool) -> list[str]:
-    filters = [
-        f"apad=whole_dur={target_duration:.6f}",
-        f"atrim=duration={target_duration:.6f}",
-    ]
+def _exact_duration_filters(target_duration: float, *, fade: bool, loop_fill: bool = False) -> list[str]:
+    if loop_fill:
+        filters = [
+            f"aloop=loop=-1:size={MATERIAL_RENDER_LOOP_FILL_SIZE_SAMPLES}:start=0",
+            f"atrim=duration={target_duration:.6f}",
+        ]
+    else:
+        filters = [
+            f"apad=whole_dur={target_duration:.6f}",
+            f"atrim=duration={target_duration:.6f}",
+        ]
     fade_seconds = _material_clip_fade_seconds(target_duration) if fade else 0.0
     if fade_seconds > 0:
         filters.extend(
@@ -1315,7 +1359,7 @@ def _resolve_stretch_strategy(
     if _should_direct_trim_tiny_target(target_duration):
         return max(min(requested_tempo, RUBBERBAND_MAX_TEMPO), RUBBERBAND_MIN_TEMPO), "tiny_target_direct_trim"
     if _is_short_material_text(text_hint) and requested_tempo < RUBBERBAND_SHORT_TEXT_MIN_TEMPO:
-        return RUBBERBAND_SHORT_TEXT_MIN_TEMPO, "syllable_formant_expand_with_tail_fill"
+        return RUBBERBAND_SHORT_TEXT_MIN_TEMPO, "syllable_formant_expand_with_loop_fill"
     if requested_tempo < RUBBERBAND_MIN_TEMPO:
         return RUBBERBAND_MIN_TEMPO, "rubberband_max_expansion_ceiling"
     return requested_tempo, "rubberband_full_clip"
@@ -1327,6 +1371,15 @@ def _is_short_material_text(text: str) -> bool:
     return 0 < len(compact) <= 4
 
 
+def _should_loop_fill_short_material(tempo: float, text_hint: str, target_duration: float | None) -> bool:
+    return (
+        target_duration is not None
+        and not _should_direct_trim_tiny_target(target_duration)
+        and _is_short_material_text(text_hint)
+        and tempo <= RUBBERBAND_SHORT_TEXT_MIN_TEMPO
+    )
+
+
 def _material_clip_fade_seconds(target_duration: float) -> float:
     if target_duration < MATERIAL_RENDER_MIN_FADE_TARGET_SECONDS:
         return 0.0
@@ -1335,6 +1388,15 @@ def _material_clip_fade_seconds(target_duration: float) -> float:
 
 
 def _stretch_naturalness_score(requested_tempo: float, text_hint: str = "") -> float:
+    return _stretch_naturalness_score_with_fill_mode(requested_tempo, text_hint, loop_fill=False)
+
+
+def _stretch_naturalness_score_with_fill_mode(
+    requested_tempo: float,
+    text_hint: str = "",
+    *,
+    loop_fill: bool,
+) -> float:
     if requested_tempo <= 0:
         return 0.0
     ratio = max(requested_tempo, 1.0 / requested_tempo)
@@ -1344,9 +1406,9 @@ def _stretch_naturalness_score(requested_tempo: float, text_hint: str = "") -> f
         score = max(1.0 - (math.log(ratio, 2) / 2.5), 0.0)
     if _is_short_material_text(text_hint):
         if ratio >= 2.0:
-            score *= 0.65
+            score *= 0.8 if loop_fill else 0.65
         elif ratio >= 1.5:
-            score *= 0.85
+            score *= 0.92 if loop_fill else 0.85
     return max(min(score, 1.0), 0.0)
 
 
