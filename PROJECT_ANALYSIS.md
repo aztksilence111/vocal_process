@@ -1496,3 +1496,30 @@ Acceptance impact:
 1. 编译、149 项单测、`audio_processor check` 和 `git diff --check` 已通过。
 2. 临时双素材 FFmpeg 渲染 smoke 输出 2.000000 秒，说明新 filter 在当前 FFmpeg 环境可执行。
 3. 完整 rendered real-eval 仍需由后台自治恢复运行，用新增 `stretch_quality_score`、`stretch_naturalness_score`、`continuity_warning_ratio`、`rendered_audio_alignment_score`、`render_duration_delta_ratio` 和 worst group 共同判断是否比上一轮改善。
+### 2026-08-02: Filename-Label-First Becomes the Next Architecture Target
+
+The latest user feedback changes the next highest-value direction. Current rendered audio is still not listenable even after duration alignment, loop-fill, and segment-lattice target coverage fixes. The remaining failure is not only timeline coverage; it is that material analysis can still let ASR hallucinations compete with or pollute filename-labeled syllable evidence, especially in PlasticLove / JP diagnostics.
+
+Current evidence:
+
+1. Autonomous session `C:\Users\WIN11\.codex\tmp\agent_runs\20260801-164741-demo-long-run` was stopped intentionally for task closeout at `2026-08-02T00:37:27+08:00`.
+2. Cycle 1 completed and pushed `521a51b Fix segment lattice target ordering`. Its progress note recorded that cached PlasticLove recomputation recovered `411/411` positioned and timed target coverage.
+3. Full rendered suite `tests_real\output\real-eval-20260801-164819\summary.md` rendered 13/13 compatible cases, but strict pass remained `0/13`. Suite means: `match_ordering_score=0.561014`, `stretch_quality_score=0.437509`, `stretch_naturalness_score=0.481325`, `continuity_warning_ratio=0.560929`.
+4. Stopped partial suite `tests_real\output\real-eval-20260801-232614\summary.md` rendered 8/13 cases before stop. Suite means improved slightly but still failed strict: `match_ordering_score=0.579279`, `stretch_quality_score=0.484238`, `stretch_naturalness_score=0.526732`, `continuity_warning_ratio=0.512938`.
+5. User inspected PlasticLove JSONL diagnostics and observed that Japanese/cross-language material can still be recognized as Chinese. This confirms that material ASR remains too authoritative or too expensive for the intended workflow.
+
+Architecture decision:
+
+1. For material clips with parseable filename labels, filename-derived syllable/pronunciation units should become the primary material text authority before ASR runs.
+2. Material ASR should be skipped or demoted for trusted filename labels. It may remain useful only when filenames are unparseable, purely numeric, too long/ambiguous, or when the user explicitly asks for material-content verification.
+3. The target side remains unchanged: with lyrics, lyrics text defines target units and original-vocal alignment defines unit timing; without lyrics, original-vocal ASR/alignment defines target units and timing.
+4. Whole-sentence or phrase semantic matching is not a practical main path for this product. The application scenario is often Japanese targets with Chinese voice material or cross-language phonetic reuse, so matching should be phonetic-unit-first, not semantic-phrase-first.
+5. The correct cross-language model is to separate reference language, material filename label system, and material audio speaker/source. A Chinese-voice clip named with a Japanese/romaji syllable label should be allowed to serve a JP target if the filename phonetic units match.
+
+Next implementation requirements:
+
+1. Add an early material-analysis path that creates `MaterialAnalysis` from filename labels before calling `_transcribe_audio()`.
+2. Record diagnostics such as `material_text_source=filename_label_authority`, `asr_skipped_for_filename_label=true`, and the parsed filename phonetic units.
+3. Upgrade/invalidate material cache keys so old ASR-first caches do not re-enter ordering or JSONL diagnostics as trusted material text.
+4. Keep ASR transcript out of primary ordering when filename labels are trusted; ASR can be stored as optional verification evidence only if it was explicitly requested or needed as fallback.
+5. Re-run rendered real-eval after implementation and compare not only coverage, but also `low_match_score`, `weak_text_signal`, `single_syllable_extreme_stretch`, `continuity_warning_ratio`, and JP/vmzJP group scores.
