@@ -286,6 +286,15 @@ class _PositionCandidate:
 
 
 @dataclass(frozen=True)
+class _ReferenceUnitSlot:
+    global_position: int
+    segment_index: int
+    local_position: int
+    unit: str
+    tone_unit: str
+
+
+@dataclass(frozen=True)
 class MaterialOrderingPlan:
     decisions: tuple[MaterialOrderDecision, ...]
     score_matrix: tuple[tuple[MaterialScoreBreakdown, ...], ...]
@@ -656,15 +665,24 @@ def _order_materials_by_reference_unit_sequence(
     *,
     language_hint: str = "",
 ) -> list[MaterialOrderDecision]:
-    reference_units = _phonetic_units(reference_text, language_hint=language_hint)
+    original_reference_text = reference_text
+    reference_lattice = _reference_phonetic_unit_lattice(reference_segments, language_hint=language_hint)
+    reference_units = [slot.unit for slot in reference_lattice]
     if not reference_units:
         return []
-    if not _should_use_phonetic_unit_sequence(reference_text, scored_by_material, language_hint=language_hint):
+    reference_text = _reference_text_from_lattice(reference_lattice)
+    if not _should_use_phonetic_unit_sequence(original_reference_text, scored_by_material, language_hint=language_hint):
         return []
 
     target_durations = _reference_phonetic_unit_durations(reference_segments)
+    reference_tone_units = [slot.tone_unit for slot in reference_lattice]
     position_candidates_by_path = {
-        material.path: _position_candidates_for_material(reference_text, material, language_hint=language_hint)
+        material.path: _position_candidates_for_material_units(
+            reference_units,
+            material,
+            language_hint=language_hint,
+            reference_tone_units=reference_tone_units,
+        )
         for material, _ in scored_by_material
     }
     material_units_by_path = {
@@ -697,9 +715,9 @@ def _order_materials_by_reference_unit_sequence(
             reason=f"reference_{position_candidate.source}_sequence",
             tone_matched=position_candidate.tone_matched,
         )
-        decision = _localize_aggregate_decision(
+        decision = _localize_lattice_decision(
             _decision_from_score(len(decisions) + 1, adjusted_score),
-            reference_segments,
+            reference_lattice,
         )
         decisions.append(decision)
         usage_counts[material.path] = usage_counts.get(material.path, 0) + 1
@@ -790,6 +808,58 @@ def _has_future_position_candidate(candidates: Sequence[_PositionCandidate], pos
     return any(candidate.position > position for candidate in candidates)
 
 
+def _reference_phonetic_unit_lattice(
+    reference_segments: Sequence[VoiceSegment],
+    *,
+    language_hint: str = "",
+) -> tuple[_ReferenceUnitSlot, ...]:
+    slots: list[_ReferenceUnitSlot] = []
+    global_position = 0
+    for segment_index, segment in enumerate(reference_segments):
+        segment_hint = language_hint or segment.language_hint
+        units = _phonetic_units(segment.text, language_hint=segment_hint)
+        tone_units = _phonetic_tone_units(segment.text, language_hint=segment_hint)
+        if len(tone_units) != len(units):
+            tone_units = [_normalize_phonetic_tone_unit(unit) for unit in units]
+        for local_position, unit in enumerate(units):
+            slots.append(
+                _ReferenceUnitSlot(
+                    global_position=global_position,
+                    segment_index=segment_index,
+                    local_position=local_position,
+                    unit=unit,
+                    tone_unit=tone_units[local_position],
+                )
+            )
+            global_position += 1
+    return tuple(slots)
+
+
+def _reference_text_from_lattice(lattice: Sequence[_ReferenceUnitSlot]) -> str:
+    return " ".join(slot.unit for slot in lattice)
+
+
+def _localize_lattice_decision(
+    decision: MaterialOrderDecision,
+    lattice: Sequence[_ReferenceUnitSlot],
+) -> MaterialOrderDecision:
+    position = decision.phonetic_position
+    if position is None or not 0 <= position < len(lattice):
+        return replace(
+            decision,
+            reference_segment_index=None,
+            text_position=None,
+            phonetic_position=None,
+        )
+    slot = lattice[position]
+    return replace(
+        decision,
+        reference_segment_index=slot.segment_index,
+        text_position=None,
+        phonetic_position=slot.local_position,
+    )
+
+
 def _should_use_phonetic_unit_sequence(
     reference_text: str,
     scored_by_material: Sequence[tuple[MaterialAnalysis, MaterialScoreBreakdown]],
@@ -854,6 +924,71 @@ def _position_candidates_for_material(
     for candidate in candidates:
         deduped[(candidate.position, candidate.span_units, candidate.source, candidate.tone_matched)] = candidate
     return tuple(sorted(deduped.values(), key=lambda item: (item.position, -item.span_units, item.source)))
+
+
+def _position_candidates_for_material_units(
+    reference_units: Sequence[str],
+    material: MaterialAnalysis,
+    *,
+    language_hint: str = "",
+    reference_tone_units: Sequence[str] = (),
+) -> tuple[_PositionCandidate, ...]:
+    sources: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
+        (
+            "filename_phonetic",
+            tuple(_phonetic_units(material.filename_text, language_hint=language_hint or material.language_hint)),
+            tuple(_phonetic_tone_units(material.filename_text, language_hint=language_hint or material.language_hint)),
+        ),
+        (
+            "transcript_phonetic",
+            tuple(_phonetic_units(material.transcript, language_hint=language_hint or material.language_hint)),
+            tuple(_phonetic_tone_units(material.transcript, language_hint=language_hint or material.language_hint)),
+        ),
+    ]
+    if len(reference_tone_units) != len(reference_units):
+        reference_tone_units = _reference_tone_units_from_phonetic_units(reference_units)
+    allow_compact_match = _normalize_language_hint(language_hint or material.language_hint) != "JP"
+
+    candidates: list[_PositionCandidate] = []
+    for source, material_units, material_tone_units in sources:
+        source_matched = False
+        if _has_tone_evidence(material_tone_units):
+            tone_positions, tone_span_units = _phonetic_positions_for_units(
+                reference_tone_units,
+                material_tone_units,
+                allow_compact_match=allow_compact_match,
+            )
+            if tone_positions:
+                span_units = max(tone_span_units, len(material_units), 1)
+                candidates.extend(
+                    _PositionCandidate(position=position, span_units=span_units, source=source, tone_matched=True)
+                    for position in tone_positions
+                )
+                source_matched = True
+                if source == "filename_phonetic":
+                    break
+        positions, span_units = _phonetic_positions_for_units(
+            reference_units,
+            material_units,
+            allow_compact_match=allow_compact_match,
+        )
+        if positions:
+            candidates.extend(
+                _PositionCandidate(position=position, span_units=max(span_units, 1), source=source)
+                for position in positions
+            )
+            source_matched = True
+        if source_matched and source == "filename_phonetic":
+            break
+
+    deduped: dict[tuple[int, int, str, bool], _PositionCandidate] = {}
+    for candidate in candidates:
+        deduped[(candidate.position, candidate.span_units, candidate.source, candidate.tone_matched)] = candidate
+    return tuple(sorted(deduped.values(), key=lambda item: (item.position, -item.span_units, item.source)))
+
+
+def _reference_tone_units_from_phonetic_units(units: Sequence[str]) -> list[str]:
+    return [_normalize_phonetic_tone_unit(unit) for unit in units]
 
 
 def _reference_position_selection_score(

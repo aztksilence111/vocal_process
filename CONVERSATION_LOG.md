@@ -1,5 +1,16 @@
 # Conversation Log
 
+## Latest Update - 2026-08-01 Segment-Lattice Target Ordering for Timeline Coverage
+
+1. This continuation read the requested project context. `E:\Workplace\demo\AGENTS.md` is still absent, so the AGENTS rules supplied in the user prompt were followed together with `PROJECT_RULES.md`. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed and the working branch remained `codex/cancel-phonetic-accuracy`.
+2. Latest full rendered evidence was `tests_real\output\real-eval-20260801-164819\summary.json`: 13/13 compatible cases rendered, output duration validation was effectively exact, but `PlasticLove_JP__vmzJP` still had only `positioned_decision_ratio=0.30467` and `timed_target_duration_ratio=0.30467`.
+3. Root cause: `reference_phonetic_unit_sequence` built target positions from one aggregate reference string. For long mixed JP/romaji/English ASR text, aggregate parsing expanded to 1349 pseudo target units, while the actual per-segment ASR/aligned lattice had 411 target units. Decisions after the 411th target lost segment/local position and fell back to `weighted_duration`, violating the no-lyrics rule that targets come from original-vocal ASR/aligned pronunciation units.
+4. `audio_processor.model_assist` now builds a segment-derived reference phonetic lattice and uses it for candidate lookup, material reuse, decision localization, and tone-aware positions. The ordering output is bounded by reference target units; extra material files are no longer appended as unpositioned clip targets in the pronunciation-sequence strategy.
+5. In-memory recomputation against the cached `PlasticLove_JP__vmzJP` analysis data now produces `decision_count=411`, `positioned_decision_count=411`, `timed_target_duration_count=411`, `bad_positioned=0`, and `target_duration_total_seconds=308.72381`, preserving total reference duration while restoring one-to-one target coverage.
+6. Added regression coverage for segment-lattice ordering so extra JP material is not appended beyond the target lattice, and target durations/timeline summary stay 4/4 positioned and 4/4 timed in the focused case.
+7. Verification passed: `.venv311\Scripts\python.exe -m unittest tests.test_engine.ModelAssistTests tests.test_engine.ModelRuntimeTests`, `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging`, full `.venv311\Scripts\python.exe -m unittest discover` with 164 tests, `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` with only CRLF conversion warnings.
+8. A non-rendered real-eval smoke for `PlasticLove_JP__vmzJP` timed out after 300 seconds before completing a case, but it wrote a recoverable partial summary at `.tmp\segment-lattice-smoke\real-eval-20260801-223958\summary.json`.
+
 ## Latest Update - 2026-08-01 Short-Text Loop Fill Render Repair
 
 1. 本轮按用户要求读取项目恢复摘要、项目规则、会话日志、项目分析和全局 memories，并运行 `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe`。预检通过，当前分支为 `codex/cancel-phonetic-accuracy`。

@@ -1,5 +1,17 @@
 # Project Analysis
 
+## Latest Update - 2026-08-01 Segment-Lattice Ordering for Unit-Timing Coverage
+
+The full rendered suite at `tests_real\output\real-eval-20260801-164819\summary.json` proved the render-duration path is now stable: every compatible case rendered and `render_validation.status` was `ok`, with output duration deltas effectively zero. The remaining urgent timeline defect was no longer final WAV length. It was target-unit coverage, especially `PlasticLove_JP__vmzJP`, where only about 30% of decisions had one-to-one reference positions and timed target durations.
+
+The root cause was a mismatch between two reference-unit lattices. Ordering built a single aggregate reference string and computed JP phonetic units from that aggregate; timeline localization later mapped decisions back to per-segment ASR/aligned units. In long mixed JP/romaji/English ASR text, the aggregate parser expanded the text to 1349 pseudo units, while the segment-derived reference lattice had only 411 target units. After those 411 units, the system kept creating unpositioned material decisions and filled them with weighted durations. That preserved total output duration after render correction, but it destroyed the one-to-one target/reference unit contract.
+
+`audio_processor.model_assist` now builds a segment-derived reference phonetic lattice for the `reference_phonetic_unit_sequence` strategy. Candidate lookup, material reuse, decision localization, and tone-aware matching all use that lattice, so the decision list is bounded by the actual target units. Extra material files are not appended after the reference target lattice is exhausted. This better matches both priority modes: without lyrics, the original-vocal ASR/aligned units define targets; with lyrics, lyric text should supply the target lattice before timings are retargeted from the original vocal.
+
+Cached-data recomputation for `PlasticLove_JP__vmzJP` shows the architectural effect without a full model rerun: `decision_count=411`, `positioned_decision_count=411`, `timed_target_duration_count=411`, `bad_positioned=0`, and `target_duration_total_seconds=308.72381`. The remaining risk is material quality and stretch naturalness, not timeline coverage for this failure class. A non-rendered real-eval smoke timed out before case completion, but it wrote a partial recoverable summary at `.tmp\segment-lattice-smoke\real-eval-20260801-223958\summary.json`.
+
+Verification passed with focused ordering/runtime tests, full `unittest discover` with 164 tests, `compileall`, `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.
+
 ## Latest Update - 2026-08-01 Short-Text Loop Fill for Extreme Expansion
 
 本轮把短字音长目标的渲染问题从“时长准确但后段静音”推进到“时长准确且有声音内容填充”。旧策略 `syllable_formant_expand_with_tail_fill` 在短文本素材扩展超过 Rubber Band 安全下限时，会先把素材拉到 `tempo=0.35`，再用 `apad` 补齐剩余目标时长。对于真实评测里 0.3-0.6 秒素材被分配到 2 秒、5 秒甚至更长目标时长的场景，这会形成大段静音尾部，正是用户此前反馈的拉伸听感差、拼接连续性弱的根源之一。

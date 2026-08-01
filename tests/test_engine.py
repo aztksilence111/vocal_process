@@ -2240,6 +2240,56 @@ class ModelAssistTests(unittest.TestCase):
         self.assertEqual([decision.material_path.name for decision in decisions], ["su.wav", "pa.wav"])
         self.assertEqual([decision.phonetic_position for decision in decisions], [0, 1])
 
+    def test_reference_sequence_uses_segment_lattice_instead_of_aggregate_romaji_expansion(self) -> None:
+        reference_segments = [
+            VoiceSegment(
+                0.0,
+                1.0,
+                "I know",
+                unit_timings=(
+                    VoiceUnitTiming(0, "i", 0.0, 0.4, timing_source="aligned"),
+                    VoiceUnitTiming(1, "know", 0.4, 1.0, timing_source="aligned"),
+                ),
+                language_hint="JP",
+            ),
+            VoiceSegment(
+                1.0,
+                2.0,
+                "there love",
+                unit_timings=(
+                    VoiceUnitTiming(0, "there", 1.0, 1.6, timing_source="aligned"),
+                    VoiceUnitTiming(1, "love", 1.6, 2.0, timing_source="aligned"),
+                ),
+                language_hint="JP",
+            ),
+        ]
+        materials = [
+            MaterialAnalysis(Path("i.wav"), transcript="", filename_text="i", duration_seconds=0.2, language_hint="JP"),
+            MaterialAnalysis(Path("know.wav"), transcript="", filename_text="know", duration_seconds=0.2, language_hint="JP"),
+            MaterialAnalysis(Path("there.wav"), transcript="", filename_text="there", duration_seconds=0.2, language_hint="JP"),
+            MaterialAnalysis(Path("love.wav"), transcript="", filename_text="love", duration_seconds=0.2, language_hint="JP"),
+            MaterialAnalysis(Path("extra.wav"), transcript="", filename_text="extra", duration_seconds=0.2, language_hint="JP"),
+        ]
+
+        plan = plan_material_ordering(reference_segments, materials)
+
+        self.assertEqual(plan.strategy, "reference_phonetic_unit_sequence")
+        self.assertEqual([decision.material_path.name for decision in plan.decisions], ["i.wav", "know.wav", "there.wav", "love.wav"])
+        self.assertEqual([decision.reference_segment_index for decision in plan.decisions], [0, 0, 1, 1])
+        self.assertEqual([decision.phonetic_position for decision in plan.decisions], [0, 1, 0, 1])
+        self.assertNotIn("extra.wav", [decision.material_path.name for decision in plan.decisions])
+
+        target_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            plan.decisions,
+            reference_duration=2.0,
+        )
+        summary = model_runtime._render_timeline_alignment_summary(reference_segments, plan.decisions, target_durations)
+        self.assertEqual(summary["decision_count"], 4)
+        self.assertEqual(summary["positioned_decision_count"], 4)
+        self.assertEqual(summary["timed_target_duration_count"], 4)
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (0.4, 0.6, 0.6, 0.4))
+
     def test_orders_japanese_kanji_lyrics_by_janome_pronunciation(self) -> None:
         with patch("audio_processor.model_assist._janome_tokenizer", return_value=self._fake_janome_tokenizer()):
             decisions = order_materials_for_reference(
