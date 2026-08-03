@@ -242,6 +242,7 @@ def _preflight_warnings(
                 "target_duration_seconds": clip.target_duration_seconds,
                 "rubberband_tempo": clip.tempo,
                 "requested_rubberband_tempo": clip.requested_tempo,
+                "stretch_backend": clip.stretch_backend,
                 "stretch_naturalness_score": clip.stretch_naturalness_score,
                 "fade_seconds": clip.fade_seconds,
                 "message": "Stretch ratio may damage pronunciation intelligibility.",
@@ -261,6 +262,7 @@ def _preflight_warnings(
                 "target_duration_seconds": clip.target_duration_seconds,
                 "rubberband_tempo": clip.tempo,
                 "requested_rubberband_tempo": clip.requested_tempo,
+                "stretch_backend": clip.stretch_backend,
                 "stretch_naturalness_score": clip.stretch_naturalness_score,
                 "fade_seconds": clip.fade_seconds,
                 "message": (
@@ -326,7 +328,7 @@ def _optimization_report(
         "duplicate_clip_render_groups": duplicate_render_groups,
         "repeated_reference_text_groups": repeated_text_groups,
         "render_continuity": {
-            "formant_preservation": "rubberband_formant_preserved",
+            "formant_preservation": _render_formant_preservation(stretch_plan),
             "boundary_conditioning": _render_boundary_conditioning(stretch_plan),
             "fade_applied_clip_count": sum(1 for clip in stretch_plan if clip.fade_seconds > 0),
             "continuity_warning_count": sum(1 for clip in stretch_plan if clip.continuity_warning),
@@ -346,7 +348,7 @@ def _optimization_report(
         "notes": [
             "Rendered audio is reused only when source file, target duration, tempo, and render options match exactly.",
             "Verse/chorus similarity is reported as a planning hint; it is not used to skip ASR or change words automatically.",
-            "Formant-preserved Rubber Band stretching is used before exact-duration trim; extreme short-text expansion uses loop fill instead of silent tail padding.",
+            "Signalsmith handles eligible vowel-core regions with exact output frames; Rubber Band remains the fallback and handles other clip strategies.",
         ],
     }
 
@@ -383,6 +385,15 @@ def _render_boundary_conditioning(stretch_plan: Sequence[MaterialStretchClip]) -
         clip.stretch_strategy == "syllable_vowel_core_stretch"
         for clip in stretch_plan
     )
+    has_signalsmith_vowel_core = any(
+        clip.stretch_strategy == "syllable_vowel_core_stretch"
+        and clip.stretch_backend == "signalsmith"
+        for clip in stretch_plan
+    )
+    if has_signalsmith_vowel_core and has_fades:
+        return "signalsmith_vowel_core_stretch+per_clip_fade_in_out"
+    if has_signalsmith_vowel_core:
+        return "signalsmith_vowel_core_stretch"
     if has_vowel_core_stretch and has_fades:
         return "vowel_core_stretch+per_clip_fade_in_out"
     if has_vowel_core_stretch:
@@ -394,6 +405,14 @@ def _render_boundary_conditioning(stretch_plan: Sequence[MaterialStretchClip]) -
     if has_fades:
         return "per_clip_fade_in_out"
     return ""
+
+
+def _render_formant_preservation(stretch_plan: Sequence[MaterialStretchClip]) -> str:
+    if any(clip.stretch_backend == "signalsmith" for clip in stretch_plan):
+        if any(clip.stretch_backend == "rubberband" for clip in stretch_plan):
+            return "signalsmith_vowel_core_or_rubberband_formant_preserved"
+        return "signalsmith_pitch_preserved_vowel_core"
+    return "rubberband_formant_preserved"
 
 
 def _continuity_warning_groups(stretch_plan: Sequence[MaterialStretchClip]) -> list[dict[str, Any]]:

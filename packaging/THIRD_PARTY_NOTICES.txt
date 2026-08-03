@@ -25,3 +25,5 @@ Optional model/runtime projects referenced by the source tree:
 - whisper.cpp: https://github.com/ggerganov/whisper.cpp
 - Librosa: https://github.com/librosa/librosa
 - MSAF: https://github.com/urinieto/msaf
+- Signalsmith Stretch: https://github.com/Signalsmith-Audio/signalsmith-stretch
+- python-stretch: https://github.com/gregogiudici/python-stretch

@@ -292,6 +292,14 @@ try {
         "--specpath", $SpecPath
     )
 
+    if (Test-PythonModule "python_stretch") {
+        $PyInstallerArgs += @("--collect-all", "python_stretch")
+    }
+
+    if (Test-PythonDistribution "python-stretch") {
+        $PyInstallerArgs += @("--copy-metadata", "python-stretch")
+    }
+
     if ($BundleModelRuntime -and $AnalyzeModelRuntime) {
         foreach ($Package in $ModelRuntimeCollectAll) {
             if (Test-PythonModule $Package) {

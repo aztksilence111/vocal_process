@@ -1,5 +1,14 @@
 # Conversation Log
 
+## Latest Update - 2026-08-03 Signalsmith Vowel-Core Stretch Backend
+
+1. The user narrowed the request to borrowing HiFiShifter's stretch backend rather than implementing its complete vocal-tuning feature set. The source review identified HiFiShifter's public Signalsmith Stretch path and its exact output-frame scheduling.
+2. Added `audio_processor.signalsmith_stretch`, a small optional PCM renderer using the MIT `python-stretch` binding. It accepts channel-first NumPy audio, processes each requested material region independently, and fits the result to exact output frames.
+3. Short material with a usable vowel core now prefers Signalsmith for consonant attack/core/coda regions. The core no longer depends on Rubber Band's `0.35` tempo floor plus loop fill when Signalsmith is available. FFmpeg remains responsible for effects, fades, encoding, and final duration correction; Rubber Band remains the runtime fallback.
+4. Added explicit backend diagnostics and cache invalidation through `stretch_backend` and `material_render_filter_v8_signalsmith_vowel_core`. DAW exports, preflight reports, portable PyInstaller collection, and third-party notices were updated.
+5. Verification passed: full `unittest discover` with 166 tests, compileall, `audio_processor check`, and diff check. Direct and end-to-end smoke passed from 0.5 seconds to 2.0 seconds with exact 2.000000-second output.
+6. A full focused `PlasticLove_JP__vmzJP` real-eval attempt exceeded the six-minute execution window before completing any case. The partial summary at `.tmp\signalsmith-real-eval\real-eval-20260804-003427\summary.md` records zero completed cases and is explicitly not a quality pass.
+
 ## Latest Closeout - 2026-08-03
 
 1. The filename-label-first and vowel-core stretch work is complete on `codex/cancel-phonetic-accuracy` and pushed as `5230f9c` and `6914f72`.

@@ -33,6 +33,7 @@ class DawTimelineClip:
     quality_warning: str = ""
     requested_tempo: float | None = None
     stretch_strategy: str = "rubberband_full_clip"
+    stretch_backend: str = "rubberband"
     text_hint: str = ""
     actual_duration_seconds: float = 0.0
 
@@ -100,6 +101,7 @@ def plan_daw_timeline(
                 quality_warning=clip.quality_warning,
                 requested_tempo=clip.requested_tempo,
                 stretch_strategy=clip.stretch_strategy,
+                stretch_backend=clip.stretch_backend,
                 text_hint=clip.text_hint,
             )
         )
@@ -221,6 +223,7 @@ def export_daw_timeline_with_progress(
                 quality_warning=clip.quality_warning,
                 requested_tempo=clip.requested_tempo,
                 stretch_strategy=clip.stretch_strategy,
+                stretch_backend=clip.stretch_backend,
                 text_hint=clip.text_hint,
                 actual_duration_seconds=actual_duration,
             )
@@ -250,7 +253,7 @@ def render_manifest(result: DawExportResult, plan: DawTimelinePlan) -> dict[str,
         "material": {
             "total_duration_seconds": plan.material_duration_seconds,
             "average_tempo": plan.tempo,
-            "note": "each clip stores its own rubberband tempo; average_tempo is material_total_duration / reference_duration",
+            "note": "each clip stores its own stretch backend and target tempo; average_tempo is material_total_duration / reference_duration",
         },
         "outputs": {
             "project_path": str(result.project_path),
@@ -302,6 +305,7 @@ def _write_csv(result: DawExportResult) -> None:
                 "rubberband_tempo",
                 "requested_rubberband_tempo",
                 "stretch_strategy",
+                "stretch_backend",
                 "text_hint",
                 "quality_warning",
                 "actual_duration_seconds",
@@ -318,6 +322,7 @@ def _write_csv(result: DawExportResult) -> None:
                     f"{clip.tempo:.8f}",
                     f"{(clip.requested_tempo if clip.requested_tempo is not None else clip.tempo):.8f}",
                     clip.stretch_strategy,
+                    clip.stretch_backend,
                     clip.text_hint,
                     clip.quality_warning,
                     f"{clip.actual_duration_seconds:.6f}",
@@ -410,6 +415,7 @@ def _clip_render_cache_key(clip: DawTimelineClip, options: ProcessOptions) -> tu
         stat.st_mtime_ns,
         round(clip.target_duration_seconds, 6),
         round(clip.tempo, 8),
+        clip.stretch_backend,
         options.gain_db,
         options.normalize,
         options.highpass_hz,

@@ -12,11 +12,16 @@ import hashlib
 import threading
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
 
 from .phoneme import analyze_vowel_consonant_profile
+from .signalsmith_stretch import (
+    SignalsmithStretchError,
+    render_signalsmith_regions,
+    signalsmith_stretch_available,
+)
 
 
 class AudioProcessorError(RuntimeError):
@@ -75,6 +80,7 @@ class MaterialStretchClip:
     stretch_naturalness_score: float = 1.0
     continuity_warning: str = ""
     phoneme_regions: tuple[MaterialPhonemeRegion, ...] = ()
+    stretch_backend: str = "rubberband"
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {
@@ -109,7 +115,7 @@ MATERIAL_CODA_MAX_STRETCH_RATIO = 1.12
 MATERIAL_CONSONANT_MAX_SECONDS = 0.075
 MATERIAL_CODA_MAX_SECONDS = 0.060
 MATERIAL_VOWEL_CORE_MIN_SECONDS = 0.030
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v7_vowel_core_stretch"
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v8_signalsmith_vowel_core"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -170,6 +176,11 @@ def get_environment_report() -> list[str]:
         info = get_tool_info(tool)
         lines.append(f"{tool}: {info.path}")
         lines.append(f"  {info.version_line}")
+    lines.append(
+        "Signalsmith Stretch: available"
+        if signalsmith_stretch_available()
+        else "Signalsmith Stretch: unavailable (Rubber Band fallback)"
+    )
     return lines
 
 
@@ -660,8 +671,49 @@ def process_material_clip_with_progress(
         normalized_output.parent.mkdir(parents=True, exist_ok=True)
 
     input_duration = get_audio_duration_seconds(probe_audio(normalized_input))
-    resolved_tempo, _ = _resolve_stretch_strategy(tempo, text_hint, target_duration)
+    resolved_tempo, resolved_strategy = _resolve_stretch_strategy(tempo, text_hint, target_duration)
     expected_duration = target_duration or (input_duration / resolved_tempo if resolved_tempo > 0 else input_duration)
+    if (
+        target_duration is not None
+        and resolved_strategy == "syllable_vowel_core_stretch"
+        and signalsmith_stretch_available()
+    ):
+        regions = _vowel_core_stretch_regions(
+            input_duration,
+            target_duration,
+            text_hint,
+            source_path=normalized_input,
+        )
+        if regions:
+            try:
+                _render_signalsmith_vowel_core_clip(
+                    normalized_input,
+                    normalized_output,
+                    regions,
+                    target_duration=target_duration,
+                    options=options,
+                    on_progress=on_progress,
+                    should_cancel=should_cancel,
+                )
+                _ensure_audio_duration(
+                    normalized_output,
+                    target_duration,
+                    options,
+                    on_progress=on_progress,
+                    should_cancel=should_cancel,
+                    progress_message="Correcting Signalsmith material clip duration",
+                    fade=False,
+                )
+                return
+            except SignalsmithStretchError as exc:
+                if should_cancel is not None and should_cancel():
+                    raise AudioProcessorError("Processing cancelled") from exc
+                _notify_progress(
+                    on_progress,
+                    0.0,
+                    f"Signalsmith stretch failed; falling back to Rubber Band: {exc}",
+                )
+
     args = build_material_clip_args(
         normalized_input,
         normalized_output,
@@ -701,6 +753,80 @@ def process_material_clip_with_progress(
             progress_message="Correcting material clip duration",
             fade=False,
         )
+
+
+def _render_signalsmith_vowel_core_clip(
+    input_path: Path,
+    output_path: Path,
+    regions: Sequence[MaterialPhonemeRegion],
+    *,
+    target_duration: float,
+    options: ProcessOptions,
+    on_progress: ProgressCallback | None,
+    should_cancel: CancelCallback | None,
+) -> None:
+    intermediate_path = output_path.with_name(
+        f".{output_path.stem}.{os.getpid()}.{threading.get_ident()}.signalsmith.wav"
+    )
+    _remove_file_if_exists(intermediate_path)
+    try:
+        _notify_progress(on_progress, 0.02, "Stretching vowel core with Signalsmith")
+        render_signalsmith_regions(
+            input_path,
+            intermediate_path,
+            regions,
+            target_duration_seconds=target_duration,
+            should_cancel=should_cancel,
+        )
+        _notify_progress(on_progress, 0.72, "Applying material effects to Signalsmith stretch")
+        args = _build_signalsmith_material_finish_args(
+            intermediate_path,
+            output_path,
+            target_duration,
+            options,
+            progress=True,
+        )
+        _run_progress_process(
+            args,
+            duration_seconds=target_duration,
+            on_progress=lambda progress, message: _notify_progress(
+                on_progress,
+                0.72 + progress * 0.28,
+                message,
+            ),
+            should_cancel=should_cancel,
+        )
+    finally:
+        _remove_file_if_exists(intermediate_path)
+
+
+def _build_signalsmith_material_finish_args(
+    input_path: Path,
+    output_path: Path,
+    target_duration: float,
+    options: ProcessOptions,
+    *,
+    progress: bool,
+) -> list[str]:
+    filters: list[str] = []
+    audio_filters = _build_audio_filters(options)
+    if audio_filters:
+        filters.append(audio_filters)
+    filters.extend(_exact_duration_filters(target_duration, fade=True, loop_fill=False))
+    args = ["ffmpeg", "-hide_banner"]
+    if progress:
+        args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
+    args.append("-y" if options.overwrite else "-n")
+    args.extend(["-i", str(input_path), "-af", ",".join(filters)])
+    if options.sample_rate is not None:
+        args.extend(["-ar", str(options.sample_rate)])
+    if options.channels is not None:
+        args.extend(["-ac", str(options.channels)])
+    codec = options.codec or _default_audio_codec(output_path)
+    if codec:
+        args.extend(["-codec:a", codec])
+    args.append(str(output_path))
+    return args
 
 
 def assemble_material_to_reference_with_progress(
@@ -970,6 +1096,18 @@ def plan_material_stretch_clips(
         )
         if strategy == "syllable_vowel_core_stretch" and not phoneme_regions:
             strategy = "syllable_formant_expand_with_loop_fill"
+        stretch_backend = (
+            "signalsmith"
+            if strategy == "syllable_vowel_core_stretch"
+            and phoneme_regions
+            and signalsmith_stretch_available()
+            else "rubberband"
+        )
+        if stretch_backend == "signalsmith":
+            phoneme_regions = tuple(
+                replace(region, loop_fill=False)
+                for region in phoneme_regions
+            )
         clips.append(
             MaterialStretchClip(
                 index=index,
@@ -988,10 +1126,12 @@ def plan_material_stretch_clips(
                     loop_fill=strategy in {
                         "syllable_formant_expand_with_loop_fill",
                         "syllable_vowel_core_stretch",
-                    },
+                    }
+                    and stretch_backend == "rubberband",
                 ),
                 continuity_warning=_stretch_continuity_warning(requested_tempo, text_hint),
                 phoneme_regions=phoneme_regions,
+                stretch_backend=stretch_backend,
             )
         )
     return clips
@@ -1007,6 +1147,7 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "rubberband_tempo": clip.tempo,
             "requested_rubberband_tempo": clip.requested_tempo if clip.requested_tempo is not None else clip.tempo,
             "stretch_strategy": clip.stretch_strategy,
+            "stretch_backend": clip.stretch_backend,
             "text_hint": clip.text_hint,
             "phoneme_regions": [
                 {
@@ -1026,6 +1167,8 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "formant_preservation": (
                 "direct_trim_no_pitch_shift"
                 if clip.stretch_strategy == "tiny_target_direct_trim"
+                else "signalsmith_pitch_preserved_vowel_core"
+                if clip.stretch_backend == "signalsmith"
                 else "vowel_core_rubberband_formant_preserved"
                 if clip.stretch_strategy == "syllable_vowel_core_stretch"
                 else "rubberband_formant_preserved"
@@ -1039,6 +1182,12 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
 
 def _stretch_boundary_conditioning(clip: MaterialStretchClip) -> str:
     if clip.stretch_strategy == "syllable_vowel_core_stretch":
+        if clip.stretch_backend == "signalsmith":
+            return (
+                "signalsmith_vowel_core_stretch+fade_in_out"
+                if clip.fade_seconds > 0
+                else "signalsmith_vowel_core_stretch"
+            )
         return "vowel_core_stretch+fade_in_out" if clip.fade_seconds > 0 else "vowel_core_stretch"
     if clip.stretch_strategy == "syllable_formant_expand_with_loop_fill":
         return "loop_fill+fade_in_out" if clip.fade_seconds > 0 else "loop_fill"
@@ -1792,6 +1941,7 @@ def _material_render_cache_key(clip: MaterialStretchClip, options: ProcessOption
         "rubberband_tempo": round(clip.tempo, 10),
         "requested_rubberband_tempo": round(clip.requested_tempo if clip.requested_tempo is not None else clip.tempo, 10),
         "stretch_strategy": clip.stretch_strategy,
+        "stretch_backend": clip.stretch_backend,
         "filter_format": MATERIAL_RENDER_FILTER_FORMAT,
         "text_hint": clip.text_hint,
         "options": {

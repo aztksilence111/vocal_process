@@ -425,8 +425,10 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
         self.assertLess(clips[0].stretch_naturalness_score, 0.2)
         rendered = render_material_stretch_plan(clips)
-        self.assertEqual(rendered[0]["boundary_conditioning"], "vowel_core_stretch+fade_in_out")
-        self.assertEqual(rendered[0]["formant_preservation"], "vowel_core_rubberband_formant_preserved")
+        self.assertEqual(clips[0].stretch_backend, "signalsmith")
+        self.assertEqual(rendered[0]["stretch_backend"], "signalsmith")
+        self.assertEqual(rendered[0]["boundary_conditioning"], "signalsmith_vowel_core_stretch+fade_in_out")
+        self.assertEqual(rendered[0]["formant_preservation"], "signalsmith_pitch_preserved_vowel_core")
         self.assertEqual(
             [region["kind"] for region in rendered[0]["phoneme_regions"]],
             ["consonant_attack", "vowel_core"],
@@ -3158,10 +3160,13 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(report["summary"]["fade_applied_clip_count"], 1)
         self.assertLess(report["summary"]["stretch_naturalness_score_mean"] or 1.0, 0.2)
         self.assertEqual(report["stretch_plan"][0]["continuity_warning"], "single_syllable_boundary_risk")
-        self.assertEqual(report["stretch_plan"][0]["boundary_conditioning"], "vowel_core_stretch+fade_in_out")
+        self.assertEqual(
+            report["stretch_plan"][0]["boundary_conditioning"],
+            "signalsmith_vowel_core_stretch+fade_in_out",
+        )
         self.assertEqual(
             report["optimization"]["render_continuity"]["boundary_conditioning"],
-            "vowel_core_stretch+per_clip_fade_in_out",
+            "signalsmith_vowel_core_stretch+per_clip_fade_in_out",
         )
         self.assertTrue(any(warning["kind"] == "single_syllable_boundary_risk" for warning in report["warnings"]))
 

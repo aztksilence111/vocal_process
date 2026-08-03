@@ -1,5 +1,22 @@
 # Project Analysis
 
+## Latest Update - 2026-08-03 Signalsmith Backend Integration
+
+The stretch implementation now borrows the part of HiFiShifter that is relevant to this project: Signalsmith Stretch as a public, pitch-preserving PCM time-stretch backend with output length driven by the requested frame count. The complete HiFiShifter editor, pitch curves, formant controls, and processor chain remain out of scope.
+
+The runtime boundary is now explicit. For short filename-labeled material with a detected or label-derived vowel core, `plan_material_stretch_clips()` reports `stretch_backend=signalsmith`. `process_material_clip_with_progress()` decodes the source through `soundfile`, sends consonant attack, vowel core, and coda regions to Signalsmith separately, concatenates their exact target frame counts, and then uses FFmpeg only for effects, fades, encoding, and final duration correction. If `python-stretch` is unavailable or the source cannot be decoded by `soundfile`, the prior Rubber Band filter graph is used and the failure is surfaced through progress diagnostics.
+
+This addresses the specific limitation in the old path: the vowel core was capped at Rubber Band tempo `0.35` and then loop-filled for more extreme expansion. Signalsmith can request the actual target frame count, so the clip is no longer forced into that loop-fill branch when the native backend is available. This does not make arbitrary four-times expansion natural; quality warnings and strict thresholds remain unchanged, and Signalsmith itself still needs comparison against real vocal material.
+
+Verification:
+
+1. `python -m unittest discover`: 166 tests passed.
+2. `python -m compileall -q audio_processor tests`, `python -m audio_processor check`, and `git diff --check` passed.
+3. A direct Signalsmith sine test and an end-to-end FFmpeg material render both produced exactly 2.000000 seconds from a 0.5-second source.
+4. The six-minute PlasticLove real-eval attempt produced no completed case and is recorded as incomplete, not as evidence of quality improvement.
+
+The next measurement should be a bounded one-clip or small-subset A/B comparison between Signalsmith and Rubber Band, followed by a larger real-eval only after the new backend's continuity and naturalness metrics are observed. Do not remove fallback behavior or relax strict gates.
+
 ## Latest Closeout - 2026-08-03
 
 The branch now has a stable separation of responsibilities: filename labels define trusted short-material pronunciation before ASR, while the reference side retains lyrics/original-vocal timing authority. Rendering preserves exact target duration and has a vowel-core-aware expansion path instead of treating every short clip as uniformly stretchable.

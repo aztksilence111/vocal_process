@@ -140,7 +140,7 @@ def run_batch_queue(
                 diagnostics.event(
                     "render.stretch_plan",
                     "Per-material stretch plan prepared",
-                    render_strategy="per_clip_rubberband_then_concat",
+                    render_strategy="per_clip_signalsmith_or_rubberband_then_concat",
                     quality_warning_count=sum(1 for clip in stretch_plan if clip.quality_warning),
                     clips=render_material_stretch_plan(stretch_plan),
                 )
