@@ -29,6 +29,7 @@ from .model_assist import (
     VoiceUnitTiming,
     _japanese_timeline_unit_spans,
     _phonetic_units,
+    _text_units,
     list_model_candidates,
     plan_material_ordering,
     render_ordering_score_matrix,
@@ -73,6 +74,10 @@ class AudioAnalysis:
     speaker_embedding: tuple[float, ...] | None
     analysis_source: str
     notes: tuple[str, ...] = ()
+    material_text_source: str = ""
+    asr_skipped_for_filename_label: bool = False
+    parsed_filename_units: tuple[str, ...] = ()
+    parsed_filename_phonetic_units: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,15 @@ class _MaterialFilenameLabelPolicy:
     enabled: bool
     cache_key: str
     language: str
+
+
+@dataclass(frozen=True)
+class _MaterialFilenameLabelAuthority:
+    text: str
+    segments: tuple[TranscriptSegment, ...]
+    notes: tuple[str, ...]
+    parsed_units: tuple[str, ...]
+    parsed_phonetic_units: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -149,7 +163,8 @@ DEFAULT_FUNASR_PUNC_MODEL = "ct-punc"
 DEFAULT_DEVICE = "cpu"
 DEFAULT_COMPUTE_TYPE = "int8"
 MATERIAL_CACHE_FILE = ".vocalprocess_material_cache.json"
-MATERIAL_CACHE_FORMAT = "vocal_process_material_cache_v3_language_asr_guard"
+MATERIAL_CACHE_FORMAT = "vocal_process_material_cache_v4_filename_label_first"
+MATERIAL_LABEL_ANALYSIS_STRATEGY = "filename_label_first_v1"
 REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v2_language_asr_guard"
 PYANNOTE_DIA_MODEL = "pyannote/speaker-diarization-community-1"
 SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
@@ -540,37 +555,46 @@ def _material_filename_label_policy(
     elif mode != "auto":
         normalized_mode = f"auto-{mode}"
 
-    cache_key = f"{normalized_mode}:{language or 'unknown'}:{confidence:.3f}:{source}"
+    cache_key = f"{MATERIAL_LABEL_ANALYSIS_STRATEGY}:{normalized_mode}:{language or 'unknown'}:{confidence:.3f}:{source}"
     return _MaterialFilenameLabelPolicy(enabled=enabled, cache_key=cache_key, language=language)
 
 
-def _apply_material_filename_label_authority(
+def _material_filename_label_authority(
     path: Path,
     *,
     duration_seconds: float,
-    transcript: str,
-    segments: Sequence[TranscriptSegment],
     policy: _MaterialFilenameLabelPolicy,
-) -> tuple[str, tuple[TranscriptSegment, ...], tuple[str, ...]]:
-    normalized_segments = tuple(segments)
+) -> _MaterialFilenameLabelAuthority | None:
     if not policy.enabled:
-        return transcript, normalized_segments, ()
+        return None
 
     filename_text = _filename_text_hint(path)
     if not _looks_like_material_filename_label(filename_text, duration_seconds, language_hint=policy.language):
-        return transcript, normalized_segments, ()
+        return None
 
+    parsed_units = tuple(_text_units(filename_text))
+    parsed_phonetic_units = tuple(_phonetic_units(filename_text, language_hint=policy.language))
     authority_segment = TranscriptSegment(
         start_seconds=0.0,
         end_seconds=max(duration_seconds, 0.0),
         text=filename_text,
         timing_source="filename_label_authority",
     )
-    note = (
+    notes = (
+        "material_text_source=filename_label_authority",
+        "asr_skipped_for_filename_label=true",
+        f"parsed_filename_units={json.dumps(list(parsed_units), ensure_ascii=False)}",
+        f"parsed_filename_phonetic_units={json.dumps(list(parsed_phonetic_units), ensure_ascii=False)}",
         "material_filename_label_authority: "
-        f"filename label used for matching; policy={policy.cache_key}; asr_transcript_ignored=True"
+        f"filename label used for matching; policy={policy.cache_key}; asr_skipped_for_filename_label=true",
     )
-    return filename_text, (authority_segment,), (note,)
+    return _MaterialFilenameLabelAuthority(
+        text=filename_text,
+        segments=(authority_segment,),
+        notes=notes,
+        parsed_units=parsed_units,
+        parsed_phonetic_units=parsed_phonetic_units,
+    )
 
 
 def _looks_like_material_filename_label(
@@ -742,6 +766,10 @@ def build_model_ordering(
             duration_seconds=analysis.duration_seconds,
             analysis_source=analysis.analysis_source,
             language_hint=material_language_hint,
+            material_text_source=analysis.material_text_source,
+            asr_skipped_for_filename_label=analysis.asr_skipped_for_filename_label,
+            parsed_filename_units=analysis.parsed_filename_units,
+            parsed_filename_phonetic_units=analysis.parsed_filename_phonetic_units,
         )
         for analysis in library.materials
     ]
@@ -1000,13 +1028,48 @@ def analyze_material_library(
         progress = 0.25 + ((index + 1) / max(total, 1)) * 0.65
         _notify_progress(on_progress, progress, f"Analyzing material {index + 1}/{total}: {path.name}")
         _raise_if_cancelled(should_cancel)
-        transcript_result = _transcribe_audio(
+        duration = get_audio_duration_seconds(probe_audio(path))
+        filename_text = _filename_text_hint(path)
+        effective_language_hint = language_hint or filename_label_policy.language
+        label_authority = _material_filename_label_authority(
             path,
-            work_dir=work_dir,
-            compute_device=compute_device,
-            should_cancel=should_cancel,
-            language_hint=language_hint or filename_label_policy.language,
+            duration_seconds=duration,
+            policy=filename_label_policy,
         )
+        if label_authority is not None:
+            transcript_text = label_authority.text
+            transcript_segments = label_authority.segments
+            transcript_backend = "filename_label_authority"
+            transcript_notes = label_authority.notes
+            parsed_filename_units = label_authority.parsed_units
+            parsed_filename_phonetic_units = label_authority.parsed_phonetic_units
+        else:
+            transcript_result = _transcribe_audio(
+                path,
+                work_dir=work_dir,
+                compute_device=compute_device,
+                should_cancel=should_cancel,
+                language_hint=effective_language_hint,
+            )
+            transcript_text = str(transcript_result["text"])
+            transcript_segments = tuple(
+                TranscriptSegment(
+                    start_seconds=segment.start_seconds,
+                    end_seconds=segment.end_seconds,
+                    text=segment.text,
+                    confidence=segment.confidence,
+                    speaker_id=segment.speaker_id,
+                )
+                for segment in transcript_result["segments"]
+            )
+            transcript_backend = str(transcript_result["backend"])
+            transcript_notes = tuple(
+                str(note) for note in transcript_result.get("notes", ()) if isinstance(note, str)
+            )
+            parsed_filename_units = tuple(_text_units(filename_text))
+            parsed_filename_phonetic_units = tuple(
+                _phonetic_units(filename_text, language_hint=effective_language_hint)
+            )
         _raise_if_cancelled(should_cancel)
         vad_segments = _detect_vad_segments(path, compute_device=compute_device, should_cancel=should_cancel)
         _raise_if_cancelled(should_cancel)
@@ -1017,24 +1080,6 @@ def analyze_material_library(
             should_cancel=should_cancel,
         )
         _raise_if_cancelled(should_cancel)
-        duration = get_audio_duration_seconds(probe_audio(path))
-        raw_segments = tuple(
-            TranscriptSegment(
-                start_seconds=segment.start_seconds,
-                end_seconds=segment.end_seconds,
-                text=segment.text,
-                confidence=segment.confidence,
-                speaker_id=segment.speaker_id,
-            )
-            for segment in transcript_result["segments"]
-        )
-        transcript_text, transcript_segments, transcript_notes = _apply_material_filename_label_authority(
-            path,
-            duration_seconds=duration,
-            transcript=str(transcript_result["text"]),
-            segments=raw_segments,
-            policy=filename_label_policy,
-        )
         analyses.append(
             AudioAnalysis(
                 path=path,
@@ -1043,8 +1088,12 @@ def analyze_material_library(
                 segments=transcript_segments,
                 vad_segments=vad_segments,
                 speaker_embedding=speaker_embedding,
-                analysis_source=transcript_result["backend"],
-                notes=tuple(transcript_result.get("notes", ())) + transcript_notes,
+                analysis_source=transcript_backend,
+                notes=transcript_notes,
+                material_text_source="filename_label_authority" if label_authority is not None else "asr_transcript",
+                asr_skipped_for_filename_label=label_authority is not None,
+                parsed_filename_units=parsed_filename_units,
+                parsed_filename_phonetic_units=parsed_filename_phonetic_units,
             )
         )
 
@@ -1114,6 +1163,10 @@ def render_material_analysis(analysis: AudioAnalysis) -> dict[str, Any]:
         "filename_text": _filename_text_hint(analysis.path),
         "duration_seconds": analysis.duration_seconds,
         "backend": analysis.analysis_source,
+        "material_text_source": analysis.material_text_source,
+        "asr_skipped_for_filename_label": analysis.asr_skipped_for_filename_label,
+        "parsed_filename_units": list(analysis.parsed_filename_units),
+        "parsed_filename_phonetic_units": list(analysis.parsed_filename_phonetic_units),
         "transcript": analysis.transcript,
         "segments": [
             {
@@ -2675,6 +2728,8 @@ def _load_material_library_cache(
         return None
     if raw.get("material_filename_label_policy") != filename_label_policy.cache_key:
         return None
+    if raw.get("material_label_analysis_strategy") != MATERIAL_LABEL_ANALYSIS_STRATEGY:
+        return None
     if raw.get("snapshot") != list(snapshot):
         return None
 
@@ -2708,6 +2763,7 @@ def _write_material_library_cache(
         "asr_backend": _asr_backend_cache_key(language_hint),
         "language_hint": _normalize_cn_jp_language(language_hint),
         "material_filename_label_policy": filename_label_policy.cache_key,
+        "material_label_analysis_strategy": MATERIAL_LABEL_ANALYSIS_STRATEGY,
         "snapshot": list(snapshot),
         "materials": [render_material_analysis(analysis) for analysis in library.materials],
     }
@@ -2784,6 +2840,8 @@ def _default_material_cache_dir(
         "asr_backend": _asr_backend_cache_key(language_hint),
         "language_hint": _normalize_cn_jp_language(language_hint),
         "compute_device": compute_device,
+        "material_cache_format": MATERIAL_CACHE_FORMAT,
+        "material_label_analysis_strategy": MATERIAL_LABEL_ANALYSIS_STRATEGY,
     }
     key = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     return work_root / "material_analysis_cache" / key
@@ -2951,6 +3009,14 @@ def _audio_analysis_from_cache(data: dict[str, Any]) -> AudioAnalysis:
         speaker_embedding=speaker_embedding,
         analysis_source=str(data.get("backend") or "cache"),
         notes=tuple(str(note) for note in data.get("notes", []) if isinstance(note, str)),
+        material_text_source=str(data.get("material_text_source") or ""),
+        asr_skipped_for_filename_label=bool(data.get("asr_skipped_for_filename_label", False)),
+        parsed_filename_units=tuple(
+            str(unit) for unit in data.get("parsed_filename_units", []) if isinstance(unit, str)
+        ),
+        parsed_filename_phonetic_units=tuple(
+            str(unit) for unit in data.get("parsed_filename_phonetic_units", []) if isinstance(unit, str)
+        ),
     )
 
 

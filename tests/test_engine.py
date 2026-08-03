@@ -1997,14 +1997,26 @@ class ModelAssistTests(unittest.TestCase):
             with patch(
                 "audio_processor.model_runtime._transcribe_audio",
                 return_value={"backend": "whisperx", "text": "\u4ed6", "segments": [], "notes": []},
-            ):
+            ) as transcribe_mock:
                 with patch("audio_processor.model_runtime._detect_vad_segments", return_value=()):
                     with patch("audio_processor.model_runtime._speaker_embedding", return_value=None):
                         library = model_runtime.analyze_material_library(material_dir)
 
-        self.assertEqual(library.materials[0].transcript, "ha")
-        self.assertEqual(library.materials[0].segments[0].text, "ha")
-        self.assertTrue(any("material_filename_label_authority" in note for note in library.materials[0].notes))
+        material = library.materials[0]
+        transcribe_mock.assert_not_called()
+        self.assertEqual(material.transcript, "ha")
+        self.assertEqual(material.segments[0].text, "ha")
+        self.assertEqual(material.analysis_source, "filename_label_authority")
+        self.assertEqual(material.material_text_source, "filename_label_authority")
+        self.assertTrue(material.asr_skipped_for_filename_label)
+        self.assertEqual(material.parsed_filename_units, ("ha",))
+        self.assertEqual(material.parsed_filename_phonetic_units, ("ha",))
+        self.assertTrue(any("material_filename_label_authority" in note for note in material.notes))
+
+        rendered = model_runtime.render_material_analysis(material)
+        self.assertEqual(rendered["material_text_source"], "filename_label_authority")
+        self.assertTrue(rendered["asr_skipped_for_filename_label"])
+        self.assertEqual(rendered["parsed_filename_phonetic_units"], ["ha"])
 
     def test_material_display_text_collapses_duplicate_filename_authority(self) -> None:
         material = MaterialAnalysis(
@@ -2593,6 +2605,7 @@ class ModelRuntimeTests(unittest.TestCase):
                         "asr_model": model_runtime.DEFAULT_ASR_MODEL,
                         "asr_backend": model_runtime._asr_backend_cache_key(),
                         "material_filename_label_policy": filename_label_policy.cache_key,
+                        "material_label_analysis_strategy": model_runtime.MATERIAL_LABEL_ANALYSIS_STRATEGY,
                         "snapshot": snapshot,
                         "materials": [
                             {
@@ -2641,6 +2654,7 @@ class ModelRuntimeTests(unittest.TestCase):
                         "asr_model": model_runtime.DEFAULT_ASR_MODEL,
                         "asr_backend": "auto",
                         "material_filename_label_policy": filename_label_policy.cache_key,
+                        "material_label_analysis_strategy": model_runtime.MATERIAL_LABEL_ANALYSIS_STRATEGY,
                         "snapshot": snapshot,
                         "materials": [
                             {

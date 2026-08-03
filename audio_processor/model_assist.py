@@ -195,6 +195,10 @@ class MaterialAnalysis:
     vad_coverage: float | None = None
     analysis_source: str = ""
     language_hint: str = ""
+    material_text_source: str = ""
+    asr_skipped_for_filename_label: bool = False
+    parsed_filename_units: tuple[str, ...] = ()
+    parsed_filename_phonetic_units: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

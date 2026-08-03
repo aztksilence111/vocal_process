@@ -1,5 +1,28 @@
 # Project Analysis
 
+## Latest Update - 2026-08-03 Filename-Label-First Material Authority
+
+This round implemented the next architecture target from the 2026-08-02 resume notes: material filename labels must become the primary text authority before material ASR runs. The previous "label authority" path was still ASR-first; it could overwrite hallucinated material transcripts after transcription, but it still paid the ASR cost and still allowed stale ASR-first cache payloads to appear authoritative unless cache policy happened to reject them.
+
+The material side now has an explicit filename-label-first branch. `analyze_material_library()` probes duration, evaluates `_material_filename_label_policy()`, and for parseable short labels creates `AudioAnalysis` directly from `_filename_text_hint()`. These analyses have `analysis_source="filename_label_authority"`, `material_text_source="filename_label_authority"`, `asr_skipped_for_filename_label=true`, parsed filename text units, parsed filename phonetic units, and a full-duration transcript segment marked `timing_source="filename_label_authority"`. `_transcribe_audio()` is not called for these trusted label clips.
+
+The cache and report contract was upgraded at the same time. Material cache format is now `vocal_process_material_cache_v4_filename_label_first`, cache payloads include `material_label_analysis_strategy="filename_label_first_v1"`, and `render_material_analysis()` serializes the new structured diagnostics. This rejects stale ASR-first material caches instead of letting old transcripts pollute matching reports or JSON diagnostics.
+
+The target side intentionally stayed unchanged. Lyrics still define target units when present, and original-vocal ASR/alignment still supplies unit timing. Without lyrics, original-vocal ASR/aligned units continue to define the target lattice and timing. This keeps the current product model intact: cross-language or Chinese-voice material can serve Japanese targets when filename phonetic units match, and semantic phrase matching is not the primary path.
+
+Verification:
+
+1. `compileall -q audio_processor tests` passed.
+2. Targeted filename/cache tests passed, including the regression that trusted `ha.wav` does not call `_transcribe_audio()`.
+3. `ModelAssistTests` and `ModelRuntimeTests` passed with 76 tests.
+4. Full `unittest discover` passed with 164 tests.
+5. `audio_processor check` passed.
+6. `git diff --check` passed with only CRLF conversion warnings.
+7. Non-render `PlasticLove_JP__vmzJP` smoke at `.tmp\filename-label-first-smoke\real-eval-20260803-202928\summary.md` showed 104/104 vmzJP material files using `filename_label_authority`, 411 ordered materials, and 411/411 positioned and timed decisions.
+8. Rendered `PlasticLove_JP__vmzJP` smoke at `.tmp\filename-label-first-render-smoke\real-eval-20260803-203308\summary.md` completed with `status=rendered`, `rendered_audio_alignment_score=0.782725`, `render_duration_delta_ratio.mean=0.0`, `match_ordering_score=0.37506`, `stretch_quality_score=0.290289`, and strict pass still false.
+
+Residual risk is now more isolated. The PlasticLove material analysis no longer shows JP/vmzJP clips being treated as Chinese ASR text, but audio quality remains limited by sparse material coverage and stretch pressure: `weak_text_signal=171`, `low_match_score=4`, `single_syllable_extreme_stretch=277`, `single_syllable_boundary_risk=277`, and `continuity_warning_ratio=0.744526`. The next durable improvement should be generic near-phonetic substitute selection and stretch allocation for missing/sparse syllables, not song-specific exceptions, long phrase semantic matching, or relaxed strict thresholds.
+
 ## Latest Update - 2026-08-01 Segment-Lattice Ordering for Unit-Timing Coverage
 
 The full rendered suite at `tests_real\output\real-eval-20260801-164819\summary.json` proved the render-duration path is now stable: every compatible case rendered and `render_validation.status` was `ok`, with output duration deltas effectively zero. The remaining urgent timeline defect was no longer final WAV length. It was target-unit coverage, especially `PlasticLove_JP__vmzJP`, where only about 30% of decisions had one-to-one reference positions and timed target durations.

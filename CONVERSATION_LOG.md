@@ -1,5 +1,18 @@
 # Conversation Log
 
+## Latest Update - 2026-08-03 Filename-Label-First Material Analysis
+
+1. This continuation read `.tmp\codex-admin-resume.md`, `PROJECT_RULES.md`, `CONVERSATION_LOG.md`, `PROJECT_ANALYSIS.md`, and the relevant global memories. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed. The active branch remained `codex/cancel-phonetic-accuracy`.
+2. Resume target was the unimplemented filename-label-first material analysis plan from the 2026-08-02 closeout. The old behavior still called material ASR first and only then overwrote hallucinated transcripts with short filename labels.
+3. `audio_processor.model_runtime.analyze_material_library()` now probes material duration first, checks the material filename label policy, and for trusted short filename labels creates analysis from the filename before `_transcribe_audio()` can run.
+4. Trusted filename-label materials now use `analysis_source="filename_label_authority"`, `material_text_source="filename_label_authority"`, `asr_skipped_for_filename_label=true`, a full-length `TranscriptSegment` with `timing_source="filename_label_authority"`, and structured parsed filename units / parsed filename phonetic units.
+5. Material diagnostics are now serialized through `render_material_analysis()` and material cache JSON. `MATERIAL_CACHE_FORMAT` was bumped to `vocal_process_material_cache_v4_filename_label_first`, and cache payloads include `material_label_analysis_strategy="filename_label_first_v1"` so ASR-first caches are rejected.
+6. `audio_processor.model_assist.MaterialAnalysis` now carries the same material text source and parsed filename diagnostics for future scoring/reporting work. Target-side behavior was not changed: lyrics/reference ASR alignment still define target units and timings as before.
+7. Verification passed: `compileall -q audio_processor tests`, targeted filename/cache tests, `ModelAssistTests` + `ModelRuntimeTests` (76 tests), full `unittest discover` (164 tests), `audio_processor check`, and `git diff --check` with only existing CRLF conversion warnings.
+8. Focused non-render smoke passed at `.tmp\filename-label-first-smoke\real-eval-20260803-202928\summary.md`. `PlasticLove_JP__vmzJP` produced 411 ordered materials, 411 positioned/timed decisions, and all 104 vmzJP material analyses reported `material_text_source=filename_label_authority` with `asr_skipped_for_filename_label=true`.
+9. Focused rendered smoke passed at `.tmp\filename-label-first-render-smoke\real-eval-20260803-203308\summary.md`. Status was `rendered`, `rendered_audio_alignment_score=0.782725`, `render_duration_delta_ratio.mean=0.0`, `match_ordering_score=0.37506`, `stretch_quality_score=0.290289`, and strict pass remained false.
+10. Remaining work is still material quality rather than ASR pollution: `weak_text_signal=171`, `low_match_score=4`, `single_syllable_extreme_stretch=277`, `continuity_warning_ratio=0.744526`, and `single_syllable_boundary_risk=277` remain high for `PlasticLove_JP__vmzJP`. Next development should focus on generic near-phonetic substitute selection and stretch allocation, not long phrase semantic matching or relaxed thresholds.
+
 ## Latest Update - 2026-08-01 Segment-Lattice Target Ordering for Timeline Coverage
 
 1. This continuation read the requested project context. `E:\Workplace\demo\AGENTS.md` is still absent, so the AGENTS rules supplied in the user prompt were followed together with `PROJECT_RULES.md`. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed and the working branch remained `codex/cancel-phonetic-accuracy`.
