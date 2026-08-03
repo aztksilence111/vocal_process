@@ -1,5 +1,18 @@
 # Conversation Log
 
+## Latest Update - 2026-08-03 Vowel-Core Stretching for Short Material
+
+1. This continuation kept the branch `codex/cancel-phonetic-accuracy` and ran the required preflight. The workspace remained clean before edits.
+2. The user asked for consonant/vowel-aware stretching and specifically mentioned Vegas/Melodyne-like behavior. I did not attempt to unpack or reverse engineer proprietary software internals. Instead I implemented a public-DSP approach based on filename/text phonetic structure plus optional local acoustic analysis.
+3. A new `audio_processor.phoneme` module now analyzes short material labels with `librosa.pyin` when available, returning a vowel/core profile with a voiced span and confidence. If acoustic analysis is unavailable or inconclusive, it falls back to the filename phonetic label.
+4. `audio_processor.engine` now uses a new `syllable_vowel_core_stretch` strategy for short material expansion when a vowel core can be identified. The clip is split into consonant attack, vowel core, and optional coda regions. The consonant regions are only lightly stretched; the vowel core absorbs most of the extra duration.
+5. The FFmpeg filtergraph is now split-based for this strategy: `asplit` feeds separate region trims, each region is time-stretched independently, then concat plus final exact-duration correction produces the output. Render cache format was bumped to `material_render_filter_v7_vowel_core_stretch`.
+6. Existing loop-fill behavior remains as fallback for short labels that do not present a usable vowel core. Tiny targets still use direct trim.
+7. Verification passed: `compileall -q audio_processor tests`, targeted unit tests, full `unittest discover` (164 tests), `audio_processor check`, and `git diff --check` with only CRLF conversion warnings.
+8. Synthetic FFmpeg smoke passed on `shi.wav` from 0.5s to 2.0s, and the acoustic analyzer reported `VowelConsonantProfile(... detection_source='librosa_voiced_f0' ...)`.
+9. Real rendered smoke passed at `.tmp\vowel-core-real-smoke\real-eval-20260803-224804\summary.md` for `PlasticLove_JP__vmzJP`. Status was `rendered`, `render_duration_delta_ratio.mean=0.0`, `rendered_audio_alignment_score=0.782933`, `stretch_quality_score=0.293067`, and all 104 vmzJP materials still used `filename_label_authority` with `asr_skipped_for_filename_label=true`.
+10. The new stretch logic did not remove the remaining quality ceiling. `weak_text_signal`, `single_syllable_extreme_stretch`, and `continuity_warning_ratio` remain high, which means the next step should be better phonetic candidate selection and more nuanced region allocation, not unlimited stretch or proprietary reverse engineering.
+
 ## Latest Update - 2026-08-03 Filename-Label-First Material Analysis
 
 1. This continuation read `.tmp\codex-admin-resume.md`, `PROJECT_RULES.md`, `CONVERSATION_LOG.md`, `PROJECT_ANALYSIS.md`, and the relevant global memories. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed. The active branch remained `codex/cancel-phonetic-accuracy`.

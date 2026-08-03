@@ -1,5 +1,24 @@
 # Project Analysis
 
+## Latest Update - 2026-08-03 Vowel-Core Stretch Strategy
+
+This round moved the stretch pipeline one level closer to the behavior the user asked for. Instead of treating a short clip as one block and stretching or looping the whole file, the renderer now attempts to identify a vowel core and split the clip into consonant attack, vowel core, and optional coda regions. The new `audio_processor.phoneme` module uses local `librosa.pyin` voiced/F0 analysis when available, but it always has a filename-label fallback so the pipeline does not depend on perfect acoustic segmentation.
+
+The implementation is intentionally heuristic, not a proprietary clone. It is based on public audio-processing ideas: voiced-region detection, per-region stretch allocation, and final exact-duration correction. The voice-like region carries most of the extra duration, while consonant regions are only lightly expanded. When no reliable vowel core is available, the code falls back to the existing short-text loop-fill path.
+
+The practical effect is visible in the render graph. Short material now uses `syllable_vowel_core_stretch`, which emits a split FFmpeg graph with `asplit`, per-region `atrim`, per-region Rubber Band, and final concat plus duration correction. Cache keys were bumped to `material_render_filter_v7_vowel_core_stretch`, and preflight now reports `vowel_core_stretch` boundary conditioning for this path.
+
+Verification:
+
+1. `compileall -q audio_processor tests` passed.
+2. Targeted unit tests for vowel-core short-material stretching passed.
+3. Full `unittest discover` passed with 164 tests.
+4. `audio_processor check` passed.
+5. Synthetic FFmpeg smoke on `shi.wav` from 0.5s to 2.0s passed.
+6. Rendered real smoke at `.tmp\vowel-core-real-smoke\real-eval-20260803-224804\summary.md` completed with `status=rendered`, `render_duration_delta_ratio.mean=0.0`, `rendered_audio_alignment_score=0.782933`, and `stretch_quality_score=0.293067`.
+
+Residual risk is still the same class of problem as before: the system can now preserve more natural attack/core structure, but it still cannot manufacture missing phonetic evidence. `weak_text_signal`, `single_syllable_extreme_stretch`, `continuity_warning_ratio`, and `single_syllable_boundary_risk` remain high for the PlasticLove vmzJP cohort, which means the next improvement should be better candidate selection and a more careful breakdown of very sparse syllables.
+
 ## Latest Update - 2026-08-03 Filename-Label-First Material Authority
 
 This round implemented the next architecture target from the 2026-08-02 resume notes: material filename labels must become the primary text authority before material ASR runs. The previous "label authority" path was still ASR-first; it could overwrite hallucinated material transcripts after transcription, but it still paid the ASR cost and still allowed stale ASR-first cache payloads to appear authoritative unless cache policy happened to reject them.

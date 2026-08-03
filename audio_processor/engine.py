@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
 
+from .phoneme import analyze_vowel_consonant_profile
+
 
 class AudioProcessorError(RuntimeError):
     """Raised when a required tool or audio processing command fails."""
@@ -45,6 +47,20 @@ class ProcessOptions:
 
 
 @dataclass(frozen=True)
+class MaterialPhonemeRegion:
+    kind: str
+    source_start_seconds: float
+    source_end_seconds: float
+    target_duration_seconds: float
+    tempo: float
+    loop_fill: bool = False
+
+    @property
+    def source_duration_seconds(self) -> float:
+        return max(self.source_end_seconds - self.source_start_seconds, 0.0)
+
+
+@dataclass(frozen=True)
 class MaterialStretchClip:
     index: int
     source_path: Path
@@ -58,6 +74,7 @@ class MaterialStretchClip:
     fade_seconds: float = 0.0
     stretch_naturalness_score: float = 1.0
     continuity_warning: str = ""
+    phoneme_regions: tuple[MaterialPhonemeRegion, ...] = ()
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {
@@ -75,6 +92,7 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 RUBBERBAND_MIN_TEMPO = 0.01
 RUBBERBAND_MAX_TEMPO = 100.0
 RUBBERBAND_SHORT_TEXT_MIN_TEMPO = 0.35
+RUBBERBAND_VOWEL_CORE_STRETCH_TEMPO = 0.75
 DAW_WAV_CODEC = "pcm_s24le"
 MIN_MATERIAL_TARGET_DURATION_SECONDS = 0.001
 RENDERED_CLIP_CONCAT_LIST_THRESHOLD = 64
@@ -86,7 +104,12 @@ MATERIAL_RENDER_TINY_TARGET_SECONDS = 0.030
 MATERIAL_RENDER_DURATION_TOLERANCE_SECONDS = 0.025
 MATERIAL_RENDER_DURATION_TOLERANCE_RATIO = 0.001
 MATERIAL_RENDER_LOOP_FILL_SIZE_SAMPLES = 2_147_483_647
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v6_short_text_loop_fill"
+MATERIAL_CONSONANT_MAX_STRETCH_RATIO = 1.20
+MATERIAL_CODA_MAX_STRETCH_RATIO = 1.12
+MATERIAL_CONSONANT_MAX_SECONDS = 0.075
+MATERIAL_CODA_MAX_SECONDS = 0.060
+MATERIAL_VOWEL_CORE_MIN_SECONDS = 0.030
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v7_vowel_core_stretch"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -354,6 +377,7 @@ def build_material_clip_args(
     *,
     target_duration: float | None = None,
     text_hint: str = "",
+    source_duration: float | None = None,
     progress: bool = False,
 ) -> list[str]:
     _validate_options(options)
@@ -366,15 +390,40 @@ def build_material_clip_args(
 
     args.append("-y" if options.overwrite else "-n")
     args.extend(["-i", str(input_path)])
-    args.extend([
-        "-af",
-        _build_material_clip_filter(
-            resolved_tempo,
-            options,
+    resolved_source_duration = source_duration
+    if resolved_source_duration is None and target_duration is not None and tempo > 0:
+        resolved_source_duration = target_duration * tempo
+    if (
+        target_duration is not None
+        and resolved_source_duration is not None
+        and _should_use_vowel_core_stretch(
+            tempo,
+            text_hint,
+            target_duration,
+            resolved_source_duration,
+        )
+    ):
+        graph = _build_vowel_core_filter_graph(
+            "[0:a]",
+            "outa",
+            source_duration=resolved_source_duration,
             target_duration=target_duration,
             text_hint=text_hint,
-        ),
-    ])
+            options=options,
+            label_prefix="vc0",
+            source_path=input_path,
+        )
+        args.extend(["-filter_complex", graph, "-map", "[outa]"])
+    else:
+        args.extend([
+            "-af",
+            _build_material_clip_filter(
+                resolved_tempo,
+                options,
+                target_duration=target_duration,
+                text_hint=text_hint,
+            ),
+        ])
 
     if options.sample_rate is not None:
         args.extend(["-ar", str(options.sample_rate)])
@@ -633,6 +682,7 @@ def process_material_clip_with_progress(
         ),
         target_duration=target_duration,
         text_hint=text_hint,
+        source_duration=input_duration,
         progress=True,
     )
     _run_progress_process(
@@ -908,6 +958,18 @@ def plan_material_stretch_clips(
         requested_tempo = source_duration / target_duration
         tempo, strategy = _resolve_stretch_strategy(requested_tempo, text_hint, target_duration)
         _validate_rubberband_tempo(tempo)
+        phoneme_regions = (
+            _vowel_core_stretch_regions(
+                source_duration,
+                target_duration,
+                text_hint,
+                source_path=path,
+            )
+            if strategy == "syllable_vowel_core_stretch"
+            else ()
+        )
+        if strategy == "syllable_vowel_core_stretch" and not phoneme_regions:
+            strategy = "syllable_formant_expand_with_loop_fill"
         clips.append(
             MaterialStretchClip(
                 index=index,
@@ -923,9 +985,13 @@ def plan_material_stretch_clips(
                 stretch_naturalness_score=_stretch_naturalness_score_with_fill_mode(
                     requested_tempo,
                     text_hint,
-                    loop_fill=strategy == "syllable_formant_expand_with_loop_fill",
+                    loop_fill=strategy in {
+                        "syllable_formant_expand_with_loop_fill",
+                        "syllable_vowel_core_stretch",
+                    },
                 ),
                 continuity_warning=_stretch_continuity_warning(requested_tempo, text_hint),
+                phoneme_regions=phoneme_regions,
             )
         )
     return clips
@@ -942,18 +1008,26 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "requested_rubberband_tempo": clip.requested_tempo if clip.requested_tempo is not None else clip.tempo,
             "stretch_strategy": clip.stretch_strategy,
             "text_hint": clip.text_hint,
+            "phoneme_regions": [
+                {
+                    "kind": region.kind,
+                    "source_start_seconds": region.source_start_seconds,
+                    "source_end_seconds": region.source_end_seconds,
+                    "source_duration_seconds": region.source_duration_seconds,
+                    "target_duration_seconds": region.target_duration_seconds,
+                    "rubberband_tempo": region.tempo,
+                    "loop_fill": region.loop_fill,
+                }
+                for region in clip.phoneme_regions
+            ],
             "quality_warning": clip.quality_warning,
             "fade_seconds": clip.fade_seconds,
-            "boundary_conditioning": (
-                "loop_fill+fade_in_out"
-                if clip.stretch_strategy == "syllable_formant_expand_with_loop_fill" and clip.fade_seconds > 0
-                else "loop_fill"
-                if clip.stretch_strategy == "syllable_formant_expand_with_loop_fill"
-                else "fade_in_out" if clip.fade_seconds > 0 else ""
-            ),
+            "boundary_conditioning": _stretch_boundary_conditioning(clip),
             "formant_preservation": (
                 "direct_trim_no_pitch_shift"
                 if clip.stretch_strategy == "tiny_target_direct_trim"
+                else "vowel_core_rubberband_formant_preserved"
+                if clip.stretch_strategy == "syllable_vowel_core_stretch"
                 else "rubberband_formant_preserved"
             ),
             "stretch_naturalness_score": clip.stretch_naturalness_score,
@@ -961,6 +1035,14 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
         }
         for clip in clips
     ]
+
+
+def _stretch_boundary_conditioning(clip: MaterialStretchClip) -> str:
+    if clip.stretch_strategy == "syllable_vowel_core_stretch":
+        return "vowel_core_stretch+fade_in_out" if clip.fade_seconds > 0 else "vowel_core_stretch"
+    if clip.stretch_strategy == "syllable_formant_expand_with_loop_fill":
+        return "loop_fill+fade_in_out" if clip.fade_seconds > 0 else "loop_fill"
+    return "fade_in_out" if clip.fade_seconds > 0 else ""
 
 
 def get_audio_duration_seconds(data: dict[str, Any]) -> float:
@@ -1057,13 +1139,25 @@ def _build_material_plan_filter_graph(
     labels: list[str] = []
     for index, clip in enumerate(clips):
         output_label = "outa" if len(clips) == 1 else f"clip{index}"
-        post_filters = _material_post_filters(
-            clip.tempo,
-            options,
-            target_duration=clip.target_duration_seconds,
-            text_hint=clip.text_hint,
-        )
-        filters.append(f"[{index}:a]{','.join(post_filters)}[{output_label}]")
+        if clip.stretch_strategy == "syllable_vowel_core_stretch" and clip.phoneme_regions:
+            filters.extend(
+                _build_vowel_core_filter_graph_parts(
+                    f"[{index}:a]",
+                    output_label,
+                    clip.phoneme_regions,
+                    target_duration=clip.target_duration_seconds,
+                    options=options,
+                    label_prefix=f"vc{index}",
+                )
+            )
+        else:
+            post_filters = _material_post_filters(
+                clip.tempo,
+                options,
+                target_duration=clip.target_duration_seconds,
+                text_hint=clip.text_hint,
+            )
+            filters.append(f"[{index}:a]{','.join(post_filters)}[{output_label}]")
         if len(clips) > 1:
             labels.append(f"[{output_label}]")
 
@@ -1121,6 +1215,261 @@ def _material_post_filters(
     if not filters:
         filters.append("anull")
     return filters
+
+
+def _build_vowel_core_filter_graph(
+    source_label: str,
+    output_label: str,
+    *,
+    source_duration: float,
+    target_duration: float,
+    text_hint: str,
+    options: ProcessOptions,
+    label_prefix: str,
+    source_path: Path | None = None,
+) -> str:
+    regions = _vowel_core_stretch_regions(
+        source_duration,
+        target_duration,
+        text_hint,
+        source_path=source_path,
+    )
+    if not regions:
+        post_filters = _material_post_filters(
+            max(source_duration / target_duration, RUBBERBAND_MIN_TEMPO),
+            options,
+            target_duration=target_duration,
+            text_hint=text_hint,
+        )
+        return f"{source_label}{','.join(post_filters)}[{output_label}]"
+    return ";".join(
+        _build_vowel_core_filter_graph_parts(
+            source_label,
+            output_label,
+            regions,
+            target_duration=target_duration,
+            options=options,
+            label_prefix=label_prefix,
+        )
+    )
+
+
+def _build_vowel_core_filter_graph_parts(
+    source_label: str,
+    output_label: str,
+    regions: Sequence[MaterialPhonemeRegion],
+    *,
+    target_duration: float,
+    options: ProcessOptions,
+    label_prefix: str,
+) -> list[str]:
+    filters: list[str] = []
+    region_labels: list[str] = []
+    input_labels = [f"{label_prefix}in{index}" for index in range(len(regions))]
+    filters.append(
+        f"{source_label}asplit={len(input_labels)}"
+        f"{''.join(f'[{label}]' for label in input_labels)}"
+    )
+    for index, region in enumerate(regions):
+        region_label = f"{label_prefix}r{index}"
+        region_labels.append(region_label)
+        filters.append(
+            f"[{input_labels[index]}]{','.join(_vowel_region_filter_chain(region))}[{region_label}]"
+        )
+
+    concat_label = f"{label_prefix}cat"
+    filters.append(
+        f"{''.join(f'[{label}]' for label in region_labels)}"
+        f"concat=n={len(region_labels)}:v=0:a=1[{concat_label}]"
+    )
+    final_filters = _build_audio_filters(options)
+    final_chain = [final_filters] if final_filters else []
+    final_chain.extend(_exact_duration_filters(target_duration, fade=True, loop_fill=False))
+    filters.append(f"[{concat_label}]{','.join(final_chain)}[{output_label}]")
+    return filters
+
+
+def _vowel_region_filter_chain(region: MaterialPhonemeRegion) -> list[str]:
+    filters = [
+        (
+            f"atrim=start={region.source_start_seconds:.6f}:"
+            f"end={region.source_end_seconds:.6f}"
+        ),
+        "asetpts=N/SR/TB",
+    ]
+    source_duration = region.source_duration_seconds
+    target_duration = region.target_duration_seconds
+    if source_duration <= 0 or target_duration <= 0:
+        return filters
+
+    if (
+        not _should_direct_trim_tiny_target(target_duration)
+        and abs(target_duration - source_duration) > 0.002
+    ):
+        requested_tempo = source_duration / target_duration
+        minimum_tempo = (
+            RUBBERBAND_SHORT_TEXT_MIN_TEMPO
+            if region.kind == "vowel_core"
+            else RUBBERBAND_VOWEL_CORE_STRETCH_TEMPO
+        )
+        tempo = max(min(requested_tempo, RUBBERBAND_MAX_TEMPO), minimum_tempo)
+        filters.append(_rubberband_filter(tempo))
+
+    filters.extend(
+        _exact_duration_filters(
+            target_duration,
+            fade=False,
+            loop_fill=region.loop_fill,
+        )
+    )
+    return filters
+
+
+def _should_use_vowel_core_stretch(
+    tempo: float,
+    text_hint: str,
+    target_duration: float | None,
+    source_duration: float | None,
+) -> bool:
+    if target_duration is None or source_duration is None:
+        return False
+    if target_duration <= source_duration or source_duration <= 0:
+        return False
+    if not _is_short_material_text(text_hint):
+        return False
+    if not _has_vowel_core_hint(text_hint):
+        return False
+    requested_tempo = source_duration / target_duration
+    return requested_tempo < RUBBERBAND_VOWEL_CORE_STRETCH_TEMPO
+
+
+def _vowel_core_stretch_regions(
+    source_duration: float,
+    target_duration: float,
+    text_hint: str,
+    *,
+    source_path: Path | None = None,
+) -> tuple[MaterialPhonemeRegion, ...]:
+    if source_duration <= 0 or target_duration <= source_duration:
+        return ()
+
+    token = _phonetic_label_token(text_hint)
+    boundaries = _vowel_boundaries(token)
+    if boundaries is None:
+        return ()
+    vowel_start, vowel_end = boundaries
+    token_length = max(len(token), 1)
+
+    attack_duration = 0.0
+    if vowel_start > 0:
+        attack_fraction = min(0.42, max(vowel_start / token_length * 0.65, 0.12))
+        attack_duration = min(
+            source_duration * attack_fraction,
+            MATERIAL_CONSONANT_MAX_SECONDS,
+        )
+
+    coda_duration = 0.0
+    if vowel_end < token_length:
+        coda_fraction = min(0.30, max((token_length - vowel_end) / token_length * 0.60, 0.10))
+        coda_duration = min(
+            source_duration * coda_fraction,
+            MATERIAL_CODA_MAX_SECONDS,
+        )
+
+    if source_path is not None:
+        acoustic_profile = analyze_vowel_consonant_profile(
+            source_path,
+            duration_seconds=source_duration,
+            text_hint=text_hint,
+        )
+        if acoustic_profile.confidence >= 0.35:
+            attack_duration = max(attack_duration, acoustic_profile.vowel_start_seconds)
+            coda_duration = max(
+                coda_duration,
+                source_duration - acoustic_profile.vowel_end_seconds,
+            )
+            attack_duration = min(attack_duration, MATERIAL_CONSONANT_MAX_SECONDS)
+            coda_duration = min(coda_duration, MATERIAL_CODA_MAX_SECONDS)
+
+    minimum_core = min(MATERIAL_VOWEL_CORE_MIN_SECONDS, source_duration * 0.5)
+    fixed_duration = attack_duration + coda_duration
+    if fixed_duration > source_duration - minimum_core:
+        scale = max((source_duration - minimum_core) / max(fixed_duration, 1e-9), 0.0)
+        attack_duration *= scale
+        coda_duration *= scale
+
+    core_start = attack_duration
+    core_end = max(core_start, source_duration - coda_duration)
+    core_source_duration = max(core_end - core_start, 0.0)
+    if core_source_duration < minimum_core:
+        return ()
+
+    expansion_ratio = target_duration / source_duration
+    attack_target = attack_duration * min(expansion_ratio, MATERIAL_CONSONANT_MAX_STRETCH_RATIO)
+    coda_target = coda_duration * min(expansion_ratio, MATERIAL_CODA_MAX_STRETCH_RATIO)
+    core_target = target_duration - attack_target - coda_target
+    if core_target <= 0:
+        return ()
+
+    regions: list[MaterialPhonemeRegion] = []
+    if attack_duration > 0.002:
+        regions.append(
+            MaterialPhonemeRegion(
+                kind="consonant_attack",
+                source_start_seconds=0.0,
+                source_end_seconds=attack_duration,
+                target_duration_seconds=attack_target,
+                tempo=attack_duration / attack_target if attack_target > 0 else 1.0,
+            )
+        )
+
+    regions.append(
+        MaterialPhonemeRegion(
+            kind="vowel_core",
+            source_start_seconds=core_start,
+            source_end_seconds=core_end,
+            target_duration_seconds=core_target,
+            tempo=max(
+                core_source_duration / core_target if core_target > 0 else 1.0,
+                RUBBERBAND_SHORT_TEXT_MIN_TEMPO,
+            ),
+            loop_fill=core_source_duration / core_target < RUBBERBAND_SHORT_TEXT_MIN_TEMPO,
+        )
+    )
+
+    if coda_duration > 0.002:
+        regions.append(
+            MaterialPhonemeRegion(
+                kind="consonant_coda",
+                source_start_seconds=core_end,
+                source_end_seconds=source_duration,
+                target_duration_seconds=coda_target,
+                tempo=coda_duration / coda_target if coda_target > 0 else 1.0,
+            )
+        )
+    return tuple(regions)
+
+
+def _phonetic_label_token(text: str) -> str:
+    tokens = re.findall(r"[a-zA-Z\u00dc\u00fc]+", str(text or "").lower())
+    return tokens[0] if tokens else ""
+
+
+def _vowel_boundaries(token: str) -> tuple[int, int] | None:
+    if not token:
+        return None
+    vowels = set("aeiou\u00fc")
+    start = next((index for index, character in enumerate(token) if character in vowels), None)
+    if start is None:
+        return None
+    end = start
+    while end < len(token) and token[end] in vowels:
+        end += 1
+    return start, end
+
+
+def _has_vowel_core_hint(text: str) -> bool:
+    return _vowel_boundaries(_phonetic_label_token(text)) is not None
 
 
 def _should_direct_trim_tiny_target(target_duration: float | None) -> bool:
@@ -1358,6 +1707,12 @@ def _resolve_stretch_strategy(
         return RUBBERBAND_MAX_TEMPO, "rubberband_max_compression_floor"
     if _should_direct_trim_tiny_target(target_duration):
         return max(min(requested_tempo, RUBBERBAND_MAX_TEMPO), RUBBERBAND_MIN_TEMPO), "tiny_target_direct_trim"
+    if (
+        _is_short_material_text(text_hint)
+        and requested_tempo < RUBBERBAND_VOWEL_CORE_STRETCH_TEMPO
+        and _has_vowel_core_hint(text_hint)
+    ):
+        return max(requested_tempo, RUBBERBAND_SHORT_TEXT_MIN_TEMPO), "syllable_vowel_core_stretch"
     if _is_short_material_text(text_hint) and requested_tempo < RUBBERBAND_SHORT_TEXT_MIN_TEMPO:
         return RUBBERBAND_SHORT_TEXT_MIN_TEMPO, "syllable_formant_expand_with_loop_fill"
     if requested_tempo < RUBBERBAND_MIN_TEMPO:

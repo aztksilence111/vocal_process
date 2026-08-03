@@ -379,6 +379,14 @@ def _render_boundary_conditioning(stretch_plan: Sequence[MaterialStretchClip]) -
         clip.stretch_strategy == "syllable_formant_expand_with_loop_fill"
         for clip in stretch_plan
     )
+    has_vowel_core_stretch = any(
+        clip.stretch_strategy == "syllable_vowel_core_stretch"
+        for clip in stretch_plan
+    )
+    if has_vowel_core_stretch and has_fades:
+        return "vowel_core_stretch+per_clip_fade_in_out"
+    if has_vowel_core_stretch:
+        return "vowel_core_stretch"
     if has_loop_fill and has_fades:
         return "short_text_loop_fill+per_clip_fade_in_out"
     if has_loop_fill:

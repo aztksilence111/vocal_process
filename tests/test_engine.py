@@ -240,7 +240,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("afade=t=out:st=1.990000:d=0.010000", filters)
         self.assertNotIn("stream_loop", args)
 
-    def test_material_clip_command_uses_loop_fill_for_short_text_expansion(self) -> None:
+    def test_material_clip_command_stretches_vowel_core_for_short_text_expansion(self) -> None:
         args = build_material_clip_args(
             Path("clip.wav"),
             Path("clip_loop.wav"),
@@ -248,16 +248,21 @@ class MaterialAssemblyTests(unittest.TestCase):
             ProcessOptions(input_path=Path("clip.wav"), output_path=Path("clip_loop.wav")),
             target_duration=2.0,
             text_hint="shi",
+            source_duration=0.5,
             progress=True,
         )
 
-        filters = args[args.index("-af") + 1]
+        filters = args[args.index("-filter_complex") + 1]
+        self.assertIn("asplit=2", filters)
+        self.assertIn("atrim=start=0.000000:end=0.075000", filters)
+        self.assertIn("atrim=start=0.075000:end=0.500000", filters)
         self.assertIn("rubberband=tempo=0.35000000:pitch=1:formant=preserved", filters)
         self.assertIn("aloop=loop=-1:size=2147483647:start=0", filters)
         self.assertIn("atrim=duration=2.000000", filters)
         self.assertIn("afade=t=in:st=0:d=0.010000", filters)
         self.assertIn("afade=t=out:st=1.990000:d=0.010000", filters)
-        self.assertNotIn("apad=whole_dur=2.000000", filters)
+        self.assertIn("-map", args)
+        self.assertIn("[outa]", args)
 
     def test_tiny_target_material_clip_skips_rubberband_failure_path(self) -> None:
         args = build_material_clip_args(
@@ -399,7 +404,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertAlmostEqual(clips[0].tempo, 100.0)
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
 
-    def test_short_material_expansion_uses_syllable_safe_loop_fill(self) -> None:
+    def test_short_material_expansion_uses_vowel_core_stretch(self) -> None:
         with patch(
             "audio_processor.engine.probe_audio",
             side_effect=[
@@ -410,18 +415,22 @@ class MaterialAssemblyTests(unittest.TestCase):
             clips = plan_material_stretch_clips(
                 Path("reference.wav"),
                 [Path("shi.wav")],
-                material_text_hints=["是"],
+                material_text_hints=["shi"],
             )
 
         self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 0.25)
         self.assertAlmostEqual(clips[0].tempo, 0.35)
-        self.assertEqual(clips[0].stretch_strategy, "syllable_formant_expand_with_loop_fill")
+        self.assertEqual(clips[0].stretch_strategy, "syllable_vowel_core_stretch")
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
         self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
         self.assertLess(clips[0].stretch_naturalness_score, 0.2)
         rendered = render_material_stretch_plan(clips)
-        self.assertEqual(rendered[0]["boundary_conditioning"], "loop_fill+fade_in_out")
-        self.assertEqual(rendered[0]["formant_preservation"], "rubberband_formant_preserved")
+        self.assertEqual(rendered[0]["boundary_conditioning"], "vowel_core_stretch+fade_in_out")
+        self.assertEqual(rendered[0]["formant_preservation"], "vowel_core_rubberband_formant_preserved")
+        self.assertEqual(
+            [region["kind"] for region in rendered[0]["phoneme_regions"]],
+            ["consonant_attack", "vowel_core"],
+        )
 
     def test_duration_correction_command_preserves_exact_duration_without_extra_fades(self) -> None:
         args = _build_duration_correction_args(
@@ -3149,10 +3158,10 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(report["summary"]["fade_applied_clip_count"], 1)
         self.assertLess(report["summary"]["stretch_naturalness_score_mean"] or 1.0, 0.2)
         self.assertEqual(report["stretch_plan"][0]["continuity_warning"], "single_syllable_boundary_risk")
-        self.assertEqual(report["stretch_plan"][0]["boundary_conditioning"], "loop_fill+fade_in_out")
+        self.assertEqual(report["stretch_plan"][0]["boundary_conditioning"], "vowel_core_stretch+fade_in_out")
         self.assertEqual(
             report["optimization"]["render_continuity"]["boundary_conditioning"],
-            "short_text_loop_fill+per_clip_fade_in_out",
+            "vowel_core_stretch+per_clip_fade_in_out",
         )
         self.assertTrue(any(warning["kind"] == "single_syllable_boundary_risk" for warning in report["warnings"]))
 
