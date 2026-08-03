@@ -1,5 +1,11 @@
 # Project Analysis
 
+## Latest Closeout - 2026-08-03
+
+The branch now has a stable separation of responsibilities: filename labels define trusted short-material pronunciation before ASR, while the reference side retains lyrics/original-vocal timing authority. Rendering preserves exact target duration and has a vowel-core-aware expansion path instead of treating every short clip as uniformly stretchable.
+
+The remaining risk is not an unbounded stretch limit. Sparse or weakly matched material cannot be made natural merely by extending the vowel core. The next engineering work should use generic near-phonetic substitutes and adaptive attack/core/coda allocation, measured first against the focused PlasticLove vmzJP smoke and then against broader rendered evaluation. Do not relax strict gates, hard-code material names, or reverse engineer proprietary Vegas/Melodyne implementations.
+
 ## Latest Update - 2026-08-03 Vowel-Core Stretch Strategy
 
 This round moved the stretch pipeline one level closer to the behavior the user asked for. Instead of treating a short clip as one block and stretching or looping the whole file, the renderer now attempts to identify a vowel core and split the clip into consonant attack, vowel core, and optional coda regions. The new `audio_processor.phoneme` module uses local `librosa.pyin` voiced/F0 analysis when available, but it always has a filename-label fallback so the pipeline does not depend on perfect acoustic segmentation.

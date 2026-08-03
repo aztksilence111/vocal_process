@@ -1,5 +1,11 @@
 # Conversation Log
 
+## Latest Closeout - 2026-08-03
+
+1. The filename-label-first and vowel-core stretch work is complete on `codex/cancel-phonetic-accuracy` and pushed as `5230f9c` and `6914f72`.
+2. This closeout refreshed `.tmp\codex-admin-resume.md` with the current architecture, verification evidence, and next-resume constraints. It also recorded the durable project constraints in the global project memory.
+3. No new feature work was added during closeout. The next implementation target remains generic phonetic candidate selection and adaptive region allocation for sparse material, while preserving strict evaluation thresholds and exact-duration validation.
+
 ## Latest Update - 2026-08-03 Vowel-Core Stretching for Short Material
 
 1. This continuation kept the branch `codex/cancel-phonetic-accuracy` and ran the required preflight. The workspace remained clean before edits.
