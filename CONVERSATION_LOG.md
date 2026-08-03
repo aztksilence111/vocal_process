@@ -2,6 +2,8 @@
 
 ## Latest Update - 2026-08-03 Signalsmith Vowel-Core Stretch Backend
 
+Closeout note: the implementation was committed locally as `02c4bf3 Use Signalsmith for vowel core stretching`. Two push attempts failed because GitHub HTTPS was unreachable/reset; `git_workspace_doctor.ps1` passed, and the branch remains ahead of origin pending network recovery.
+
 1. The user narrowed the request to borrowing HiFiShifter's stretch backend rather than implementing its complete vocal-tuning feature set. The source review identified HiFiShifter's public Signalsmith Stretch path and its exact output-frame scheduling.
 2. Added `audio_processor.signalsmith_stretch`, a small optional PCM renderer using the MIT `python-stretch` binding. It accepts channel-first NumPy audio, processes each requested material region independently, and fits the result to exact output frames.
 3. Short material with a usable vowel core now prefers Signalsmith for consonant attack/core/coda regions. The core no longer depends on Rubber Band's `0.35` tempo floor plus loop fill when Signalsmith is available. FFmpeg remains responsible for effects, fades, encoding, and final duration correction; Rubber Band remains the runtime fallback.

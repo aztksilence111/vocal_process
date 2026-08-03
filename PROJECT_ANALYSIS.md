@@ -2,6 +2,8 @@
 
 ## Latest Update - 2026-08-03 Signalsmith Backend Integration
 
+Closeout status: the Signalsmith implementation is committed locally as `02c4bf3`, but remote push is pending because GitHub HTTPS failed twice. Local Git health checks passed, so this is a network/remoting blocker rather than a repository-state blocker.
+
 The stretch implementation now borrows the part of HiFiShifter that is relevant to this project: Signalsmith Stretch as a public, pitch-preserving PCM time-stretch backend with output length driven by the requested frame count. The complete HiFiShifter editor, pitch curves, formant controls, and processor chain remain out of scope.
 
 The runtime boundary is now explicit. For short filename-labeled material with a detected or label-derived vowel core, `plan_material_stretch_clips()` reports `stretch_backend=signalsmith`. `process_material_clip_with_progress()` decodes the source through `soundfile`, sends consonant attack, vowel core, and coda regions to Signalsmith separately, concatenates their exact target frame counts, and then uses FFmpeg only for effects, fades, encoding, and final duration correction. If `python-stretch` is unavailable or the source cannot be decoded by `soundfile`, the prior Rubber Band filter graph is used and the failure is surfaced through progress diagnostics.
