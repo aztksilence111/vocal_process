@@ -1,8 +1,12 @@
 # Project Analysis
 
+## Latest Update - 2026-08-04 Main Promotion Completed
+
+The Signalsmith branch promotion was completed without force-push. `origin/main` was an ancestor of the completed branch, so `main` was fast-forwarded to the Signalsmith work after backing up the old main state as `archive/main-before-signalsmith-vowel-core`.
+
 ## Latest Update - 2026-08-04 Branch Promotion Closeout Gate
 
-The project rule for completed branches has been strengthened: uploaded feature branches are not the final delivery state. The closeout must back up the old `main`, promote the completed branch to `main`, push both refs, and report the final branch state; otherwise the task remains explicitly blocked. For the Signalsmith work, `origin/main` is an ancestor of the completed branch, so the promotion can be done as a fast-forward after backing up `main`.
+The project rule for completed branches has been strengthened: uploaded feature branches are not the final delivery state. The closeout must back up the old `main`, promote the completed branch to `main`, push both refs, and report the final branch state; otherwise the task remains explicitly blocked. For the Signalsmith work, `origin/main` was an ancestor of the completed branch, so the promotion was completed as a fast-forward after backing up `main`.
 
 ## Latest Update - 2026-08-04 Remote Push Completed
 
