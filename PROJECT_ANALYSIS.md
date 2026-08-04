@@ -2,7 +2,7 @@
 
 ## Latest Update - 2026-08-04 Branch Promotion Closeout Gate
 
-The project rule for completed branches has been strengthened: uploaded feature branches are not the final delivery state. The closeout must back up the old `main`, promote the completed branch to `main`, push both refs, and report the final branch state; otherwise the task remains explicitly blocked.
+The project rule for completed branches has been strengthened: uploaded feature branches are not the final delivery state. The closeout must back up the old `main`, promote the completed branch to `main`, push both refs, and report the final branch state; otherwise the task remains explicitly blocked. For the Signalsmith work, `origin/main` is an ancestor of the completed branch, so the promotion can be done as a fast-forward after backing up `main`.
 
 ## Latest Update - 2026-08-04 Remote Push Completed
 

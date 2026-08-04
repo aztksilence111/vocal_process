@@ -2,7 +2,7 @@
 
 ## Latest Update - 2026-08-04 Branch Promotion Rule Reinforced
 
-The user corrected the closeout process: after a verified feature branch is uploaded, the project must back up the previous `main`, promote the completed branch to `main`, and push both. `PROJECT_RULES.md` now marks this as a mandatory closeout gate rather than an optional follow-up.
+The user corrected the closeout process: after a verified feature branch is uploaded, the project must back up the previous `main`, promote the completed branch to `main`, and push both. `PROJECT_RULES.md` now marks this as a mandatory closeout gate rather than an optional follow-up. The planned backup branch for this promotion is `archive/main-before-signalsmith-vowel-core`.
 
 ## Latest Update - 2026-08-04 Remote Push Completed
 

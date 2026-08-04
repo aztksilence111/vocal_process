@@ -13,6 +13,13 @@
 
 ## 更新日志
 
+### 2026-08-04: Signalsmith vowel-core stretch and main promotion
+
+1. Short filename-labeled material with a detected vowel core now uses a Signalsmith Stretch backend through `python-stretch`, while Rubber Band remains the fallback for unsupported or failed renders.
+2. Material render plans, DAW exports, preflight reports, cache keys, portable packaging, and third-party notices now record the selected `stretch_backend`.
+3. `codex/cancel-phonetic-accuracy` is promoted as the completed work branch for this main update; the previous `main` is backed up under `archive/main-before-signalsmith-vowel-core`.
+4. Verification before promotion: 166 unit tests passed, `audio_processor check` passed, and a 0.5s-to-2.0s Signalsmith render smoke produced exact duration.
+
 ### 2026-07-31: 歌词优先与日文注音处理
 
 1. 有歌词文件时，歌词文本作为目标字音最高优先项，原人声 ASR/对齐时间轴继续负责每个字音的起点、终点和持续时长；无歌词时继续按原人声识别字音拼接。
