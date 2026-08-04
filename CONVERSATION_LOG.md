@@ -1,8 +1,12 @@
 # Conversation Log
 
+## Latest Update - 2026-08-04 Remote Push Completed
+
+The GitHub upload requested by the user completed successfully. Branch `codex/cancel-phonetic-accuracy` is synchronized with `origin/codex/cancel-phonetic-accuracy` through `cf0930a Record Signalsmith push blocker`, including `02c4bf3 Use Signalsmith for vowel core stretching`.
+
 ## Latest Update - 2026-08-03 Signalsmith Vowel-Core Stretch Backend
 
-Closeout note: the implementation was committed locally as `02c4bf3 Use Signalsmith for vowel core stretching`. Two push attempts failed because GitHub HTTPS was unreachable/reset; `git_workspace_doctor.ps1` passed, and the branch remains ahead of origin pending network recovery.
+Closeout note: the implementation was committed locally as `02c4bf3 Use Signalsmith for vowel core stretching`. Two push attempts initially failed because GitHub HTTPS was unreachable/reset; the later 2026-08-04 retry succeeded.
 
 1. The user narrowed the request to borrowing HiFiShifter's stretch backend rather than implementing its complete vocal-tuning feature set. The source review identified HiFiShifter's public Signalsmith Stretch path and its exact output-frame scheduling.
 2. Added `audio_processor.signalsmith_stretch`, a small optional PCM renderer using the MIT `python-stretch` binding. It accepts channel-first NumPy audio, processes each requested material region independently, and fits the result to exact output frames.

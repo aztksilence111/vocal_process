@@ -1,8 +1,12 @@
 # Project Analysis
 
+## Latest Update - 2026-08-04 Remote Push Completed
+
+The Signalsmith backend work has been uploaded to GitHub. Branch `codex/cancel-phonetic-accuracy` is synchronized with origin through `cf0930a`, which includes the implementation commit `02c4bf3`.
+
 ## Latest Update - 2026-08-03 Signalsmith Backend Integration
 
-Closeout status: the Signalsmith implementation is committed locally as `02c4bf3`, but remote push is pending because GitHub HTTPS failed twice. Local Git health checks passed, so this is a network/remoting blocker rather than a repository-state blocker.
+Closeout status: the Signalsmith implementation was committed locally as `02c4bf3`; the initial remote push failed because GitHub HTTPS failed twice, but the 2026-08-04 retry succeeded.
 
 The stretch implementation now borrows the part of HiFiShifter that is relevant to this project: Signalsmith Stretch as a public, pitch-preserving PCM time-stretch backend with output length driven by the requested frame count. The complete HiFiShifter editor, pitch curves, formant controls, and processor chain remain out of scope.
 
