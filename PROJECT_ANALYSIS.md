@@ -1,5 +1,9 @@
 # Project Analysis
 
+## Latest Update - 2026-08-04 Branch Promotion Closeout Gate
+
+The project rule for completed branches has been strengthened: uploaded feature branches are not the final delivery state. The closeout must back up the old `main`, promote the completed branch to `main`, push both refs, and report the final branch state; otherwise the task remains explicitly blocked.
+
 ## Latest Update - 2026-08-04 Remote Push Completed
 
 The Signalsmith backend work has been uploaded to GitHub. Branch `codex/cancel-phonetic-accuracy` is synchronized with origin through `cf0930a`, which includes the implementation commit `02c4bf3`.

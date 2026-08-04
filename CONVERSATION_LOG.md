@@ -1,5 +1,9 @@
 # Conversation Log
 
+## Latest Update - 2026-08-04 Branch Promotion Rule Reinforced
+
+The user corrected the closeout process: after a verified feature branch is uploaded, the project must back up the previous `main`, promote the completed branch to `main`, and push both. `PROJECT_RULES.md` now marks this as a mandatory closeout gate rather than an optional follow-up.
+
 ## Latest Update - 2026-08-04 Remote Push Completed
 
 The GitHub upload requested by the user completed successfully. Branch `codex/cancel-phonetic-accuracy` is synchronized with `origin/codex/cancel-phonetic-accuracy` through `cf0930a Record Signalsmith push blocker`, including `02c4bf3 Use Signalsmith for vowel core stretching`.

@@ -12,13 +12,14 @@
 
 ## Branch Promotion Rule
 
-This project does not use long-lived feature branches as the final delivery state. When a new work branch is completed and verified:
+This project does not use long-lived feature branches as the final delivery state. When a new work branch is completed, verified, and uploaded, promotion to `main` is a mandatory closeout step, not an optional follow-up. A task is not fully finished until this rule has either been completed or explicitly blocked in the final report.
 
 1. Back up the current `main` branch to a separate archive/backup branch before promotion.
 2. Promote the completed work branch to replace `main`.
 3. Keep the completed work branch name available as the backup label for that main state when the next main replacement happens.
 4. Push the backup branch, the promoted `main`, and the work branch to the remote repository.
 5. If replacing `main` cannot be done as a fast-forward, stop and make the required force-push risk explicit before changing the remote.
+6. Before any final response after a completed feature branch, run or report the equivalent of `git status --short --branch`, confirm the backup branch name, and confirm whether `origin/main` now points at the completed work.
 
 Recommended backup branch name:
 
