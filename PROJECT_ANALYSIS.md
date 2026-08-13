@@ -1,5 +1,27 @@
 # Project Analysis
 
+## Latest Update - 2026-08-13 Adaptive Acoustic Boundaries for Signalsmith Stretch
+
+The next Signalsmith quality pass targeted a concrete boundary-allocation defect rather than changing strict acceptance thresholds. The previous implementation used the filename-derived first-vowel span as a hard intersection with the acoustic voiced/F0 span. This made long material clips such as `chi.wav` and `bo.wav` use a fixed short attack and a large core that could include unvoiced or consonant content, increasing the load on extreme core stretching.
+
+The new boundary policy is:
+
+1. If `librosa.pyin` produces a high-confidence voiced span, that acoustic span directly defines the vowel core.
+2. Filename phonetic boundaries remain the fallback for clips without reliable acoustic evidence.
+3. The attack region is limited by both `180ms` and `28%` of the source duration.
+4. The coda region is limited by both `140ms` and `22%` of the source duration.
+5. Signalsmith still receives exact per-region target frame counts, while Rubber Band remains the fallback backend.
+
+This is a public-DSP improvement inspired by the HiFiShifter/Signalsmith architecture. It does not copy proprietary tuning behavior or claim to reproduce Vegas/Melodyne. The purpose is to keep consonant and tail material out of the high-expansion vowel core while preserving exact output timing.
+
+Evidence from the local `vmzJP` material set:
+
+1. `chi.wav` now uses an acoustic core of approximately `0.136s..0.928s`, with `0.136s` attack and `0.109s` coda.
+2. `bo.wav` now uses an acoustic core of approximately `0.008s..0.860s`, with `0.008s` attack and `0.140s` coda.
+3. `chi.wav`, `bo.wav`, and `shi.wav` rendered through the Signalsmith path to their requested durations with deltas of `0`, `0`, and approximately `-0.000001s`.
+
+Verification passed with 167 unit tests, compileall, `audio_processor check`, and diff check. The next required measurement is a bounded Signalsmith/Rubber Band A/B comparison on the same real clips, followed by the focused PlasticLove/vmzJP rendered smoke. Full rendered real-eval should only be resumed after those measurements identify a general quality improvement.
+
 ## Latest Update - 2026-08-04 Main Promotion Completed
 
 The Signalsmith branch promotion was completed without force-push. `origin/main` was an ancestor of the completed branch, so `main` was fast-forwarded to the Signalsmith work after backing up the old main state as `archive/main-before-signalsmith-vowel-core`.

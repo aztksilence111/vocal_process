@@ -112,8 +112,10 @@ MATERIAL_RENDER_DURATION_TOLERANCE_RATIO = 0.001
 MATERIAL_RENDER_LOOP_FILL_SIZE_SAMPLES = 2_147_483_647
 MATERIAL_CONSONANT_MAX_STRETCH_RATIO = 1.20
 MATERIAL_CODA_MAX_STRETCH_RATIO = 1.12
-MATERIAL_CONSONANT_MAX_SECONDS = 0.075
-MATERIAL_CODA_MAX_SECONDS = 0.060
+MATERIAL_CONSONANT_MAX_SECONDS = 0.180
+MATERIAL_CODA_MAX_SECONDS = 0.140
+MATERIAL_CONSONANT_MAX_FRACTION = 0.28
+MATERIAL_CODA_MAX_FRACTION = 0.22
 MATERIAL_VOWEL_CORE_MIN_SECONDS = 0.030
 MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v8_signalsmith_vowel_core"
 
@@ -1525,6 +1527,7 @@ def _vowel_core_stretch_regions(
             MATERIAL_CODA_MAX_SECONDS,
         )
 
+    acoustic_profile = None
     if source_path is not None:
         acoustic_profile = analyze_vowel_consonant_profile(
             source_path,
@@ -1532,13 +1535,25 @@ def _vowel_core_stretch_regions(
             text_hint=text_hint,
         )
         if acoustic_profile.confidence >= 0.35:
-            attack_duration = max(attack_duration, acoustic_profile.vowel_start_seconds)
+            # A reliable voiced span is a better boundary estimate than
+            # proportional spelling heuristics. Keep the consonant regions
+            # bounded so long tails cannot dominate the render.
+            attack_duration = max(float(acoustic_profile.vowel_start_seconds), 0.0)
             coda_duration = max(
-                coda_duration,
-                source_duration - acoustic_profile.vowel_end_seconds,
+                source_duration - float(acoustic_profile.vowel_end_seconds),
+                0.0,
             )
-            attack_duration = min(attack_duration, MATERIAL_CONSONANT_MAX_SECONDS)
-            coda_duration = min(coda_duration, MATERIAL_CODA_MAX_SECONDS)
+
+    attack_limit = min(
+        MATERIAL_CONSONANT_MAX_SECONDS,
+        source_duration * MATERIAL_CONSONANT_MAX_FRACTION,
+    )
+    coda_limit = min(
+        MATERIAL_CODA_MAX_SECONDS,
+        source_duration * MATERIAL_CODA_MAX_FRACTION,
+    )
+    attack_duration = min(max(attack_duration, 0.0), attack_limit)
+    coda_duration = min(max(coda_duration, 0.0), coda_limit)
 
     minimum_core = min(MATERIAL_VOWEL_CORE_MIN_SECONDS, source_duration * 0.5)
     fixed_duration = attack_duration + coda_duration

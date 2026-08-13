@@ -103,9 +103,11 @@ def _analyze_cached(
         acoustic_start = max(float(frame_times[run_start]) - half_frame, 0.0)
         acoustic_end = min(float(frame_times[min(run_end - 1, len(frame_times) - 1)]) + half_frame, duration_seconds)
 
-        text_profile = _text_fallback_profile(duration_seconds, text_hint)
-        vowel_start = max(acoustic_start, text_profile.vowel_start_seconds)
-        vowel_end = min(acoustic_end, text_profile.vowel_end_seconds)
+        # Filename text identifies the syllable, but it does not provide a
+        # reliable time alignment. Use the acoustic voiced span directly;
+        # the text-derived span remains the fallback when F0 evidence fails.
+        vowel_start = acoustic_start
+        vowel_end = acoustic_end
         minimum_vowel = min(0.030, duration_seconds * 0.5)
         if vowel_end - vowel_start < minimum_vowel:
             return fallback

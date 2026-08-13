@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from audio_processor import model_assist, model_runtime, preflight
+from audio_processor.phoneme import VowelConsonantProfile
 from audio_processor import maintenance
 from audio_processor import real_eval
 from audio_processor import tls
@@ -52,6 +53,7 @@ from audio_processor.engine import (
     resolve_tool,
     summarize_probe,
     _run_progress_process,
+    _vowel_core_stretch_regions,
 )
 from audio_processor.gui import LYRICS_EXTENSIONS
 from audio_processor.i18n import TRANSLATIONS, normalize_language, translate, translate_status
@@ -254,8 +256,8 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         filters = args[args.index("-filter_complex") + 1]
         self.assertIn("asplit=2", filters)
-        self.assertIn("atrim=start=0.000000:end=0.075000", filters)
-        self.assertIn("atrim=start=0.075000:end=0.500000", filters)
+        self.assertIn("atrim=start=0.000000:end=0.140000", filters)
+        self.assertIn("atrim=start=0.140000:end=0.500000", filters)
         self.assertIn("rubberband=tempo=0.35000000:pitch=1:formant=preserved", filters)
         self.assertIn("aloop=loop=-1:size=2147483647:start=0", filters)
         self.assertIn("atrim=duration=2.000000", filters)
@@ -433,6 +435,38 @@ class MaterialAssemblyTests(unittest.TestCase):
             [region["kind"] for region in rendered[0]["phoneme_regions"]],
             ["consonant_attack", "vowel_core"],
         )
+
+    def test_vowel_core_regions_prioritize_acoustic_voiced_span(self) -> None:
+        acoustic_profile = VowelConsonantProfile(
+            vowel_start_seconds=0.136,
+            vowel_end_seconds=0.928,
+            detection_source="librosa_voiced_f0",
+            confidence=0.95,
+            voiced_ratio=0.70,
+        )
+        with patch(
+            "audio_processor.engine.analyze_vowel_consonant_profile",
+            return_value=acoustic_profile,
+        ):
+            regions = _vowel_core_stretch_regions(
+                1.037,
+                4.148,
+                "chi",
+                source_path=Path("chi.wav"),
+            )
+
+        self.assertEqual(
+            [region.kind for region in regions],
+            ["consonant_attack", "vowel_core", "consonant_coda"],
+        )
+        self.assertAlmostEqual(regions[0].source_start_seconds, 0.0)
+        self.assertAlmostEqual(regions[0].source_end_seconds, 0.136)
+        self.assertAlmostEqual(regions[1].source_start_seconds, 0.136)
+        self.assertAlmostEqual(regions[1].source_end_seconds, 0.928)
+        self.assertAlmostEqual(regions[2].source_start_seconds, 0.928)
+        self.assertAlmostEqual(regions[2].source_end_seconds, 1.037)
+        self.assertLess(regions[0].target_duration_seconds / regions[0].source_duration_seconds, 1.21)
+        self.assertLess(regions[2].target_duration_seconds / regions[2].source_duration_seconds, 1.13)
 
     def test_duration_correction_command_preserves_exact_duration_without_extra_fades(self) -> None:
         args = _build_duration_correction_args(

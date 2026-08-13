@@ -1,5 +1,16 @@
 # Conversation Log
 
+## Latest Update - 2026-08-13 Adaptive Acoustic Boundaries for Signalsmith Stretch
+
+1. Continued the HiFiShifter-inspired Signalsmith stretch work on branch `codex/adaptive-signalsmith-stretch` after reading the project recovery context, relevant global memory, and passing `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe`.
+2. Found that `audio_processor.phoneme` intersected the acoustic voiced span with the filename-derived vowel span. For long or noisy filename-labeled clips such as `chi.wav` and `bo.wav`, this could shrink the useful voiced core and force Signalsmith to stretch unvoiced material.
+3. Changed high-confidence `librosa.pyin` voiced/F0 evidence to define the vowel-core boundaries directly. Filename phonetic structure remains the fallback when acoustic evidence is unavailable or inconclusive.
+4. Replaced fixed `75ms` attack / `60ms` coda limits with adaptive limits: attack is capped by `180ms` and `28%` of source duration; coda is capped by `140ms` and `22%` of source duration. This preserves real acoustic boundaries without allowing long consonant/tail regions to dominate the render.
+5. Added regression coverage for acoustic `chi`-style boundaries and updated the short-text filter assertion for the new adaptive fallback boundary.
+6. Verification passed: full `unittest discover` with 167 tests, `compileall -q audio_processor tests packaging`, `audio_processor check` with Signalsmith/Librosa/WhisperX/FunASR caches available, and `git diff --check` with only existing LF/CRLF conversion warnings.
+7. Real Signalsmith smoke passed for `vmzJP` materials `chi.wav`, `bo.wav`, and `shi.wav`; each output matched its requested target duration within one microsecond.
+8. Remaining work: compare Signalsmith and Rubber Band on bounded real clips, inspect continuity/naturalness metrics, then continue generic adaptive allocation and candidate-selection improvements before broad rendered real-eval.
+
 ## Latest Update - 2026-08-04 Main Promotion Completed
 
 The completed branch `codex/cancel-phonetic-accuracy` was promoted to `main` by fast-forward. The previous remote `main` was backed up as `archive/main-before-signalsmith-vowel-core`, and `origin/main`, local `main`, and the completed branch all point at the promoted Signalsmith work.
