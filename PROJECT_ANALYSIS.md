@@ -1624,3 +1624,14 @@ Next implementation requirements:
 3. Upgrade/invalidate material cache keys so old ASR-first caches do not re-enter ordering or JSONL diagnostics as trusted material text.
 4. Keep ASR transcript out of primary ordering when filename labels are trusted; ASR can be stored as optional verification evidence only if it was explicitly requested or needed as fallback.
 5. Re-run rendered real-eval after implementation and compare not only coverage, but also `low_match_score`, `weak_text_signal`, `single_syllable_extreme_stretch`, `continuity_warning_ratio`, and JP/vmzJP group scores.
+### 2026-08-13: Adaptive Signalsmith Session Closeout
+
+The current Signalsmith Stretch implementation now prefers reliable acoustic voiced boundaries for the vowel core and applies adaptive attack/coda limits based on both absolute duration and material length. This removes the previous dependence on narrow filename-derived vowel spans when the waveform provides a stronger boundary signal.
+
+Evidence:
+
+1. `167` unit tests passed.
+2. `compileall`, `audio_processor check`, and `git diff --check` passed.
+3. Rendered smoke output preserved requested durations for `chi.wav`, `bo.wav`, and `shi.wav`.
+4. The autonomous full rendered suite was stopped during SpeechBrain initialization before any compatible case completed. Its partial summary must not be used to claim an ordering or listening-quality improvement.
+5. The feature branch and commit are pushed as `codex/adaptive-signalsmith-stretch` / `b46f0ee`; promotion to `main` remains pending full rendered evaluation and human listening review.
