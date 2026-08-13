@@ -135,6 +135,8 @@ def run_batch_queue(
                     item.input_path,
                     ordered_material_paths,
                     target_durations=ordering.target_durations,
+                    audible_target_durations=ordering.target_audible_durations,
+                    pre_silence_seconds=ordering.target_pre_silences,
                     material_text_hints=ordered_material_texts,
                 )
                 diagnostics.event(
@@ -170,6 +172,8 @@ def run_batch_queue(
                         options,
                         material_paths=ordered_material_paths,
                         target_durations=ordering.target_durations,
+                        audible_target_durations=ordering.target_audible_durations,
+                        pre_silence_seconds=ordering.target_pre_silences,
                         material_text_hints=ordered_material_texts,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
@@ -182,6 +186,8 @@ def run_batch_queue(
                         options,
                         material_paths=ordered_material_paths,
                         material_target_durations=ordering.target_durations,
+                        material_audible_target_durations=ordering.target_audible_durations,
+                        material_pre_silence_seconds=ordering.target_pre_silences,
                         material_text_hints=ordered_material_texts,
                         on_progress=progress_callback,
                         should_cancel=should_cancel,

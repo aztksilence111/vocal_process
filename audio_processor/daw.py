@@ -29,6 +29,11 @@ class DawTimelineClip:
     start_seconds: float
     source_duration_seconds: float
     target_duration_seconds: float
+    audible_target_duration_seconds: float | None = None
+    pre_silence_seconds: float = 0.0
+    post_silence_seconds: float = 0.0
+    source_window_start_seconds: float = 0.0
+    source_window_duration_seconds: float | None = None
     tempo: float = 1.0
     quality_warning: str = ""
     requested_tempo: float | None = None
@@ -66,6 +71,8 @@ def plan_daw_timeline(
     audio_directory: Path,
     *,
     target_durations: Sequence[float | None] | None = None,
+    audible_target_durations: Sequence[float | None] | None = None,
+    pre_silence_seconds: Sequence[float] | None = None,
     material_text_hints: Sequence[str] | None = None,
 ) -> DawTimelinePlan:
     if not material_paths:
@@ -75,6 +82,8 @@ def plan_daw_timeline(
         reference_path,
         material_paths,
         target_durations=target_durations,
+        audible_target_durations=audible_target_durations,
+        pre_silence_seconds=pre_silence_seconds,
         material_text_hints=material_text_hints,
     )
     normalized_reference = reference_path.expanduser()
@@ -97,6 +106,11 @@ def plan_daw_timeline(
                 start_seconds=start,
                 source_duration_seconds=clip.source_duration_seconds,
                 target_duration_seconds=clip.target_duration_seconds,
+                audible_target_duration_seconds=clip.audible_target_duration_seconds,
+                pre_silence_seconds=clip.pre_silence_seconds,
+                post_silence_seconds=clip.post_silence_seconds,
+                source_window_start_seconds=clip.source_window_start_seconds,
+                source_window_duration_seconds=clip.source_window_duration_seconds,
                 tempo=clip.tempo,
                 quality_warning=clip.quality_warning,
                 requested_tempo=clip.requested_tempo,
@@ -124,6 +138,8 @@ def export_daw_timeline_with_progress(
     *,
     material_paths: Sequence[Path] | None = None,
     target_durations: Sequence[float | None] | None = None,
+    audible_target_durations: Sequence[float | None] | None = None,
+    pre_silence_seconds: Sequence[float] | None = None,
     material_text_hints: Sequence[str] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
@@ -146,6 +162,8 @@ def export_daw_timeline_with_progress(
         ordered_material_paths,
         audio_directory,
         target_durations=target_durations,
+        audible_target_durations=audible_target_durations,
+        pre_silence_seconds=pre_silence_seconds,
         material_text_hints=material_text_hints,
     )
 
@@ -195,6 +213,10 @@ def export_daw_timeline_with_progress(
                 clip.tempo,
                 clip_options,
                 target_duration=clip.target_duration_seconds,
+                audible_target_duration=clip.audible_target_duration_seconds,
+                pre_silence_seconds=clip.pre_silence_seconds,
+                source_window_start_seconds=clip.source_window_start_seconds,
+                source_window_duration_seconds=clip.source_window_duration_seconds,
                 text_hint=clip.text_hint,
                 on_progress=clip_progress,
                 should_cancel=should_cancel,
@@ -219,6 +241,11 @@ def export_daw_timeline_with_progress(
                 start_seconds=clip.start_seconds,
                 source_duration_seconds=clip.source_duration_seconds,
                 target_duration_seconds=clip.target_duration_seconds,
+                audible_target_duration_seconds=clip.audible_target_duration_seconds,
+                pre_silence_seconds=clip.pre_silence_seconds,
+                post_silence_seconds=clip.post_silence_seconds,
+                source_window_start_seconds=clip.source_window_start_seconds,
+                source_window_duration_seconds=clip.source_window_duration_seconds,
                 tempo=clip.tempo,
                 quality_warning=clip.quality_warning,
                 requested_tempo=clip.requested_tempo,
@@ -302,6 +329,11 @@ def _write_csv(result: DawExportResult) -> None:
                 "rendered_path",
                 "start_seconds",
                 "target_duration_seconds",
+                "audible_target_duration_seconds",
+                "pre_silence_seconds",
+                "post_silence_seconds",
+                "source_window_start_seconds",
+                "source_window_duration_seconds",
                 "rubberband_tempo",
                 "requested_rubberband_tempo",
                 "stretch_strategy",
@@ -319,6 +351,19 @@ def _write_csv(result: DawExportResult) -> None:
                     str(clip.rendered_path),
                     f"{clip.start_seconds:.6f}",
                     f"{clip.target_duration_seconds:.6f}",
+                    (
+                        f"{clip.audible_target_duration_seconds:.6f}"
+                        if clip.audible_target_duration_seconds is not None
+                        else ""
+                    ),
+                    f"{clip.pre_silence_seconds:.6f}",
+                    f"{clip.post_silence_seconds:.6f}",
+                    f"{clip.source_window_start_seconds:.6f}",
+                    (
+                        f"{clip.source_window_duration_seconds:.6f}"
+                        if clip.source_window_duration_seconds is not None
+                        else ""
+                    ),
                     f"{clip.tempo:.8f}",
                     f"{(clip.requested_tempo if clip.requested_tempo is not None else clip.tempo):.8f}",
                     clip.stretch_strategy,
@@ -414,8 +459,25 @@ def _clip_render_cache_key(clip: DawTimelineClip, options: ProcessOptions) -> tu
         stat.st_size,
         stat.st_mtime_ns,
         round(clip.target_duration_seconds, 6),
+        round(
+            clip.audible_target_duration_seconds
+            if clip.audible_target_duration_seconds is not None
+            else clip.target_duration_seconds,
+            6,
+        ),
+        round(clip.pre_silence_seconds, 6),
+        round(clip.post_silence_seconds, 6),
+        round(clip.source_window_start_seconds, 6),
+        (
+            round(clip.source_window_duration_seconds, 6)
+            if clip.source_window_duration_seconds is not None
+            else None
+        ),
         round(clip.tempo, 8),
+        clip.stretch_strategy,
         clip.stretch_backend,
+        clip.text_hint,
+        "daw_render_cache_v2_tempo_safe_silence_pad",
         options.gain_db,
         options.normalize,
         options.highpass_hz,

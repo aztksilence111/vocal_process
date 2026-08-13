@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -90,6 +91,47 @@ def _write_test_wave(path: Path, *, duration_seconds: float = 1.0, sample_rate: 
         handle.setsampwidth(sample_width)
         handle.setframerate(sample_rate)
         handle.writeframes(b"\x00\x00" * n_frames)
+
+
+def _write_tone_wave(path: Path, *, duration_seconds: float = 1.0, sample_rate: int = 8000) -> None:
+    n_frames = int(duration_seconds * sample_rate)
+    frames = bytearray()
+    for index in range(n_frames):
+        value = int(12000 * math.sin(2.0 * math.pi * 220.0 * (index / sample_rate)))
+        frames.extend(value.to_bytes(2, byteorder="little", signed=True))
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(bytes(frames))
+
+
+def _write_windowed_tone_wave(
+    path: Path,
+    *,
+    leading_silence_seconds: float,
+    tone_seconds: float,
+    trailing_silence_seconds: float,
+    sample_rate: int = 8000,
+) -> None:
+    total_frames = int(
+        (leading_silence_seconds + tone_seconds + trailing_silence_seconds) * sample_rate
+    )
+    tone_start = int(leading_silence_seconds * sample_rate)
+    tone_end = tone_start + int(tone_seconds * sample_rate)
+    frames = bytearray()
+    for index in range(total_frames):
+        value = (
+            int(12000 * math.sin(2.0 * math.pi * 220.0 * (index / sample_rate)))
+            if tone_start <= index < tone_end
+            else 0
+        )
+        frames.extend(value.to_bytes(2, byteorder="little", signed=True))
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(bytes(frames))
 
 
 class ProcessCommandTests(unittest.TestCase):
@@ -258,11 +300,12 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("asplit=2", filters)
         self.assertIn("atrim=start=0.000000:end=0.140000", filters)
         self.assertIn("atrim=start=0.140000:end=0.500000", filters)
-        self.assertIn("rubberband=tempo=0.35000000:pitch=1:formant=preserved", filters)
-        self.assertIn("aloop=loop=-1:size=2147483647:start=0", filters)
+        self.assertIn("rubberband=tempo=", filters)
+        self.assertNotIn("aloop=loop=-1:size=2147483647:start=0", filters)
+        self.assertIn("apad=whole_dur=2.000000", filters)
         self.assertIn("atrim=duration=2.000000", filters)
         self.assertIn("afade=t=in:st=0:d=0.010000", filters)
-        self.assertIn("afade=t=out:st=1.990000:d=0.010000", filters)
+        self.assertIn("afade=t=out:st=0.990000:d=0.010000", filters)
         self.assertIn("-map", args)
         self.assertIn("[outa]", args)
 
@@ -406,6 +449,89 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertAlmostEqual(clips[0].tempo, 100.0)
         self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
 
+    def test_short_material_compression_uses_source_window_trim(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "ko.wav"
+            _write_test_wave(reference, duration_seconds=0.2)
+            _write_tone_wave(material, duration_seconds=1.0)
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[0.2],
+                material_text_hints=["ko"],
+            )
+
+            self.assertAlmostEqual(clips[0].source_window_start_seconds, 0.0)
+            self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.24, places=2)
+            self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 1.2, places=2)
+            self.assertEqual(clips[0].quality_warning, "")
+            rendered = render_material_stretch_plan(clips)
+            self.assertAlmostEqual(rendered[0]["source_window_duration_seconds"] or 0.0, 0.24, places=2)
+
+            args = build_material_clip_args(
+                material,
+                root / "out.wav",
+                clips[0].tempo,
+                ProcessOptions(input_path=material, output_path=root / "out.wav"),
+                target_duration=clips[0].target_duration_seconds,
+                audible_target_duration=clips[0].audible_target_duration_seconds,
+                source_window_start_seconds=clips[0].source_window_start_seconds,
+                source_window_duration_seconds=clips[0].source_window_duration_seconds,
+                text_hint="ko",
+                source_duration=clips[0].source_window_duration_seconds,
+                progress=True,
+            )
+            self.assertIn("-t", args)
+            self.assertIn("0.240000", args)
+
+    def test_source_window_skips_vowel_core_graph_for_trimmed_input(self) -> None:
+        args = build_material_clip_args(
+            Path("shi.wav"),
+            Path("out.wav"),
+            0.5,
+            ProcessOptions(input_path=Path("shi.wav"), output_path=Path("out.wav")),
+            target_duration=1.0,
+            audible_target_duration=1.0,
+            source_window_start_seconds=0.12,
+            source_window_duration_seconds=0.5,
+            text_hint="shi",
+            source_duration=0.5,
+        )
+
+        self.assertIn("-ss", args)
+        self.assertIn("-t", args)
+        self.assertIn("-af", args)
+        self.assertNotIn("-filter_complex", args)
+
+    def test_source_window_plan_reports_rubberband_not_signalsmith(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "shi.wav"
+            _write_test_wave(reference, duration_seconds=0.4)
+            _write_windowed_tone_wave(
+                material,
+                leading_silence_seconds=0.12,
+                tone_seconds=0.20,
+                trailing_silence_seconds=0.68,
+            )
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[0.4],
+                material_text_hints=["shi"],
+            )
+
+        self.assertGreater(clips[0].source_window_start_seconds, 0.0)
+        self.assertIsNotNone(clips[0].source_window_duration_seconds)
+        self.assertEqual(clips[0].stretch_strategy, "rubberband_full_clip")
+        self.assertEqual(clips[0].stretch_backend, "rubberband")
+        self.assertEqual(clips[0].phoneme_regions, ())
+
     def test_short_material_expansion_uses_vowel_core_stretch(self) -> None:
         with patch(
             "audio_processor.engine.probe_audio",
@@ -420,16 +546,24 @@ class MaterialAssemblyTests(unittest.TestCase):
                 material_text_hints=["shi"],
             )
 
-        self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 0.25)
-        self.assertAlmostEqual(clips[0].tempo, 0.35)
+        self.assertAlmostEqual(clips[0].timeline_requested_tempo or 0.0, 0.25)
+        self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 0.5)
+        self.assertAlmostEqual(clips[0].tempo, 0.5)
         self.assertEqual(clips[0].stretch_strategy, "syllable_vowel_core_stretch")
-        self.assertEqual(clips[0].quality_warning, "extreme_stretch_ratio")
+        self.assertEqual(clips[0].quality_warning, "moderate_stretch_ratio")
         self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
-        self.assertLess(clips[0].stretch_naturalness_score, 0.2)
+        self.assertAlmostEqual(clips[0].stretch_naturalness_score, 0.39)
+        self.assertAlmostEqual(clips[0].audible_target_duration_seconds or 0.0, 1.0)
+        self.assertAlmostEqual(clips[0].post_silence_seconds, 1.0)
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(clips[0].stretch_backend, "signalsmith")
         self.assertEqual(rendered[0]["stretch_backend"], "signalsmith")
-        self.assertEqual(rendered[0]["boundary_conditioning"], "signalsmith_vowel_core_stretch+fade_in_out")
+        self.assertEqual(
+            rendered[0]["boundary_conditioning"],
+            "signalsmith_vowel_core_stretch+fade_in_out+tempo_safe_silence_pad",
+        )
+        self.assertAlmostEqual(rendered[0]["audible_target_duration_seconds"], 1.0)
+        self.assertAlmostEqual(rendered[0]["post_silence_seconds"], 1.0)
         self.assertEqual(rendered[0]["formant_preservation"], "signalsmith_pitch_preserved_vowel_core")
         self.assertEqual(
             [region["kind"] for region in rendered[0]["phoneme_regions"]],
@@ -520,6 +654,10 @@ class MaterialAssemblyTests(unittest.TestCase):
                 options: ProcessOptions,
                 *,
                 target_duration: float | None = None,
+                audible_target_duration: float | None = None,
+                pre_silence_seconds: float = 0.0,
+                source_window_start_seconds: float = 0.0,
+                source_window_duration_seconds: float | None = None,
                 text_hint: str = "",
                 on_progress=None,
                 should_cancel=None,
@@ -563,6 +701,10 @@ class MaterialAssemblyTests(unittest.TestCase):
                 options: ProcessOptions,
                 *,
                 target_duration: float | None = None,
+                audible_target_duration: float | None = None,
+                pre_silence_seconds: float = 0.0,
+                source_window_start_seconds: float = 0.0,
+                source_window_duration_seconds: float | None = None,
                 text_hint: str = "",
                 on_progress=None,
                 should_cancel=None,
@@ -3050,6 +3192,106 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["resolved_target_duration_count"], 3)
         self.assertAlmostEqual(summary["target_duration_total_seconds"], 10.0)
 
+    def test_absolute_segment_timeline_keeps_inter_segment_silence_out_of_audible_targets(self) -> None:
+        reference_segments = [
+            VoiceSegment(10.0, 20.0, "\u6211\u662f", timing_source="asr_segment"),
+        ]
+        decisions = [
+            MaterialOrderDecision(
+                rank=1,
+                material_path=Path("wo.wav"),
+                score=0.8,
+                reference_text="\u6211\u662f",
+                material_text="wo",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=0,
+                phonetic_position=0,
+                phonetic_span_units=1,
+            ),
+            MaterialOrderDecision(
+                rank=2,
+                material_path=Path("shi.wav"),
+                score=0.8,
+                reference_text="\u6211\u662f",
+                material_text="shi",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=1,
+                phonetic_position=1,
+                phonetic_span_units=1,
+            ),
+        ]
+
+        active_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=30.0,
+            preserve_positioned_active_total=True,
+        )
+        slots, audible, pre_silences, post_silences = model_runtime._target_timeline_slots_for_decisions(
+            reference_segments,
+            decisions,
+            active_durations,
+            reference_duration=30.0,
+        )
+        summary = model_runtime._render_timeline_alignment_summary(
+            reference_segments,
+            decisions,
+            slots,
+            target_audible_durations=audible,
+            target_pre_silences=pre_silences,
+            target_post_silences=post_silences,
+        )
+
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in audible), (5.0, 5.0))
+        self.assertEqual(tuple(round(value, 6) for value in pre_silences), (10.0, 0.0))
+        self.assertEqual(tuple(round(value, 6) for value in post_silences), (0.0, 10.0))
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in slots), (15.0, 15.0))
+        self.assertAlmostEqual(summary["target_duration_total_seconds"], 30.0)
+        self.assertAlmostEqual(summary["target_audible_duration_total_seconds"], 10.0)
+        self.assertAlmostEqual(summary["target_pre_silence_total_seconds"], 10.0)
+        self.assertAlmostEqual(summary["target_post_silence_total_seconds"], 10.0)
+
+    def test_absolute_segment_timeline_handles_unpositioned_fallback_decision(self) -> None:
+        reference_segments = [
+            VoiceSegment(5.0, 7.0, "\u6211", timing_source="asr_segment"),
+        ]
+        decisions = [
+            MaterialOrderDecision(
+                rank=1,
+                material_path=Path("wo.wav"),
+                score=0.8,
+                reference_text="\u6211",
+                material_text="wo",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=0,
+                phonetic_position=0,
+                phonetic_span_units=1,
+            ),
+            MaterialOrderDecision(
+                rank=2,
+                material_path=Path("fallback.wav"),
+                score=0.1,
+                reference_text="",
+                material_text="fallback",
+                reason="unmatched_filename_fallback",
+            ),
+        ]
+
+        slots, audible, pre_silences, post_silences = model_runtime._target_timeline_slots_for_decisions(
+            reference_segments,
+            decisions,
+            (2.0, 1.0),
+            reference_duration=10.0,
+        )
+
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in audible), (2.0, 1.0))
+        self.assertEqual(tuple(round(value, 6) for value in pre_silences), (5.0, 0.0))
+        self.assertEqual(tuple(round(value, 6) for value in post_silences), (2.0, 0.0))
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in slots), (9.0, 1.0))
+
     def test_duplicate_positioned_decisions_do_not_expand_segment_unit_count(self) -> None:
         reference_segments = [VoiceSegment(0.0, 2.0, "you")]
         decisions = [
@@ -3192,15 +3434,17 @@ class ModelRuntimeTests(unittest.TestCase):
 
         self.assertEqual(report["summary"]["continuity_warning_count"], 1)
         self.assertEqual(report["summary"]["fade_applied_clip_count"], 1)
-        self.assertLess(report["summary"]["stretch_naturalness_score_mean"] or 1.0, 0.2)
+        self.assertAlmostEqual(report["summary"]["stretch_naturalness_score_mean"] or 0.0, 0.39)
+        self.assertAlmostEqual(report["stretch_plan"][0]["timeline_requested_tempo"], 0.25)
+        self.assertAlmostEqual(report["stretch_plan"][0]["requested_rubberband_tempo"], 0.5)
         self.assertEqual(report["stretch_plan"][0]["continuity_warning"], "single_syllable_boundary_risk")
         self.assertEqual(
             report["stretch_plan"][0]["boundary_conditioning"],
-            "signalsmith_vowel_core_stretch+fade_in_out",
+            "signalsmith_vowel_core_stretch+fade_in_out+tempo_safe_silence_pad",
         )
         self.assertEqual(
             report["optimization"]["render_continuity"]["boundary_conditioning"],
-            "signalsmith_vowel_core_stretch+per_clip_fade_in_out",
+            "signalsmith_vowel_core_stretch+per_clip_fade_in_out+tempo_safe_silence_pad",
         )
         self.assertTrue(any(warning["kind"] == "single_syllable_boundary_risk" for warning in report["warnings"]))
 
@@ -3908,6 +4152,10 @@ class DawRenderReuseTests(unittest.TestCase):
                 options: ProcessOptions,
                 *,
                 target_duration: float | None = None,
+                audible_target_duration: float | None = None,
+                pre_silence_seconds: float = 0.0,
+                source_window_start_seconds: float = 0.0,
+                source_window_duration_seconds: float | None = None,
                 text_hint: str = "",
                 on_progress: object | None = None,
                 should_cancel: object | None = None,

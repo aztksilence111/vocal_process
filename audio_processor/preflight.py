@@ -39,6 +39,8 @@ def build_preflight_report(
         reference_path,
         ordering.ordered_paths,
         target_durations=ordering.target_durations,
+        audible_target_durations=ordering.target_audible_durations,
+        pre_silence_seconds=ordering.target_pre_silences,
         material_text_hints=[decision.material_text for decision in ordering.decisions],
     )
     warnings = _preflight_warnings(ordering, stretch_plan)
@@ -390,21 +392,37 @@ def _render_boundary_conditioning(stretch_plan: Sequence[MaterialStretchClip]) -
         and clip.stretch_backend == "signalsmith"
         for clip in stretch_plan
     )
+    has_tempo_safe_padding = any(
+        clip.pre_silence_seconds > 0.0005
+        or clip.post_silence_seconds > 0.0005
+        for clip in stretch_plan
+    )
+    has_source_window_trim = any(
+        clip.source_window_start_seconds > 0.0005
+        or clip.source_window_duration_seconds is not None
+        for clip in stretch_plan
+    )
+    suffix_parts = []
+    if has_source_window_trim:
+        suffix_parts.append("source_window_trim")
+    if has_tempo_safe_padding:
+        suffix_parts.append("tempo_safe_silence_pad")
+    suffix = f"+{'+'.join(suffix_parts)}" if suffix_parts else ""
     if has_signalsmith_vowel_core and has_fades:
-        return "signalsmith_vowel_core_stretch+per_clip_fade_in_out"
+        return f"signalsmith_vowel_core_stretch+per_clip_fade_in_out{suffix}"
     if has_signalsmith_vowel_core:
-        return "signalsmith_vowel_core_stretch"
+        return f"signalsmith_vowel_core_stretch{suffix}"
     if has_vowel_core_stretch and has_fades:
-        return "vowel_core_stretch+per_clip_fade_in_out"
+        return f"vowel_core_stretch+per_clip_fade_in_out{suffix}"
     if has_vowel_core_stretch:
-        return "vowel_core_stretch"
+        return f"vowel_core_stretch{suffix}"
     if has_loop_fill and has_fades:
-        return "short_text_loop_fill+per_clip_fade_in_out"
+        return f"short_text_loop_fill+per_clip_fade_in_out{suffix}"
     if has_loop_fill:
-        return "short_text_loop_fill"
+        return f"short_text_loop_fill{suffix}"
     if has_fades:
-        return "per_clip_fade_in_out"
-    return ""
+        return f"per_clip_fade_in_out{suffix}"
+    return "+".join(suffix_parts)
 
 
 def _render_formant_preservation(stretch_plan: Sequence[MaterialStretchClip]) -> str:

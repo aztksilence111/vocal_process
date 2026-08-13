@@ -12,6 +12,7 @@ import hashlib
 import threading
 import time
 import wave
+from array import array
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
@@ -72,6 +73,12 @@ class MaterialStretchClip:
     source_duration_seconds: float
     target_duration_seconds: float
     tempo: float
+    audible_target_duration_seconds: float | None = None
+    pre_silence_seconds: float = 0.0
+    post_silence_seconds: float = 0.0
+    timeline_requested_tempo: float | None = None
+    source_window_start_seconds: float = 0.0
+    source_window_duration_seconds: float | None = None
     quality_warning: str = ""
     requested_tempo: float | None = None
     stretch_strategy: str = "rubberband_full_clip"
@@ -117,7 +124,16 @@ MATERIAL_CODA_MAX_SECONDS = 0.140
 MATERIAL_CONSONANT_MAX_FRACTION = 0.28
 MATERIAL_CODA_MAX_FRACTION = 0.22
 MATERIAL_VOWEL_CORE_MIN_SECONDS = 0.030
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v8_signalsmith_vowel_core"
+MATERIAL_SHORT_TEXT_MAX_AUDIBLE_EXPANSION_RATIO = 2.0
+MATERIAL_SHORT_TEXT_MAX_AUDIBLE_EXTENSION_SECONDS = 0.75
+MATERIAL_SHORT_TEXT_SOURCE_WINDOW_TRIM_RATIO = 1.75
+MATERIAL_SHORT_TEXT_SOURCE_WINDOW_RENDER_RATIO = 1.20
+MATERIAL_SOURCE_WINDOW_ANALYSIS_FRAME_SECONDS = 0.010
+MATERIAL_SOURCE_WINDOW_ANALYSIS_HOP_SECONDS = 0.005
+MATERIAL_SOURCE_WINDOW_ANALYSIS_RELATIVE_DB = 32.0
+MATERIAL_SOURCE_WINDOW_ANALYSIS_ABSOLUTE_FLOOR = 0.003
+MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS = 0.025
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v10_tempo_safe_source_window"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -343,6 +359,8 @@ def build_material_assembly_args(
     options: ProcessOptions,
     *,
     material_target_durations: Sequence[float | None] | None = None,
+    material_audible_target_durations: Sequence[float | None] | None = None,
+    material_pre_silence_seconds: Sequence[float] | None = None,
     material_text_hints: Sequence[str] | None = None,
     progress: bool = False,
 ) -> list[str]:
@@ -355,6 +373,8 @@ def build_material_assembly_args(
         reference_path,
         material_paths,
         target_durations=material_target_durations,
+        audible_target_durations=material_audible_target_durations,
+        pre_silence_seconds=material_pre_silence_seconds,
         material_text_hints=material_text_hints,
     )
     filters = _build_material_plan_filter_graph(clip_plan, options)
@@ -389,30 +409,73 @@ def build_material_clip_args(
     options: ProcessOptions,
     *,
     target_duration: float | None = None,
+    audible_target_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
+    source_window_start_seconds: float = 0.0,
+    source_window_duration_seconds: float | None = None,
     text_hint: str = "",
     source_duration: float | None = None,
     progress: bool = False,
 ) -> list[str]:
     _validate_options(options)
-    resolved_tempo, _ = _resolve_stretch_strategy(tempo, text_hint, target_duration)
-    _validate_rubberband_tempo(resolved_tempo)
 
     args = ["ffmpeg", "-hide_banner"]
     if progress:
         args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
 
     args.append("-y" if options.overwrite else "-n")
+    if source_window_start_seconds > 0.0005:
+        args.extend(["-ss", f"{source_window_start_seconds:.6f}"])
+    if source_window_duration_seconds is not None and source_window_duration_seconds > 0.0005:
+        args.extend(["-t", f"{source_window_duration_seconds:.6f}"])
     args.extend(["-i", str(input_path)])
     resolved_source_duration = source_duration
     if resolved_source_duration is None and target_duration is not None and tempo > 0:
         resolved_source_duration = target_duration * tempo
+    if source_window_duration_seconds is not None and source_window_duration_seconds > 0:
+        resolved_source_duration = min(
+            float(source_window_duration_seconds),
+            resolved_source_duration if resolved_source_duration is not None else float(source_window_duration_seconds),
+        )
+    pre_silence_seconds = max(float(pre_silence_seconds or 0.0), 0.0)
+    requested_audible_target = audible_target_duration or target_duration
+    if (
+        audible_target_duration is None
+        and target_duration is not None
+        and pre_silence_seconds > 0.0
+    ):
+        requested_audible_target = max(
+            target_duration - pre_silence_seconds,
+            MIN_MATERIAL_TARGET_DURATION_SECONDS,
+        )
+    audible_target_duration = _resolve_audible_target_duration(
+        resolved_source_duration,
+        requested_audible_target,
+        text_hint,
+    )
+    render_target_duration = audible_target_duration or target_duration
+    render_tempo = (
+        resolved_source_duration / render_target_duration
+        if resolved_source_duration is not None
+        and render_target_duration is not None
+        and render_target_duration > 0
+        else tempo
+    )
+    resolved_tempo, _ = _resolve_stretch_strategy(
+        render_tempo,
+        text_hint,
+        render_target_duration,
+    )
+    _validate_rubberband_tempo(resolved_tempo)
     if (
         target_duration is not None
         and resolved_source_duration is not None
+        and source_window_start_seconds <= 0.0005
+        and source_window_duration_seconds is None
         and _should_use_vowel_core_stretch(
-            tempo,
+            resolved_tempo,
             text_hint,
-            target_duration,
+            render_target_duration,
             resolved_source_duration,
         )
     ):
@@ -420,7 +483,9 @@ def build_material_clip_args(
             "[0:a]",
             "outa",
             source_duration=resolved_source_duration,
-            target_duration=target_duration,
+            target_duration=render_target_duration,
+            output_duration=target_duration,
+            pre_silence_seconds=pre_silence_seconds,
             text_hint=text_hint,
             options=options,
             label_prefix="vc0",
@@ -434,6 +499,10 @@ def build_material_clip_args(
                 resolved_tempo,
                 options,
                 target_duration=target_duration,
+                audible_target_duration=audible_target_duration,
+                pre_silence_seconds=pre_silence_seconds,
+                source_window_start_seconds=0.0,
+                source_window_duration_seconds=None,
                 text_hint=text_hint,
             ),
         ])
@@ -660,6 +729,10 @@ def process_material_clip_with_progress(
     options: ProcessOptions,
     *,
     target_duration: float | None = None,
+    audible_target_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
+    source_window_start_seconds: float = 0.0,
+    source_window_duration_seconds: float | None = None,
     text_hint: str = "",
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
@@ -673,16 +746,49 @@ def process_material_clip_with_progress(
         normalized_output.parent.mkdir(parents=True, exist_ok=True)
 
     input_duration = get_audio_duration_seconds(probe_audio(normalized_input))
-    resolved_tempo, resolved_strategy = _resolve_stretch_strategy(tempo, text_hint, target_duration)
-    expected_duration = target_duration or (input_duration / resolved_tempo if resolved_tempo > 0 else input_duration)
+    source_window_start_seconds = max(float(source_window_start_seconds or 0.0), 0.0)
+    if source_window_duration_seconds is not None:
+        source_window_duration_seconds = max(float(source_window_duration_seconds), 0.0)
+    render_source_duration = (
+        min(source_window_duration_seconds, max(input_duration - source_window_start_seconds, 0.0))
+        if source_window_duration_seconds is not None and source_window_duration_seconds > 0
+        else input_duration
+    )
+    pre_silence_seconds = max(float(pre_silence_seconds or 0.0), 0.0)
+    audible_target_duration = _resolve_audible_target_duration(
+        render_source_duration,
+        audible_target_duration or target_duration,
+        text_hint,
+    )
+    available_audio_duration = max(
+        (target_duration or audible_target_duration or input_duration) - pre_silence_seconds,
+        MIN_MATERIAL_TARGET_DURATION_SECONDS,
+    )
+    audible_target_duration = min(audible_target_duration or available_audio_duration, available_audio_duration)
+    render_target_duration = audible_target_duration or target_duration
+    render_tempo = (
+        render_source_duration / render_target_duration
+        if render_target_duration is not None and render_target_duration > 0
+        else tempo
+    )
+    resolved_tempo, resolved_strategy = _resolve_stretch_strategy(
+        render_tempo,
+        text_hint,
+        render_target_duration,
+    )
+    expected_duration = target_duration or (
+        input_duration / resolved_tempo if resolved_tempo > 0 else input_duration
+    )
     if (
-        target_duration is not None
+        render_target_duration is not None
         and resolved_strategy == "syllable_vowel_core_stretch"
         and signalsmith_stretch_available()
+        and source_window_start_seconds <= 0.0005
+        and source_window_duration_seconds is None
     ):
         regions = _vowel_core_stretch_regions(
             input_duration,
-            target_duration,
+            render_target_duration,
             text_hint,
             source_path=normalized_input,
         )
@@ -692,20 +798,23 @@ def process_material_clip_with_progress(
                     normalized_input,
                     normalized_output,
                     regions,
-                    target_duration=target_duration,
+                    audible_target_duration=render_target_duration,
+                    output_target_duration=target_duration,
+                    pre_silence_seconds=pre_silence_seconds,
                     options=options,
                     on_progress=on_progress,
                     should_cancel=should_cancel,
                 )
-                _ensure_audio_duration(
-                    normalized_output,
-                    target_duration,
-                    options,
-                    on_progress=on_progress,
-                    should_cancel=should_cancel,
-                    progress_message="Correcting Signalsmith material clip duration",
-                    fade=False,
-                )
+                if target_duration is not None:
+                    _ensure_audio_duration(
+                        normalized_output,
+                        target_duration,
+                        options,
+                        on_progress=on_progress,
+                        should_cancel=should_cancel,
+                        progress_message="Padding Signalsmith material clip to timeline slot",
+                        fade=False,
+                    )
                 return
             except SignalsmithStretchError as exc:
                 if should_cancel is not None and should_cancel():
@@ -735,8 +844,12 @@ def process_material_clip_with_progress(
             codec=options.codec,
         ),
         target_duration=target_duration,
+        audible_target_duration=audible_target_duration,
+        pre_silence_seconds=pre_silence_seconds,
         text_hint=text_hint,
         source_duration=input_duration,
+        source_window_start_seconds=source_window_start_seconds,
+        source_window_duration_seconds=source_window_duration_seconds,
         progress=True,
     )
     _run_progress_process(
@@ -762,7 +875,9 @@ def _render_signalsmith_vowel_core_clip(
     output_path: Path,
     regions: Sequence[MaterialPhonemeRegion],
     *,
-    target_duration: float,
+    audible_target_duration: float,
+    output_target_duration: float | None,
+    pre_silence_seconds: float,
     options: ProcessOptions,
     on_progress: ProgressCallback | None,
     should_cancel: CancelCallback | None,
@@ -777,20 +892,22 @@ def _render_signalsmith_vowel_core_clip(
             input_path,
             intermediate_path,
             regions,
-            target_duration_seconds=target_duration,
+            target_duration_seconds=audible_target_duration,
             should_cancel=should_cancel,
         )
         _notify_progress(on_progress, 0.72, "Applying material effects to Signalsmith stretch")
         args = _build_signalsmith_material_finish_args(
             intermediate_path,
             output_path,
-            target_duration,
-            options,
+            output_target_duration or audible_target_duration,
+            audible_target_duration=audible_target_duration,
+            pre_silence_seconds=pre_silence_seconds,
+            options=options,
             progress=True,
         )
         _run_progress_process(
             args,
-            duration_seconds=target_duration,
+            duration_seconds=output_target_duration or audible_target_duration,
             on_progress=lambda progress, message: _notify_progress(
                 on_progress,
                 0.72 + progress * 0.28,
@@ -806,15 +923,24 @@ def _build_signalsmith_material_finish_args(
     input_path: Path,
     output_path: Path,
     target_duration: float,
-    options: ProcessOptions,
     *,
+    audible_target_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
+    options: ProcessOptions,
     progress: bool,
 ) -> list[str]:
     filters: list[str] = []
     audio_filters = _build_audio_filters(options)
     if audio_filters:
         filters.append(audio_filters)
-    filters.extend(_exact_duration_filters(target_duration, fade=True, loop_fill=False))
+    filters.extend(
+        _material_slot_duration_filters(
+            target_duration,
+            audible_target_duration=audible_target_duration,
+            pre_silence_seconds=pre_silence_seconds,
+            loop_fill=False,
+        )
+    )
     args = ["ffmpeg", "-hide_banner"]
     if progress:
         args.extend(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
@@ -839,6 +965,8 @@ def assemble_material_to_reference_with_progress(
     *,
     material_paths: Sequence[Path] | None = None,
     material_target_durations: Sequence[float | None] | None = None,
+    material_audible_target_durations: Sequence[float | None] | None = None,
+    material_pre_silence_seconds: Sequence[float] | None = None,
     material_text_hints: Sequence[str] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
@@ -853,13 +981,21 @@ def assemble_material_to_reference_with_progress(
 
     ordered_material_paths = list(material_paths) if material_paths is not None else list_audio_files(material_directory)
     reference_duration = get_audio_duration_seconds(probe_audio(normalized_reference))
-    if len(ordered_material_paths) > 1 or material_target_durations is not None or material_text_hints is not None:
+    if (
+        len(ordered_material_paths) > 1
+        or material_target_durations is not None
+        or material_audible_target_durations is not None
+        or material_pre_silence_seconds is not None
+        or material_text_hints is not None
+    ):
         _assemble_material_clips_with_render_cache(
             normalized_reference,
             ordered_material_paths,
             normalized_output,
             options,
             material_target_durations=material_target_durations,
+            material_audible_target_durations=material_audible_target_durations,
+            material_pre_silence_seconds=material_pre_silence_seconds,
             material_text_hints=material_text_hints,
             reference_duration=reference_duration,
             on_progress=on_progress,
@@ -886,6 +1022,8 @@ def assemble_material_to_reference_with_progress(
             codec=options.codec,
         ),
         material_target_durations=material_target_durations,
+        material_audible_target_durations=material_audible_target_durations,
+        material_pre_silence_seconds=material_pre_silence_seconds,
         material_text_hints=material_text_hints,
         progress=True,
     )
@@ -913,6 +1051,8 @@ def _assemble_material_clips_with_render_cache(
     options: ProcessOptions,
     *,
     material_target_durations: Sequence[float | None] | None,
+    material_audible_target_durations: Sequence[float | None] | None,
+    material_pre_silence_seconds: Sequence[float] | None,
     material_text_hints: Sequence[str] | None,
     reference_duration: float,
     on_progress: ProgressCallback | None,
@@ -925,6 +1065,8 @@ def _assemble_material_clips_with_render_cache(
         reference_path,
         material_paths,
         target_durations=material_target_durations,
+        audible_target_durations=material_audible_target_durations,
+        pre_silence_seconds=material_pre_silence_seconds,
         material_text_hints=material_text_hints,
     )
     cache_root = output_path.parent / ".vocalprocess_render_cache"
@@ -975,6 +1117,10 @@ def _assemble_material_clips_with_render_cache(
             clip.tempo,
             cache_options,
             target_duration=clip.target_duration_seconds,
+            audible_target_duration=clip.audible_target_duration_seconds,
+            pre_silence_seconds=clip.pre_silence_seconds,
+            source_window_start_seconds=clip.source_window_start_seconds,
+            source_window_duration_seconds=clip.source_window_duration_seconds,
             text_hint=clip.text_hint,
             on_progress=clip_progress,
             should_cancel=should_cancel,
@@ -1051,6 +1197,8 @@ def plan_material_stretch_clips(
     material_paths: Sequence[Path],
     *,
     target_durations: Sequence[float | None] | None = None,
+    audible_target_durations: Sequence[float | None] | None = None,
+    pre_silence_seconds: Sequence[float] | None = None,
     material_text_hints: Sequence[str] | None = None,
 ) -> list[MaterialStretchClip]:
     if not material_paths:
@@ -1079,17 +1227,61 @@ def plan_material_stretch_clips(
 
     clips: list[MaterialStretchClip] = []
     resolved_text_hints = _resolve_material_text_hints(len(normalized_materials), material_text_hints)
-    for index, (path, source_duration, target_duration, text_hint) in enumerate(
-        zip(normalized_materials, source_durations, resolved_targets, resolved_text_hints),
+    resolved_audible_targets = _resolve_explicit_audible_target_durations(
+        resolved_targets,
+        audible_target_durations,
+    )
+    resolved_pre_silences = _resolve_pre_silence_seconds(
+        len(normalized_materials),
+        pre_silence_seconds,
+    )
+    for index, (path, source_duration, target_duration, explicit_audible_target, pre_silence, text_hint) in enumerate(
+        zip(
+            normalized_materials,
+            source_durations,
+            resolved_targets,
+            resolved_audible_targets,
+            resolved_pre_silences,
+            resolved_text_hints,
+        ),
         start=1,
     ):
-        requested_tempo = source_duration / target_duration
-        tempo, strategy = _resolve_stretch_strategy(requested_tempo, text_hint, target_duration)
+        pre_silence = min(max(pre_silence, 0.0), max(target_duration - MIN_MATERIAL_TARGET_DURATION_SECONDS, 0.0))
+        available_audible_slot = max(target_duration - pre_silence, MIN_MATERIAL_TARGET_DURATION_SECONDS)
+        requested_tempo = source_duration / max(explicit_audible_target or available_audible_slot, MIN_MATERIAL_TARGET_DURATION_SECONDS)
+        timeline_requested_tempo = source_duration / target_duration
+        audible_target_duration = _resolve_audible_target_duration(
+            source_duration,
+            min(explicit_audible_target or available_audible_slot, available_audible_slot),
+            text_hint,
+        )
+        post_silence_seconds = max(target_duration - pre_silence - audible_target_duration, 0.0)
+        source_window_start, source_window_duration = _source_window_for_render(
+            path,
+            source_duration,
+            audible_target_duration,
+            text_hint,
+        )
+        render_source_duration = source_window_duration or source_duration
+        render_requested_tempo = render_source_duration / audible_target_duration
+        tempo, strategy = _resolve_stretch_strategy(
+            render_requested_tempo,
+            text_hint,
+            audible_target_duration,
+        )
+        if (
+            strategy == "syllable_vowel_core_stretch"
+            and (source_window_start > 0.0005 or source_window_duration is not None)
+        ):
+            # Vowel-core boundaries are measured on the original waveform.
+            # A trimmed source window has a different time origin, so keep
+            # diagnostics and rendering on the regular Rubber Band path.
+            strategy = "rubberband_full_clip"
         _validate_rubberband_tempo(tempo)
         phoneme_regions = (
             _vowel_core_stretch_regions(
                 source_duration,
-                target_duration,
+                audible_target_duration,
                 text_hint,
                 source_path=path,
             )
@@ -1117,13 +1309,19 @@ def plan_material_stretch_clips(
                 source_duration_seconds=source_duration,
                 target_duration_seconds=target_duration,
                 tempo=tempo,
-                quality_warning=_stretch_quality_warning(requested_tempo),
-                requested_tempo=requested_tempo,
+                audible_target_duration_seconds=audible_target_duration,
+                pre_silence_seconds=pre_silence,
+                post_silence_seconds=post_silence_seconds,
+                timeline_requested_tempo=timeline_requested_tempo,
+                source_window_start_seconds=source_window_start,
+                source_window_duration_seconds=source_window_duration,
+                quality_warning=_stretch_quality_warning(render_requested_tempo),
+                requested_tempo=render_requested_tempo,
                 stretch_strategy=strategy,
                 text_hint=text_hint,
                 fade_seconds=_material_clip_fade_seconds(target_duration),
                 stretch_naturalness_score=_stretch_naturalness_score_with_fill_mode(
-                    requested_tempo,
+                    render_requested_tempo,
                     text_hint,
                     loop_fill=strategy in {
                         "syllable_formant_expand_with_loop_fill",
@@ -1131,7 +1329,7 @@ def plan_material_stretch_clips(
                     }
                     and stretch_backend == "rubberband",
                 ),
-                continuity_warning=_stretch_continuity_warning(requested_tempo, text_hint),
+                continuity_warning=_stretch_continuity_warning(render_requested_tempo, text_hint),
                 phoneme_regions=phoneme_regions,
                 stretch_backend=stretch_backend,
             )
@@ -1146,8 +1344,24 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "source_path": clip.source_path,
             "source_duration_seconds": clip.source_duration_seconds,
             "target_duration_seconds": clip.target_duration_seconds,
+            "audible_target_duration_seconds": (
+                clip.audible_target_duration_seconds
+                if clip.audible_target_duration_seconds is not None
+                else clip.target_duration_seconds
+            ),
+            "pre_silence_seconds": clip.pre_silence_seconds,
+            "post_silence_seconds": clip.post_silence_seconds,
+            "source_window_start_seconds": clip.source_window_start_seconds,
+            "source_window_duration_seconds": clip.source_window_duration_seconds,
             "rubberband_tempo": clip.tempo,
             "requested_rubberband_tempo": clip.requested_tempo if clip.requested_tempo is not None else clip.tempo,
+            "timeline_requested_tempo": (
+                clip.timeline_requested_tempo
+                if clip.timeline_requested_tempo is not None
+                else clip.requested_tempo
+                if clip.requested_tempo is not None
+                else clip.tempo
+            ),
             "stretch_strategy": clip.stretch_strategy,
             "stretch_backend": clip.stretch_backend,
             "text_hint": clip.text_hint,
@@ -1183,17 +1397,36 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
 
 
 def _stretch_boundary_conditioning(clip: MaterialStretchClip) -> str:
+    padding = (
+        clip.pre_silence_seconds > 0.0005
+        or clip.post_silence_seconds > 0.0005
+    )
+    source_window = (
+        clip.source_window_start_seconds > 0.0005
+        or clip.source_window_duration_seconds is not None
+    )
+    extras = []
+    if source_window:
+        extras.append("source_window_trim")
+    if padding:
+        extras.append("tempo_safe_silence_pad")
     if clip.stretch_strategy == "syllable_vowel_core_stretch":
         if clip.stretch_backend == "signalsmith":
-            return (
+            conditioning = (
                 "signalsmith_vowel_core_stretch+fade_in_out"
                 if clip.fade_seconds > 0
                 else "signalsmith_vowel_core_stretch"
             )
-        return "vowel_core_stretch+fade_in_out" if clip.fade_seconds > 0 else "vowel_core_stretch"
+            return "+".join([conditioning, *extras]) if extras else conditioning
+        conditioning = "vowel_core_stretch+fade_in_out" if clip.fade_seconds > 0 else "vowel_core_stretch"
+        return "+".join([conditioning, *extras]) if extras else conditioning
     if clip.stretch_strategy == "syllable_formant_expand_with_loop_fill":
-        return "loop_fill+fade_in_out" if clip.fade_seconds > 0 else "loop_fill"
-    return "fade_in_out" if clip.fade_seconds > 0 else ""
+        conditioning = "loop_fill+fade_in_out" if clip.fade_seconds > 0 else "loop_fill"
+        return "+".join([conditioning, *extras]) if extras else conditioning
+    conditioning = "fade_in_out" if clip.fade_seconds > 0 else ""
+    if conditioning:
+        return "+".join([conditioning, *extras]) if extras else conditioning
+    return "+".join(extras)
 
 
 def get_audio_duration_seconds(data: dict[str, Any]) -> float:
@@ -1296,7 +1529,12 @@ def _build_material_plan_filter_graph(
                     f"[{index}:a]",
                     output_label,
                     clip.phoneme_regions,
-                    target_duration=clip.target_duration_seconds,
+                    target_duration=(
+                        clip.audible_target_duration_seconds
+                        or clip.target_duration_seconds
+                    ),
+                    output_duration=clip.target_duration_seconds,
+                    pre_silence_seconds=clip.pre_silence_seconds,
                     options=options,
                     label_prefix=f"vc{index}",
                 )
@@ -1306,6 +1544,10 @@ def _build_material_plan_filter_graph(
                 clip.tempo,
                 options,
                 target_duration=clip.target_duration_seconds,
+                audible_target_duration=clip.audible_target_duration_seconds,
+                pre_silence_seconds=clip.pre_silence_seconds,
+                source_window_start_seconds=clip.source_window_start_seconds,
+                source_window_duration_seconds=clip.source_window_duration_seconds,
                 text_hint=clip.text_hint,
             )
             filters.append(f"[{index}:a]{','.join(post_filters)}[{output_label}]")
@@ -1322,22 +1564,35 @@ def _build_material_clip_filter(
     options: ProcessOptions,
     *,
     target_duration: float | None = None,
+    audible_target_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
+    source_window_start_seconds: float = 0.0,
+    source_window_duration_seconds: float | None = None,
     text_hint: str = "",
 ) -> str:
     if target_duration is not None and target_duration <= 0:
         raise AudioProcessorError("target_duration must be greater than 0")
 
     audio_filters = _build_audio_filters(options)
-    filters = []
+    filters = _source_window_filters(
+        source_window_start_seconds,
+        source_window_duration_seconds,
+    )
     if not _should_direct_trim_tiny_target(target_duration):
         filters.append(_rubberband_filter(tempo))
     if audio_filters:
         filters.append(audio_filters)
     if target_duration is not None:
         filters.extend(
-            _target_duration_filters(
+            _material_slot_duration_filters(
                 target_duration,
-                loop_fill=_should_loop_fill_short_material(tempo, text_hint, target_duration),
+                audible_target_duration=audible_target_duration,
+                pre_silence_seconds=pre_silence_seconds,
+                loop_fill=(
+                    audible_target_duration is None
+                    or audible_target_duration >= target_duration - 0.0005
+                )
+                and _should_loop_fill_short_material(tempo, text_hint, target_duration),
             )
         )
     return ",".join(filters)
@@ -1348,19 +1603,32 @@ def _material_post_filters(
     options: ProcessOptions,
     *,
     target_duration: float | None,
+    audible_target_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
+    source_window_start_seconds: float = 0.0,
+    source_window_duration_seconds: float | None = None,
     text_hint: str = "",
 ) -> list[str]:
     audio_filters = _build_audio_filters(options)
-    filters: list[str] = []
+    filters = _source_window_filters(
+        source_window_start_seconds,
+        source_window_duration_seconds,
+    )
     if not _should_direct_trim_tiny_target(target_duration):
         filters.append(_rubberband_filter(tempo))
     if audio_filters:
         filters.append(audio_filters)
     if target_duration is not None:
         filters.extend(
-            _target_duration_filters(
+            _material_slot_duration_filters(
                 target_duration,
-                loop_fill=_should_loop_fill_short_material(tempo, text_hint, target_duration),
+                audible_target_duration=audible_target_duration,
+                pre_silence_seconds=pre_silence_seconds,
+                loop_fill=(
+                    audible_target_duration is None
+                    or audible_target_duration >= target_duration - 0.0005
+                )
+                and _should_loop_fill_short_material(tempo, text_hint, target_duration),
             )
         )
     if not filters:
@@ -1378,6 +1646,8 @@ def _build_vowel_core_filter_graph(
     options: ProcessOptions,
     label_prefix: str,
     source_path: Path | None = None,
+    output_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
 ) -> str:
     regions = _vowel_core_stretch_regions(
         source_duration,
@@ -1389,7 +1659,9 @@ def _build_vowel_core_filter_graph(
         post_filters = _material_post_filters(
             max(source_duration / target_duration, RUBBERBAND_MIN_TEMPO),
             options,
-            target_duration=target_duration,
+            target_duration=output_duration or target_duration,
+            audible_target_duration=target_duration if output_duration else None,
+            pre_silence_seconds=pre_silence_seconds,
             text_hint=text_hint,
         )
         return f"{source_label}{','.join(post_filters)}[{output_label}]"
@@ -1399,6 +1671,8 @@ def _build_vowel_core_filter_graph(
             output_label,
             regions,
             target_duration=target_duration,
+            output_duration=output_duration or target_duration,
+            pre_silence_seconds=pre_silence_seconds,
             options=options,
             label_prefix=label_prefix,
         )
@@ -1411,6 +1685,8 @@ def _build_vowel_core_filter_graph_parts(
     regions: Sequence[MaterialPhonemeRegion],
     *,
     target_duration: float,
+    output_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
     options: ProcessOptions,
     label_prefix: str,
 ) -> list[str]:
@@ -1435,7 +1711,15 @@ def _build_vowel_core_filter_graph_parts(
     )
     final_filters = _build_audio_filters(options)
     final_chain = [final_filters] if final_filters else []
-    final_chain.extend(_exact_duration_filters(target_duration, fade=True, loop_fill=False))
+    final_chain.extend(
+        _material_slot_duration_filters(
+            output_duration or target_duration,
+            audible_target_duration=target_duration,
+            pre_silence_seconds=pre_silence_seconds,
+            fade=True,
+            loop_fill=False,
+        )
+    )
     filters.append(f"[{concat_label}]{','.join(final_chain)}[{output_label}]")
     return filters
 
@@ -1642,6 +1926,66 @@ def _should_direct_trim_tiny_target(target_duration: float | None) -> bool:
 
 def _target_duration_filters(target_duration: float, *, loop_fill: bool = False) -> list[str]:
     return _exact_duration_filters(target_duration, fade=True, loop_fill=loop_fill)
+
+
+def _material_slot_duration_filters(
+    target_duration: float,
+    *,
+    audible_target_duration: float | None = None,
+    pre_silence_seconds: float = 0.0,
+    fade: bool = True,
+    loop_fill: bool = False,
+) -> list[str]:
+    pre_silence_seconds = max(float(pre_silence_seconds or 0.0), 0.0)
+    audible_target = audible_target_duration
+    if audible_target is not None:
+        audible_target = max(
+            min(float(audible_target), max(target_duration - pre_silence_seconds, MIN_MATERIAL_TARGET_DURATION_SECONDS)),
+            MIN_MATERIAL_TARGET_DURATION_SECONDS,
+        )
+    filters = _exact_duration_filters(
+        audible_target if audible_target is not None else target_duration,
+        fade=fade,
+        loop_fill=loop_fill and pre_silence_seconds <= 0.0005,
+    )
+    if pre_silence_seconds > 0.0005:
+        delay_ms = max(int(round(pre_silence_seconds * 1000.0)), 1)
+        filters.extend(
+            [
+                f"adelay=delays={delay_ms}:all=1",
+                f"apad=whole_dur={target_duration:.6f}",
+                f"atrim=duration={target_duration:.6f}",
+                "asetpts=N/SR/TB",
+            ]
+        )
+    elif audible_target is not None and audible_target < target_duration - 0.0005:
+        filters.extend(
+            [
+                f"apad=whole_dur={target_duration:.6f}",
+                f"atrim=duration={target_duration:.6f}",
+                "asetpts=N/SR/TB",
+            ]
+        )
+    return filters
+
+
+def _source_window_filters(
+    start_seconds: float,
+    duration_seconds: float | None,
+) -> list[str]:
+    start = max(float(start_seconds or 0.0), 0.0)
+    duration = (
+        max(float(duration_seconds), 0.0)
+        if duration_seconds is not None
+        else None
+    )
+    if start <= 0.0005 and (duration is None or duration <= 0.0005):
+        return []
+    parts = [f"atrim=start={start:.6f}"]
+    if duration is not None and duration > 0.0005:
+        parts[0] += f":duration={duration:.6f}"
+    parts.append("asetpts=N/SR/TB")
+    return parts
 
 
 def _exact_duration_filters(target_duration: float, *, fade: bool, loop_fill: bool = False) -> list[str]:
@@ -1862,6 +2206,26 @@ def _resolve_material_text_hints(count: int, hints: Sequence[str] | None) -> lis
     return [str(hint or "") for hint in hints]
 
 
+def _resolve_explicit_audible_target_durations(
+    targets: Sequence[float],
+    audible_targets: Sequence[float | None] | None,
+) -> list[float | None]:
+    if audible_targets is None or len(audible_targets) != len(targets):
+        return [None for _ in targets]
+    return [
+        None
+        if value is None
+        else min(max(float(value), MIN_MATERIAL_TARGET_DURATION_SECONDS), target)
+        for value, target in zip(audible_targets, targets)
+    ]
+
+
+def _resolve_pre_silence_seconds(count: int, values: Sequence[float] | None) -> list[float]:
+    if values is None or len(values) != count:
+        return [0.0 for _ in range(count)]
+    return [max(float(value or 0.0), 0.0) for value in values]
+
+
 def _resolve_stretch_strategy(
     requested_tempo: float,
     text_hint: str,
@@ -1882,6 +2246,110 @@ def _resolve_stretch_strategy(
     if requested_tempo < RUBBERBAND_MIN_TEMPO:
         return RUBBERBAND_MIN_TEMPO, "rubberband_max_expansion_ceiling"
     return requested_tempo, "rubberband_full_clip"
+
+
+def _resolve_audible_target_duration(
+    source_duration: float | None,
+    target_duration: float | None,
+    text_hint: str,
+) -> float | None:
+    """Limit extreme short-label expansion while preserving the timeline slot."""
+    if target_duration is None:
+        return None
+    target = max(float(target_duration), MIN_MATERIAL_TARGET_DURATION_SECONDS)
+    if source_duration is None or source_duration <= 0 or target <= source_duration:
+        return target
+    if not _is_short_material_text(text_hint):
+        return target
+
+    safe_expansion = min(
+        source_duration * MATERIAL_SHORT_TEXT_MAX_AUDIBLE_EXPANSION_RATIO,
+        source_duration + MATERIAL_SHORT_TEXT_MAX_AUDIBLE_EXTENSION_SECONDS,
+    )
+    return min(target, max(source_duration, safe_expansion))
+
+
+def _source_window_for_render(
+    path: Path,
+    source_duration: float,
+    target_duration: float,
+    text_hint: str,
+) -> tuple[float, float | None]:
+    if (
+        source_duration <= 0
+        or target_duration <= MIN_MATERIAL_TARGET_DURATION_SECONDS
+        or not _is_short_material_text(text_hint)
+        or source_duration / target_duration < MATERIAL_SHORT_TEXT_SOURCE_WINDOW_TRIM_RATIO
+    ):
+        return 0.0, None
+
+    active_start, active_end = _detect_active_audio_window(path, source_duration)
+    active_duration = max(active_end - active_start, 0.0)
+    if active_duration <= target_duration + 0.0005:
+        return active_start, active_duration if active_start > 0.0005 else None
+
+    window_duration = min(
+        active_duration,
+        max(
+            target_duration * MATERIAL_SHORT_TEXT_SOURCE_WINDOW_RENDER_RATIO,
+            target_duration,
+            MIN_MATERIAL_TARGET_DURATION_SECONDS,
+        ),
+    )
+    if window_duration >= source_duration - 0.0005 and active_start <= 0.0005:
+        return 0.0, None
+    return active_start, window_duration
+
+
+def _detect_active_audio_window(path: Path, fallback_duration: float) -> tuple[float, float]:
+    pcm = _read_pcm_wave_mono(path)
+    if pcm is None:
+        return 0.0, max(fallback_duration, 0.0)
+    samples, sample_rate = pcm
+    if not samples or sample_rate <= 0:
+        return 0.0, max(fallback_duration, 0.0)
+
+    frame_size = max(int(round(sample_rate * MATERIAL_SOURCE_WINDOW_ANALYSIS_FRAME_SECONDS)), 1)
+    hop_size = max(int(round(sample_rate * MATERIAL_SOURCE_WINDOW_ANALYSIS_HOP_SECONDS)), 1)
+    if len(samples) <= frame_size:
+        return 0.0, len(samples) / sample_rate
+
+    rms_values: list[float] = []
+    frame_starts: list[int] = []
+    for start in range(0, len(samples) - frame_size + 1, hop_size):
+        frame = samples[start : start + frame_size]
+        rms_values.append(math.sqrt(sum(sample * sample for sample in frame) / len(frame)))
+        frame_starts.append(start)
+    if not rms_values:
+        return 0.0, len(samples) / sample_rate
+
+    peak = max(rms_values)
+    if peak <= 0:
+        return 0.0, len(samples) / sample_rate
+    threshold = max(
+        MATERIAL_SOURCE_WINDOW_ANALYSIS_ABSOLUTE_FLOOR,
+        peak * (10 ** (-MATERIAL_SOURCE_WINDOW_ANALYSIS_RELATIVE_DB / 20.0)),
+    )
+    active_indices = [
+        index for index, rms in enumerate(rms_values)
+        if rms >= threshold
+    ]
+    if not active_indices:
+        return 0.0, len(samples) / sample_rate
+
+    start_frame = frame_starts[active_indices[0]]
+    end_frame = min(frame_starts[active_indices[-1]] + frame_size, len(samples))
+    start_seconds = max(
+        start_frame / sample_rate - MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS,
+        0.0,
+    )
+    end_seconds = min(
+        end_frame / sample_rate + MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS,
+        len(samples) / sample_rate,
+    )
+    if end_seconds <= start_seconds:
+        return 0.0, len(samples) / sample_rate
+    return start_seconds, end_seconds
 
 
 def _is_short_material_text(text: str) -> bool:
@@ -1953,6 +2421,20 @@ def _material_render_cache_key(clip: MaterialStretchClip, options: ProcessOption
         "source_mtime_ns": stat.st_mtime_ns,
         "source_duration_seconds": round(clip.source_duration_seconds, 9),
         "target_duration_seconds": round(clip.target_duration_seconds, 9),
+        "audible_target_duration_seconds": round(
+            clip.audible_target_duration_seconds
+            if clip.audible_target_duration_seconds is not None
+            else clip.target_duration_seconds,
+            9,
+        ),
+        "pre_silence_seconds": round(clip.pre_silence_seconds, 9),
+        "post_silence_seconds": round(clip.post_silence_seconds, 9),
+        "source_window_start_seconds": round(clip.source_window_start_seconds, 9),
+        "source_window_duration_seconds": (
+            round(clip.source_window_duration_seconds, 9)
+            if clip.source_window_duration_seconds is not None
+            else None
+        ),
         "rubberband_tempo": round(clip.tempo, 10),
         "requested_rubberband_tempo": round(clip.requested_tempo if clip.requested_tempo is not None else clip.tempo, 10),
         "stretch_strategy": clip.stretch_strategy,
@@ -2186,6 +2668,57 @@ def _probe_wav_with_stdlib(path: Path) -> dict[str, Any] | None:
         "format": {"format_name": "wav", "duration": duration_text},
         "probe_fallback": "python_wave",
     }
+
+
+def _read_pcm_wave_mono(path: Path) -> tuple[list[float], int] | None:
+    if path.suffix.lower() != ".wav":
+        return None
+    try:
+        with wave.open(str(path), "rb") as handle:
+            channels = handle.getnchannels()
+            sample_rate = handle.getframerate()
+            sample_width = handle.getsampwidth()
+            frames = handle.readframes(handle.getnframes())
+    except (EOFError, OSError, wave.Error):
+        return None
+    if channels <= 0 or sample_rate <= 0 or not frames:
+        return None
+
+    samples: list[float]
+    if sample_width == 1:
+        values = array("B")
+        values.frombytes(frames)
+        samples = [(value - 128) / 128.0 for value in values]
+    elif sample_width == 2:
+        values = array("h")
+        values.frombytes(frames)
+        if sys.byteorder != "little":
+            values.byteswap()
+        samples = [value / 32768.0 for value in values]
+    elif sample_width == 3:
+        samples = []
+        for offset in range(0, len(frames) - 2, 3):
+            value = int.from_bytes(
+                frames[offset : offset + 3],
+                byteorder="little",
+                signed=True,
+            )
+            samples.append(value / 8388608.0)
+    elif sample_width == 4:
+        values = array("i")
+        values.frombytes(frames)
+        if sys.byteorder != "little":
+            values.byteswap()
+        samples = [value / 2147483648.0 for value in values]
+    else:
+        return None
+
+    if channels == 1:
+        return samples, sample_rate
+    mono: list[float] = []
+    for offset in range(0, len(samples) - channels + 1, channels):
+        mono.append(sum(samples[offset : offset + channels]) / channels)
+    return mono, sample_rate
 
 
 def _probe_audio_with_ffmpeg_stderr(path: Path) -> dict[str, Any] | None:

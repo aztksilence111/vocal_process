@@ -1635,3 +1635,25 @@ Evidence:
 3. Rendered smoke output preserved requested durations for `chi.wav`, `bo.wav`, and `shi.wav`.
 4. The autonomous full rendered suite was stopped during SpeechBrain initialization before any compatible case completed. Its partial summary must not be used to claim an ordering or listening-quality improvement.
 5. The feature branch and commit are pushed as `codex/adaptive-signalsmith-stretch` / `b46f0ee`; promotion to `main` remains pending full rendered evaluation and human listening review.
+
+### Tempo-Safe Audible Slots And Source Windows
+
+This continuation addresses a rendering defect that directly affected pronunciation timing and listenability: a duration slot can include real reference silence, but stretching the source clip to fill that entire slot causes the syllable body and vowel to absorb silence that should remain silent.
+
+Architecture changes:
+
+1. Keep the complete timeline slot, audible target duration, pre-silence, and post-silence as separate values. The renderer stretches only the audible target and pads to the complete slot afterward.
+2. When reference segments have absolute timing, preserve gaps between segments as explicit silence assigned to adjacent clip slots. This keeps the concatenated output aligned with reference time without making a short syllable unnaturally long.
+3. For short labeled material under compression, detect the active PCM window, trim inactive lead/tail audio, and calculate render tempo from the trimmed source window. The source window is part of cache identity and DAW/timeline diagnostics.
+4. Do not use Signalsmith vowel-core regions on a trimmed source window until the backend accepts an explicit time offset or receives re-based acoustic boundaries. Planning intentionally selects regular Rubber Band for that case so declared backend metadata matches the executed path.
+
+Validation evidence:
+
+1. Full regression suite passed with 172 tests, along with `compileall`, runtime checks, and diff validation.
+2. Synthetic and real single-material FFmpeg smokes demonstrated exact output duration, source-window compression, bounded audible expansion, and preserved post-silence.
+3. The real `chickenOTTO/shi.wav` smoke compressed to `0.100000s` through a `0.120s` source window using Rubber Band. Its expanded `2.000000s` slot used Signalsmith only for the `0.535192s` audible region and left about `1.465s` as measured trailing silence.
+
+Residual risk and promotion gate:
+
+1. These tests validate duration and silence semantics, not end-to-end order quality or subjective continuity across a full song.
+2. Before `main` promotion, run a rendered real-eval on compatible corpus cases and manually inspect the generated audio. Compare `stretch_quality_score`, `stretch_naturalness_score`, `continuity_warning_ratio`, match ordering metrics, and worst group regressions without relaxing strict thresholds.

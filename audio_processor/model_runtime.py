@@ -144,6 +144,9 @@ class OrderingDecision:
     phonetic_tone_position: int | None = None
     phonetic_tone_position_count: int = 0
     target_duration_seconds: float | None = None
+    target_audible_duration_seconds: float | None = None
+    target_pre_silence_seconds: float = 0.0
+    target_post_silence_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -154,6 +157,9 @@ class ModelOrderingResult:
     target_durations: tuple[float | None, ...]
     decisions: tuple[OrderingDecision, ...]
     analysis_report: dict[str, Any]
+    target_audible_durations: tuple[float | None, ...] = ()
+    target_pre_silences: tuple[float, ...] = ()
+    target_post_silences: tuple[float, ...] = ()
 
 
 DEFAULT_ASR_MODEL = os.environ.get("VOCAL_PROCESS_ASR_MODEL", "base")
@@ -786,6 +792,18 @@ def build_model_ordering(
         reference_segments,
         decisions,
         reference_duration=reference_duration_for(reference.source_path),
+        preserve_positioned_active_total=_has_absolute_segment_timing(reference_segments),
+    )
+    (
+        target_durations,
+        target_audible_durations,
+        target_pre_silences,
+        target_post_silences,
+    ) = _target_timeline_slots_for_decisions(
+        reference_segments,
+        decisions,
+        target_durations,
+        reference_duration=reference_duration_for(reference.source_path),
     )
 
     report = {
@@ -826,6 +844,9 @@ def build_model_ordering(
                 "material_text": decision.material_text,
                 "reason": decision.reason,
                 "target_duration_seconds": target_durations[index],
+                "target_audible_duration_seconds": target_audible_durations[index],
+                "target_pre_silence_seconds": target_pre_silences[index],
+                "target_post_silence_seconds": target_post_silences[index],
             }
             for index, decision in enumerate(decisions)
         ],
@@ -833,6 +854,9 @@ def build_model_ordering(
             reference_segments,
             decisions,
             target_durations,
+            target_audible_durations=target_audible_durations,
+            target_pre_silences=target_pre_silences,
+            target_post_silences=target_post_silences,
         ),
         "backend_summary": backend_summary,
         "notes": notes,
@@ -868,10 +892,16 @@ def build_model_ordering(
                 material_text=decision.material_text,
                 reason=decision.reason,
                 target_duration_seconds=target_durations[index],
+                target_audible_duration_seconds=target_audible_durations[index],
+                target_pre_silence_seconds=target_pre_silences[index],
+                target_post_silence_seconds=target_post_silences[index],
             )
             for index, decision in enumerate(decisions)
         ),
         analysis_report=report,
+        target_audible_durations=target_audible_durations,
+        target_pre_silences=target_pre_silences,
+        target_post_silences=target_post_silences,
     )
 
 
@@ -3245,6 +3275,7 @@ def _target_durations_for_decisions(
     decisions: Sequence[MaterialOrderDecision],
     *,
     reference_duration: float,
+    preserve_positioned_active_total: bool = False,
 ) -> tuple[float | None, ...]:
     if not decisions:
         return ()
@@ -3254,6 +3285,11 @@ def _target_durations_for_decisions(
     positioned_targets = _positioned_target_durations(reference_segments, decisions)
     if positioned_targets and any(target is not None for target in positioned_targets):
         if _can_preserve_positioned_target_durations(reference_segments, decisions, positioned_targets):
+            if preserve_positioned_active_total:
+                return tuple(
+                    float(target) if target is not None else None
+                    for target in positioned_targets
+                )
             if _can_preserve_positioned_target_total(
                 reference_segments,
                 positioned_targets,
@@ -3318,10 +3354,136 @@ def _target_durations_for_decisions(
     return _weighted_target_durations(decisions, reference_duration=reference_duration)
 
 
+def _target_timeline_slots_for_decisions(
+    reference_segments: Sequence[VoiceSegment],
+    decisions: Sequence[MaterialOrderDecision],
+    active_target_durations: Sequence[float | None],
+    *,
+    reference_duration: float,
+) -> tuple[
+    tuple[float | None, ...],
+    tuple[float | None, ...],
+    tuple[float, ...],
+    tuple[float, ...],
+]:
+    """Separate voiced segment time from absolute inter-segment silence."""
+    if (
+        not decisions
+        or len(active_target_durations) != len(decisions)
+        or not _has_absolute_segment_timing(reference_segments)
+    ):
+        active = tuple(active_target_durations)
+        audible = tuple(active_target_durations)
+        zeros = tuple(0.0 for _ in decisions)
+        return active, audible, zeros, zeros
+
+    pre_silences = [0.0 for _ in decisions]
+    groups: dict[int, list[tuple[int, MaterialOrderDecision]]] = {}
+    for decision_index, decision in enumerate(decisions):
+        segment_index = decision.reference_segment_index
+        if segment_index is None or not 0 <= segment_index < len(reference_segments):
+            continue
+        groups.setdefault(segment_index, []).append((decision_index, decision))
+    if not groups:
+        active = tuple(active_target_durations)
+        audible = tuple(active_target_durations)
+        zeros = tuple(0.0 for _ in decisions)
+        return active, audible, zeros, zeros
+
+    pending_silence = 0.0
+    cursor = 0.0
+    last_decision_index: int | None = None
+    for segment_index, segment in enumerate(reference_segments):
+        segment_start = max(float(segment.start_seconds), cursor)
+        pending_silence += max(segment_start - cursor, 0.0)
+        group = groups.get(segment_index, [])
+        if group:
+            ordered_group = sorted(
+                group,
+                key=lambda item: (_decision_position(item[1]) or 0, item[1].rank),
+            )
+            first_index = ordered_group[0][0]
+            pre_silences[first_index] += pending_silence
+            pending_silence = 0.0
+            last_decision_index = ordered_group[-1][0]
+        else:
+            pending_silence += max(float(segment.end_seconds) - segment_start, 0.0)
+        cursor = max(cursor, float(segment.end_seconds))
+
+    post_silences = [0.0 for _ in decisions]
+    post_silence = max(reference_duration - cursor, 0.0)
+    if last_decision_index is not None:
+        post_silences[last_decision_index] += post_silence
+
+    active_values = [float(duration or 0.0) for duration in active_target_durations]
+    positioned_indices = {
+        decision_index
+        for group in groups.values()
+        for decision_index, _decision in group
+    }
+    active_reference_duration = sum(
+        max(float(segment.end_seconds) - float(segment.start_seconds), 0.0)
+        for segment_index, segment in enumerate(reference_segments)
+        if segment_index in groups
+    )
+    positioned_active_total = sum(active_values[index] for index in positioned_indices)
+    if (
+        active_reference_duration > 0
+        and positioned_active_total > active_reference_duration + 0.000001
+    ):
+        positioned_order = sorted(positioned_indices)
+        positioned_values = _fit_target_durations_to_total(
+            [active_values[index] for index in positioned_order],
+            active_reference_duration,
+        )
+        for index, value in zip(positioned_order, positioned_values):
+            active_values[index] = value
+    audible = tuple(
+        value if duration is not None else None
+        for value, duration in zip(active_values, active_target_durations)
+    )
+    slots = [
+        (float(audible[index] or 0.0) if audible[index] is not None else 0.0)
+        + pre_silences[index]
+        + post_silences[index]
+        if duration is not None
+        else None
+        for index, duration in enumerate(audible)
+    ]
+
+    slot_total = sum(float(duration or 0.0) for duration in slots)
+    residual = reference_duration - slot_total
+    if last_decision_index is not None and abs(residual) > 0.000001:
+        post_silences[last_decision_index] = max(
+            post_silences[last_decision_index] + residual,
+            0.0,
+        )
+        slots[last_decision_index] = (
+            float(audible[last_decision_index] or 0.0)
+            + pre_silences[last_decision_index]
+            + post_silences[last_decision_index]
+        )
+
+    return tuple(slots), audible, tuple(pre_silences), tuple(post_silences)
+
+
+def _has_absolute_segment_timing(reference_segments: Sequence[VoiceSegment]) -> bool:
+    return any(
+        segment.duration_seconds > 0
+        and str(segment.timing_source or "").strip()
+        and str(segment.timing_source or "") not in {"lyrics_sequence"}
+        for segment in reference_segments
+    )
+
+
 def _render_timeline_alignment_summary(
     reference_segments: Sequence[VoiceSegment],
     decisions: Sequence[MaterialOrderDecision],
     target_durations: Sequence[float | None],
+    *,
+    target_audible_durations: Sequence[float | None] | None = None,
+    target_pre_silences: Sequence[float] | None = None,
+    target_post_silences: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     positioned_decisions = [
         decision
@@ -3333,7 +3495,14 @@ def _render_timeline_alignment_summary(
         for segment_index, count in _positioned_decision_count_by_segment(decisions).items()
         if count > 1
     )
-    decision_details = _render_timeline_alignment_details(reference_segments, decisions, target_durations)
+    decision_details = _render_timeline_alignment_details(
+        reference_segments,
+        decisions,
+        target_durations,
+        target_audible_durations=target_audible_durations,
+        target_pre_silences=target_pre_silences,
+        target_post_silences=target_post_silences,
+    )
     timed_target_duration_count = sum(
         1 for detail in decision_details if detail.get("target_duration_source") == "aligned_unit_timing"
     )
@@ -3348,6 +3517,22 @@ def _render_timeline_alignment_summary(
         "resolved_target_duration_count": sum(1 for duration in target_durations if duration is not None),
         "timed_target_duration_count": timed_target_duration_count,
         "target_duration_total_seconds": sum(float(duration or 0.0) for duration in target_durations),
+        "target_audible_duration_total_seconds": sum(
+            float(duration or 0.0)
+            for duration in (
+                target_audible_durations
+                if target_audible_durations is not None
+                else target_durations
+            )
+        ),
+        "target_pre_silence_total_seconds": sum(
+            float(value or 0.0)
+            for value in (target_pre_silences if target_pre_silences is not None else ())
+        ),
+        "target_post_silence_total_seconds": sum(
+            float(value or 0.0)
+            for value in (target_post_silences if target_post_silences is not None else ())
+        ),
         "phonetic_positioned_decision_count": sum(
             1 for decision in decisions if decision.phonetic_position is not None
         ),
@@ -3369,6 +3554,10 @@ def _render_timeline_alignment_details(
     reference_segments: Sequence[VoiceSegment],
     decisions: Sequence[MaterialOrderDecision],
     target_durations: Sequence[float | None],
+    *,
+    target_audible_durations: Sequence[float | None] | None = None,
+    target_pre_silences: Sequence[float] | None = None,
+    target_post_silences: Sequence[float] | None = None,
 ) -> list[dict[str, Any]]:
     details: list[dict[str, Any] | None] = [None for _ in decisions]
     groups: dict[int, list[tuple[int, MaterialOrderDecision]]] = {}
@@ -3417,6 +3606,29 @@ def _render_timeline_alignment_details(
                 resampled=lattice_resampled,
             )
             target_duration = target_durations[decision_index]
+            audible_duration = (
+                target_audible_durations[decision_index]
+                if target_audible_durations is not None
+                and decision_index < len(target_audible_durations)
+                else target_duration
+            )
+            pre_silence = (
+                target_pre_silences[decision_index]
+                if target_pre_silences is not None
+                and decision_index < len(target_pre_silences)
+                else 0.0
+            )
+            post_silence = (
+                target_post_silences[decision_index]
+                if target_post_silences is not None
+                and decision_index < len(target_post_silences)
+                else max(
+                    float(target_duration or 0.0)
+                    - float(audible_duration or 0.0)
+                    - float(pre_silence or 0.0),
+                    0.0,
+                )
+            )
             language_hint = decision.language_hint or segment.language_hint
             reference_text_units = list(_timeline_units(segment.text, language_hint=language_hint))
             reference_phonetic_units = list(_phonetic_units(segment.text, language_hint=language_hint))
@@ -3456,6 +3668,9 @@ def _render_timeline_alignment_details(
                     timed_span.end_seconds if timed_span is not None else None
                 ),
                 "target_duration_seconds": target_duration,
+                "target_audible_duration_seconds": audible_duration,
+                "target_pre_silence_seconds": pre_silence,
+                "target_post_silence_seconds": post_silence,
                 "target_duration_source": (
                     timed_span.timing_source if timed_span is not None else "proportional_segment_split"
                 ),
@@ -3515,6 +3730,24 @@ def _render_timeline_alignment_details(
             "target_start_seconds": None,
             "target_end_seconds": None,
             "target_duration_seconds": target_durations[decision_index],
+            "target_audible_duration_seconds": (
+                target_audible_durations[decision_index]
+                if target_audible_durations is not None
+                and decision_index < len(target_audible_durations)
+                else target_durations[decision_index]
+            ),
+            "target_pre_silence_seconds": (
+                target_pre_silences[decision_index]
+                if target_pre_silences is not None
+                and decision_index < len(target_pre_silences)
+                else 0.0
+            ),
+            "target_post_silence_seconds": (
+                target_post_silences[decision_index]
+                if target_post_silences is not None
+                and decision_index < len(target_post_silences)
+                else 0.0
+            ),
             "target_duration_source": "weighted_duration",
             "aligned_unit_count": 0,
             "expected_unit_count": 0,
