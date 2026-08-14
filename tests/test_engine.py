@@ -278,6 +278,7 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         filters = args[args.index("-af") + 1]
         self.assertIn("rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
+        self.assertIn("channels=together", filters)
         self.assertIn("apad=whole_dur=2.000000", filters)
         self.assertIn("atrim=duration=2.000000", filters)
         self.assertIn("afade=t=in:st=0:d=0.010000", filters)
@@ -1530,6 +1531,95 @@ class RealEvalTests(unittest.TestCase):
         self.assertIn("Boundary Risks", markdown)
         self.assertIn("Timed", markdown)
         self.assertIn("Strict Pass", markdown)
+
+    def test_real_eval_output_root_separates_audio_reports_and_cache(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzCN"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            reference_path = origin / "song_CN.wav"
+            _write_test_wave(reference_path, duration_seconds=4.0)
+            _write_test_wave(material_root / "wo.wav", duration_seconds=1.0)
+
+            preflight_report = {
+                "status": "ok",
+                "summary": {
+                    "material_count": 1,
+                    "warning_count": 0,
+                    "error_warning_count": 0,
+                    "review_required_match_count": 0,
+                    "minimum_match_score": 0.9,
+                    "extreme_stretch_count": 0,
+                    "moderate_stretch_count": 0,
+                },
+                "warnings": [],
+                "ordering": {
+                    "ordering": [{"rank": 1, "score": 0.9, "confidence_label": "strong"}],
+                    "timeline_alignment": {
+                        "decision_count": 1,
+                        "positioned_decision_count": 1,
+                        "resolved_target_duration_count": 1,
+                        "timed_target_duration_count": 1,
+                        "target_duration_total_seconds": 4.0,
+                    },
+                },
+                "stretch_plan": [
+                    {
+                        "target_duration_seconds": 4.0,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.95,
+                        "continuity_warning": "",
+                    }
+                ],
+            }
+            captured = {}
+
+            def fake_run_batch_queue(
+                items: list[QueueItem],
+                settings: ProcessingSettings,
+                **kwargs: object,
+            ) -> BatchSummary:
+                del kwargs
+                captured["settings"] = settings
+                captured["output_path"] = items[0].output_path
+                _write_test_wave(items[0].output_path, duration_seconds=4.0)
+                return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+            with patch("audio_processor.real_eval.build_preflight_report", return_value=preflight_report):
+                with patch("audio_processor.real_eval.run_batch_queue", side_effect=fake_run_batch_queue):
+                    with patch(
+                        "audio_processor.real_eval.probe_audio",
+                        return_value={"streams": [{"codec_type": "audio", "duration": "4.0"}], "format": {}},
+                    ):
+                        result = real_eval.run_real_suite(
+                            root,
+                            render=True,
+                            source_separation="never",
+                            output_root=root / "output",
+                        )
+
+        settings = captured["settings"]
+        output_path = captured["output_path"]
+        self.assertEqual(result.report_directory.parent, root / "output" / "reports")
+        self.assertEqual(output_path, root / "output" / "audio" / "song_CN" / "vmzCN" / "song_CN.wav")
+        self.assertEqual(
+            Path(settings.render_cache_directory),
+            root / "output" / "cache" / "song_CN" / "vmzCN",
+        )
+        self.assertEqual(
+            Path(settings.diagnostics_directory),
+            result.report_directory / "cases" / "song_CN__vmzCN" / "render",
+        )
+        self.assertEqual(
+            result.cases[0].analysis_report_path,
+            result.report_directory / "cases" / "song_CN__vmzCN" / "analysis.json",
+        )
+        self.assertEqual(
+            result.cases[0].render_report_path,
+            result.report_directory / "cases" / "song_CN__vmzCN" / "render" / "song_CN.diagnostics.jsonl",
+        )
 
     def test_real_eval_render_failed_validation_ignores_stale_output_duration(self) -> None:
         with TemporaryDirectory() as temp_dir:

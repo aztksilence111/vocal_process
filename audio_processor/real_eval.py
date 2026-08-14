@@ -100,7 +100,7 @@ def discover_real_cases_with_skips(
 
     origin_root = root / "origin_vocal"
     material_root = root / "material_set"
-    output_root = root / "output"
+    output_root = root / "output" / "audio"
     references = list_audio_files(origin_root) if origin_root.exists() else []
     material_dirs = [path for path in sorted(material_root.iterdir()) if path.is_dir()] if material_root.exists() else []
     if material_root.exists() and not material_dirs and list_audio_files(material_root):
@@ -126,6 +126,76 @@ def discover_real_cases_with_skips(
     return _filter_language_compatible_cases(cases)
 
 
+def _real_eval_suite_root(root: Path, output_root: Path | None) -> Path:
+    if output_root is None:
+        return root.expanduser() / "output"
+    resolved = output_root.expanduser()
+    if resolved.name.lower() == "reports":
+        return resolved.parent
+    return resolved
+
+
+def _real_eval_report_root(root: Path, output_root: Path | None) -> Path:
+    if output_root is not None and output_root.expanduser().name.lower() == "reports":
+        return output_root.expanduser()
+    return _real_eval_suite_root(root, output_root) / "reports"
+
+
+def _real_eval_audio_root(root: Path, output_root: Path | None) -> Path:
+    return _real_eval_suite_root(root, output_root) / "audio"
+
+
+def _real_eval_cache_root(root: Path, output_root: Path | None) -> Path:
+    return _real_eval_suite_root(root, output_root) / "cache"
+
+
+def _case_report_directory(report_directory: Path, case: RealCase | SkippedRealCase) -> Path:
+    return report_directory / "cases" / case.name
+
+
+def _real_eval_case_cache_directory(root: Path, output_root: Path | None, case: RealCase) -> Path:
+    return _real_eval_cache_root(root, output_root) / case.reference_path.stem / case.material_directory.name
+
+
+def _rebase_case_output_directories(
+    cases: Sequence[RealCase],
+    audio_root: Path,
+) -> list[RealCase]:
+    return [
+        RealCase(
+            name=case.name,
+            reference_path=case.reference_path,
+            material_directory=case.material_directory,
+            lyrics_file=case.lyrics_file,
+            output_directory=audio_root / case.reference_path.stem / case.material_directory.name,
+            split=case.split,
+            language=case.language,
+            expected_order=case.expected_order,
+        )
+        for case in cases
+    ]
+
+
+def _rebase_skipped_case_output_directories(
+    cases: Sequence[SkippedRealCase],
+    audio_root: Path,
+) -> list[SkippedRealCase]:
+    return [
+        SkippedRealCase(
+            name=case.name,
+            reference_path=case.reference_path,
+            material_directory=case.material_directory,
+            lyrics_file=case.lyrics_file,
+            output_directory=audio_root / case.reference_path.stem / case.material_directory.name,
+            split=case.split,
+            language=case.language,
+            reason=case.reason,
+            language_compatibility=case.language_compatibility,
+        )
+        for case in cases
+    ]
+
+
 def run_real_suite(
     root: Path,
     *,
@@ -143,6 +213,10 @@ def run_real_suite(
     root = root.expanduser()
     cancel_checker = _combined_cancel_checker(should_cancel, stop_file)
     cases, skipped_cases = discover_real_cases_with_skips(root, manifest_path=manifest_path)
+    if manifest_path is None:
+        audio_root = _real_eval_audio_root(root, output_root)
+        cases = _rebase_case_output_directories(cases, audio_root)
+        skipped_cases = _rebase_skipped_case_output_directories(skipped_cases, audio_root)
     if case_filter:
         lowered = case_filter.lower()
         cases = [case for case in cases if lowered in case.name.lower()]
@@ -155,7 +229,7 @@ def run_real_suite(
         cases = cases[: max(0, max_cases)]
 
     timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-    report_directory = (output_root or (root / "output")).expanduser() / f"real-eval-{timestamp}"
+    report_directory = _real_eval_report_root(root, output_root) / f"real-eval-{timestamp}"
     report_directory.mkdir(parents=True, exist_ok=True)
     summary_path = report_directory / "summary.json"
     markdown_path = report_directory / "summary.md"
@@ -189,15 +263,16 @@ def run_real_suite(
             break
 
         case.output_directory.mkdir(parents=True, exist_ok=True)
-        analysis_path = report_directory / case.name / "analysis.json"
+        case_report_directory = _case_report_directory(report_directory, case)
+        analysis_path = case_report_directory / "analysis.json"
         analysis_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             report = build_preflight_report(
                 case.reference_path,
                 case.material_directory,
                 lyrics_file=case.lyrics_file,
-                work_dir=case.output_directory / "_work",
-                material_cache_dir=case.output_directory / "_analysis_cache",
+                work_dir=case_report_directory / "work",
+                material_cache_dir=case_report_directory / "material-analysis-cache",
                 compute_device=compute_device,
                 source_separation=source_separation,
                 should_cancel=cancel_checker,
@@ -267,7 +342,7 @@ def run_real_suite(
             if _report_has_infrastructure_blocker(report):
                 for blocked_case in cases[case_index + 1 :]:
                     blocked_case.output_directory.mkdir(parents=True, exist_ok=True)
-                    blocked_analysis_path = report_directory / blocked_case.name / "analysis.json"
+                    blocked_analysis_path = _case_report_directory(report_directory, blocked_case) / "analysis.json"
                     blocked_analysis_path.parent.mkdir(parents=True, exist_ok=True)
                     blocked_report = _case_blocked_report(
                         blocked_case,
@@ -320,9 +395,11 @@ def run_real_suite(
                 overwrite=True,
                 compute_device=compute_device,
                 source_separation=source_separation,
+                render_cache_directory=str(_real_eval_case_cache_directory(root, output_root, case)),
+                diagnostics_directory=str(case_report_directory / "render"),
             )
             render_output_path = settings.output_path_for(case.reference_path)
-            render_report_path = diagnostic_log_path(render_output_path)
+            render_report_path = diagnostic_log_path(render_output_path, case_report_directory / "render")
             try:
                 if _should_cancel(cancel_checker):
                     raise AudioProcessorError("Processing cancelled")
@@ -706,7 +783,7 @@ def _append_cancelled_case_results(
 ) -> None:
     for case in cases:
         case.output_directory.mkdir(parents=True, exist_ok=True)
-        analysis_path = report_directory / case.name / "analysis.json"
+        analysis_path = _case_report_directory(report_directory, case) / "analysis.json"
         analysis_path.parent.mkdir(parents=True, exist_ok=True)
         report = _case_cancelled_report(case, "Real-eval cancellation requested before this case started.")
         _write_json_atomic(analysis_path, report)

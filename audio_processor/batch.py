@@ -74,7 +74,12 @@ def run_batch_queue(
             cancelled += _mark_remaining_cancelled(items, index, on_item_update)
             break
 
-        diagnostics = DiagnosticLogger(diagnostic_log_path(item.output_path))
+        diagnostics_directory = (
+            Path(settings.diagnostics_directory).expanduser()
+            if settings.diagnostics_directory
+            else None
+        )
+        diagnostics = DiagnosticLogger(diagnostic_log_path(item.output_path, diagnostics_directory))
         item_started_at = time.monotonic()
         item.status = "Processing"
         item.progress = 0.0
@@ -189,6 +194,11 @@ def run_batch_queue(
                         material_audible_target_durations=ordering.target_audible_durations,
                         material_pre_silence_seconds=ordering.target_pre_silences,
                         material_text_hints=ordered_material_texts,
+                        render_cache_directory=(
+                            Path(settings.render_cache_directory).expanduser()
+                            if settings.render_cache_directory
+                            else None
+                        ),
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                     )

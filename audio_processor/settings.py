@@ -27,6 +27,8 @@ class ProcessingSettings:
     source_separation: str = "auto"
     window_geometry: str = "980x680"
     output_directory: str = ""
+    render_cache_directory: str = ""
+    diagnostics_directory: str = ""
     output_extension: str = ".wav"
     overwrite: bool = True
     trim_start: str | None = None
@@ -83,6 +85,8 @@ class ProcessingSettings:
             source_separation=normalize_source_separation(data.get("source_separation")),
             window_geometry=normalize_window_geometry(data.get("window_geometry")),
             output_directory=str(data.get("output_directory") or defaults.output_directory),
+            render_cache_directory=str(data.get("render_cache_directory") or defaults.render_cache_directory),
+            diagnostics_directory=str(data.get("diagnostics_directory") or defaults.diagnostics_directory),
             output_extension=normalize_extension(
                 str(data.get("output_extension") or defaults.output_extension),
                 fallback=defaults.output_extension,

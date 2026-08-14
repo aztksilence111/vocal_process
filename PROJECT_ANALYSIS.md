@@ -1,5 +1,34 @@
 # Project Analysis
 
+## Latest Update - 2026-08-14 Human Listening Quality Review
+
+Manual listening changes the current diagnosis. The project is no longer blocked by gross render duration drift: the old-code full rendered suite completed `13/13` compatible cases with `render_duration_delta_ratio.mean=0.0`, and its rendered alignment mean reached `0.866752`. The output is now usable as timing evidence, but not yet as listening-quality evidence.
+
+The strict failure remains real. `strict_render_pass_count=0/13`, `match_ordering_score.mean=0.568635`, `stretch_quality_score.mean=0.733137`, `stretch_naturalness_score.mean=0.720577`, and `continuity_warning_ratio.mean=0.309001` show that automated metrics still see material-selection and stretch-risk problems. The user's manual feedback adds failure modes the old metrics under-measure: stereo phase/channel incoherence, repeated consonant attacks during long vowel targets, and unstable formant/timbre preservation.
+
+The durable product contract is now sharper:
+
+1. Timing, ordering, and duration are allowed to change.
+2. Pitch, formants, timbre, and speaker identity should not be intentionally changed.
+3. Stereo material must either be processed coherently as one stereo signal or safely folded to a reviewed mono policy; independent channel stretching is not acceptable for vocal identity.
+4. Consonant/attack/coda material should not be repeatedly stretched as if it were a vowel sustain.
+5. Human review needs separated outputs, reports, diagnostics, and render caches so final audio can be audited without being mixed with scoring artifacts.
+
+Immediate architectural adjustments:
+
+1. Rubber Band filter construction now requests `channels=together`, which directly targets stereo incoherence from independent left/right processing.
+2. The render cache format is bumped to `material_render_filter_v12_stereo_coherent_tiny_direct_trim` so older per-channel cache output is not reused.
+3. Real-eval output roots are split into `audio`, `reports`, and `cache`, with per-case analysis/render diagnostics under the report case directory.
+4. Batch settings now carry explicit render-cache and diagnostics directories so future suites can keep final review WAVs separate from intermediate scoring files.
+
+Next DSP direction:
+
+1. Add diagnostics before larger algorithm changes: stereo correlation/phase coherence, F0 median drift, spectral-envelope or MFCC/formant-envelope drift, and per-boundary transient repetition counters.
+2. Treat consonants and attacks as anchors. Copy or minimally stretch them, and allocate long-duration expansion only to a verified voiced/vowel core.
+3. Avoid independent region resynthesis that reintroduces the same attack more than once. A long vowel target should have one onset, one stable sustain region, and a controlled release.
+4. Use backend policy by clip class: direct trim for tiny audible targets, stereo-coherent Rubber Band for ordinary whole clips, Signalsmith for exact-frame vowel-core stretching only when boundaries and channel handling are reliable.
+5. Keep strict thresholds unchanged. The next acceptance target is not only higher score; it is lower audible formant drift, fewer repeated consonants, and cleaner manual review folders.
+
 ## Latest Update - 2026-08-13 Adaptive Acoustic Boundaries for Signalsmith Stretch
 
 The next Signalsmith quality pass targeted a concrete boundary-allocation defect rather than changing strict acceptance thresholds. The previous implementation used the filename-derived first-vowel span as a hard intersection with the acoustic voiced/F0 span. This made long material clips such as `chi.wav` and `bo.wav` use a fixed short attack and a large core that could include unvoiced or consonant content, increasing the load on extreme core stretching.

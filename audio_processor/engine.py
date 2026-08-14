@@ -133,7 +133,7 @@ MATERIAL_SOURCE_WINDOW_ANALYSIS_HOP_SECONDS = 0.005
 MATERIAL_SOURCE_WINDOW_ANALYSIS_RELATIVE_DB = 32.0
 MATERIAL_SOURCE_WINDOW_ANALYSIS_ABSOLUTE_FLOOR = 0.003
 MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS = 0.025
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v11_tiny_audible_direct_trim"
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v12_stereo_coherent_tiny_direct_trim"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -968,6 +968,7 @@ def assemble_material_to_reference_with_progress(
     material_audible_target_durations: Sequence[float | None] | None = None,
     material_pre_silence_seconds: Sequence[float] | None = None,
     material_text_hints: Sequence[str] | None = None,
+    render_cache_directory: Path | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
 ) -> None:
@@ -997,6 +998,7 @@ def assemble_material_to_reference_with_progress(
             material_audible_target_durations=material_audible_target_durations,
             material_pre_silence_seconds=material_pre_silence_seconds,
             material_text_hints=material_text_hints,
+            render_cache_directory=render_cache_directory,
             reference_duration=reference_duration,
             on_progress=on_progress,
             should_cancel=should_cancel,
@@ -1054,6 +1056,7 @@ def _assemble_material_clips_with_render_cache(
     material_audible_target_durations: Sequence[float | None] | None,
     material_pre_silence_seconds: Sequence[float] | None,
     material_text_hints: Sequence[str] | None,
+    render_cache_directory: Path | None,
     reference_duration: float,
     on_progress: ProgressCallback | None,
     should_cancel: CancelCallback | None,
@@ -1069,7 +1072,11 @@ def _assemble_material_clips_with_render_cache(
         pre_silence_seconds=material_pre_silence_seconds,
         material_text_hints=material_text_hints,
     )
-    cache_root = output_path.parent / ".vocalprocess_render_cache"
+    cache_root = (
+        render_cache_directory.expanduser()
+        if render_cache_directory is not None
+        else output_path.parent / ".vocalprocess_render_cache"
+    )
     cache_root.mkdir(parents=True, exist_ok=True)
     rendered_paths: list[Path] = []
     total_steps = len(clips) + 1
@@ -2020,7 +2027,10 @@ def _exact_duration_filters(target_duration: float, *, fade: bool, loop_fill: bo
 
 
 def _rubberband_filter(tempo: float) -> str:
-    return f"rubberband=tempo={tempo:.8f}:pitch=1:formant=preserved:transients=crisp:phase=laminar"
+    return (
+        f"rubberband=tempo={tempo:.8f}:pitch=1:formant=preserved:"
+        "transients=crisp:phase=laminar:channels=together"
+    )
 
 
 def _resolve_material_target_durations(

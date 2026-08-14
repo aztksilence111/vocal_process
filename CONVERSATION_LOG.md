@@ -1,5 +1,17 @@
 # Conversation Log
 
+## Latest Update - 2026-08-14 Human Listening Review, Stereo Coherence, and Output Layout
+
+1. User completed manual listening review of the latest real rendered audio. The useful progress is that many timelines now align closely enough to the reference start/end/duration targets, which remains the core product goal.
+2. The remaining listening failures are now more specific: some stereo source material is processed incoherently between left/right channels; long vowel stretches can repeat consonant-like attacks; formant/timbre preservation is unstable, with some clips sounding child-like, some too low, and some nearly inaudible.
+3. The project goal is restated: the renderer should change only duration and ordering/timing. It must not intentionally change pitch, formants, timbre, or speaker identity.
+4. The old background full rendered suite `tests_real\output\real-eval-20260814-153841\summary.md` completed `13/13` compatible cases and produced 13 final WAV outputs. It is old-code evidence because it was launched before this round's local changes.
+5. Old-code suite means: `planning_alignment_score=0.822336`, `rendered_audio_alignment_score=0.866752`, `match_ordering_score=0.568635`, `stretch_quality_score=0.733137`, `stretch_naturalness_score=0.720577`, `continuity_warning_ratio=0.309001`, `render_duration_delta_ratio=0.0`, and `strict_render_pass_count=0`.
+6. Initial implementation response: FFmpeg Rubber Band rendering now requests stereo-coherent processing with `channels=together`, and the render-cache format is bumped to avoid reusing older per-channel cache artifacts.
+7. Real-eval output layout is now separated for future runs: final WAVs go under `output\audio\...`, suite reports under `output\reports\real-eval-*`, and intermediate render cache under `output\cache\...`. Per-case analysis and render diagnostics are stored inside the report case directory.
+8. Verification passed locally with `175` unit tests, focused real-eval/output-layout/render diagnostics tests, `compileall`, and `git diff --check` with only the existing CRLF warnings.
+9. Next quality work should add measurable formant/F0/stereo-coherence diagnostics, then adjust stretch policy so consonants/attacks are copied or only minimally stretched while verified vowel cores carry duration changes without repeated boundary attacks.
+
 ## Latest Update - 2026-08-13 Adaptive Acoustic Boundaries for Signalsmith Stretch
 
 1. Continued the HiFiShifter-inspired Signalsmith stretch work on branch `codex/adaptive-signalsmith-stretch` after reading the project recovery context, relevant global memory, and passing `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe`.

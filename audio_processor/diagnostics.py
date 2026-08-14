@@ -45,11 +45,20 @@ class DiagnosticLogger:
         )
 
 
-def diagnostic_log_path(output_path: Path) -> Path:
+def diagnostic_log_path(output_path: Path, directory: Path | None = None) -> Path:
     output = output_path.expanduser()
+    diagnostics_directory = directory.expanduser() if directory is not None else None
     if output.suffix.lower() == ".rpp":
-        return output.parent / "diagnostics.jsonl"
-    return output.with_name(f"{output.stem}.diagnostics.jsonl")
+        return (
+            diagnostics_directory / "diagnostics.jsonl"
+            if diagnostics_directory is not None
+            else output.parent / "diagnostics.jsonl"
+        )
+    return (
+        diagnostics_directory / f"{output.stem}.diagnostics.jsonl"
+        if diagnostics_directory is not None
+        else output.with_name(f"{output.stem}.diagnostics.jsonl")
+    )
 
 
 def _to_jsonable(value: Any) -> Any:
