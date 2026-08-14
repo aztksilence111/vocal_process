@@ -325,6 +325,50 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("atrim=duration=0.014074", filters)
         self.assertNotIn("afade=", filters)
 
+    def test_tiny_audible_material_clip_skips_rubberband_failure_path(self) -> None:
+        args = build_material_clip_args(
+            Path("a1.wav"),
+            Path("clip_tiny_audible.wav"),
+            1.2,
+            ProcessOptions(input_path=Path("a1.wav"), output_path=Path("clip_tiny_audible.wav")),
+            target_duration=13.351413,
+            audible_target_duration=0.011413,
+            pre_silence_seconds=13.34,
+            source_window_duration_seconds=0.013695,
+            source_duration=0.013695,
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertNotIn("rubberband=", filters)
+        self.assertIn("apad=whole_dur=0.011413", filters)
+        self.assertIn("atrim=duration=0.011413", filters)
+        self.assertIn("adelay=delays=13340:all=1", filters)
+        self.assertIn("apad=whole_dur=13.351413", filters)
+
+    def test_tiny_audible_material_plan_reports_direct_trim_strategy(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "a1.wav"
+            _write_test_wave(reference, duration_seconds=13.351413)
+            _write_tone_wave(material, duration_seconds=0.285938)
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[13.351413],
+                audible_target_durations=[0.011413],
+                pre_silence_seconds=[13.34],
+                material_text_hints=["a1"],
+            )
+
+        self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
+        self.assertAlmostEqual(clips[0].audible_target_duration_seconds or 0.0, 0.011413)
+        self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.013695, places=4)
+        rendered = render_material_stretch_plan(clips)
+        self.assertEqual(rendered[0]["formant_preservation"], "direct_trim_no_pitch_shift")
+
     def test_material_assembly_uses_per_clip_stretch_plan(self) -> None:
         with patch(
             "audio_processor.engine.probe_audio",
@@ -539,7 +583,7 @@ class MaterialAssemblyTests(unittest.TestCase):
                 {"format": {"duration": "2.0"}, "streams": []},
                 {"format": {"duration": "0.5"}, "streams": []},
             ],
-        ):
+        ), patch("audio_processor.engine.signalsmith_stretch_available", return_value=True):
             clips = plan_material_stretch_clips(
                 Path("reference.wav"),
                 [Path("shi.wav")],
@@ -3429,7 +3473,7 @@ class ModelRuntimeTests(unittest.TestCase):
                     {"format": {"duration": "2.0"}, "streams": []},
                     {"format": {"duration": "0.5"}, "streams": []},
                 ],
-            ):
+            ), patch("audio_processor.engine.signalsmith_stretch_available", return_value=True):
                 report = preflight.build_preflight_report(Path("reference.wav"), Path("materials"))
 
         self.assertEqual(report["summary"]["continuity_warning_count"], 1)

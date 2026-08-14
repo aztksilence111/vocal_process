@@ -1657,3 +1657,16 @@ Residual risk and promotion gate:
 
 1. These tests validate duration and silence semantics, not end-to-end order quality or subjective continuity across a full song.
 2. Before `main` promotion, run a rendered real-eval on compatible corpus cases and manually inspect the generated audio. Compare `stretch_quality_score`, `stretch_naturalness_score`, `continuity_warning_ratio`, match ordering metrics, and worst group regressions without relaxing strict thresholds.
+
+### Tiny Audible Target Render Failure
+
+The 2026-08-14 rendered run exposed a distinct FFmpeg boundary case. A model plan can reserve a long timeline slot while assigning only a few milliseconds of audible material and the rest as silence. The previous filter builder decided whether to invoke Rubber Band from the complete slot duration, so a 13.695 ms source window was still sent through Rubber Band for an 11.413 ms audible target. FFmpeg returned `-1 (Operation not permitted)` from the filter graph and the batch marked the case as failed.
+
+The renderer now makes the direct-trim decision from the audible target duration. Tiny audible clips bypass Rubber Band and use exact trim/pad plus the existing pre-silence/post-silence slot conditioning. This preserves the timeline contract while avoiding an unsupported Rubber Band input size. Cache identity uses `material_render_filter_v11_tiny_audible_direct_trim`.
+
+Evidence:
+
+1. Exact failing FFmpeg command reproduced the error; the same command without Rubber Band returned zero and produced `13.351417 s`.
+2. The project render entry point produced `13.351417 s` for the real `vmzJP/a1.wav` case.
+3. `.venv311\Scripts\python.exe -m unittest discover` passed all `174` tests.
+4. A real rerun of `1000nenyikiteru_JP__vmzJP` completed with `status=rendered`, output duration `194.155102 s`, and zero new render-error entries in the post-fix time window.

@@ -133,7 +133,7 @@ MATERIAL_SOURCE_WINDOW_ANALYSIS_HOP_SECONDS = 0.005
 MATERIAL_SOURCE_WINDOW_ANALYSIS_RELATIVE_DB = 32.0
 MATERIAL_SOURCE_WINDOW_ANALYSIS_ABSOLUTE_FLOOR = 0.003
 MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS = 0.025
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v10_tempo_safe_source_window"
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_v11_tiny_audible_direct_trim"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -1578,7 +1578,7 @@ def _build_material_clip_filter(
         source_window_start_seconds,
         source_window_duration_seconds,
     )
-    if not _should_direct_trim_tiny_target(target_duration):
+    if not _should_direct_trim_tiny_render_target(target_duration, audible_target_duration):
         filters.append(_rubberband_filter(tempo))
     if audio_filters:
         filters.append(audio_filters)
@@ -1614,7 +1614,7 @@ def _material_post_filters(
         source_window_start_seconds,
         source_window_duration_seconds,
     )
-    if not _should_direct_trim_tiny_target(target_duration):
+    if not _should_direct_trim_tiny_render_target(target_duration, audible_target_duration):
         filters.append(_rubberband_filter(tempo))
     if audio_filters:
         filters.append(audio_filters)
@@ -1922,6 +1922,14 @@ def _has_vowel_core_hint(text: str) -> bool:
 
 def _should_direct_trim_tiny_target(target_duration: float | None) -> bool:
     return target_duration is not None and target_duration <= MATERIAL_RENDER_TINY_TARGET_SECONDS
+
+
+def _should_direct_trim_tiny_render_target(
+    target_duration: float | None,
+    audible_target_duration: float | None,
+) -> bool:
+    render_target = audible_target_duration if audible_target_duration is not None else target_duration
+    return _should_direct_trim_tiny_target(render_target)
 
 
 def _target_duration_filters(target_duration: float, *, loop_fill: bool = False) -> list[str]:

@@ -1556,3 +1556,13 @@ Remaining after this continuation:
 6. Synthetic FFmpeg smoke at `.tmp\tempo-safe-final-smoke` produced a source-window compression clip of `0.200000s` and a `2.000000s` expanded slot with detected silence from about `0.997s` to `2.000s`.
 7. Bounded real-material smoke at `.tmp\tempo-safe-real-material-smoke` used `tests_real\material_set\chickenOTTO\shi.wav`. Compression selected a `0.120s` source window, used Rubber Band, and produced `0.100000s`. Expansion used Signalsmith for a `0.535192s` audible target, retained `1.464808s` post silence, produced `2.000000s`, and detected silence from about `0.53449s` to `2.000s`.
 8. Full rendered real-eval and manual listening review remain required before promotion to `main`; these bounded duration and silence tests are correctness evidence, not final listening-quality acceptance.
+
+### 2026-08-14: Tiny Audible Target Rubber Band Failure
+
+1. The full rendered evaluation completed all 13 compatible cases, but three JP/vmzJP cases reported `render_failed`. The infrastructure blocker remained false; the failures were material clip render failures.
+2. Root cause was reproduced with `vmzJP/a1.wav`: a 13.695 ms source window and 11.413 ms audible target were sent through FFmpeg Rubber Band inside a much longer timeline slot. FFmpeg returned `-1 (Operation not permitted)` and left a partial cache file.
+3. Removing Rubber Band from the exact filter chain reproduced success with a complete 13.351417 s output. The failure was therefore a Rubber Band minimum-input boundary, not an agent-runner, path, permission, or concat failure.
+4. `audio_processor/engine.py` now skips Rubber Band when the audible target is at or below `MATERIAL_RENDER_TINY_TARGET_SECONDS`, even when the full timeline slot is long. The slot still receives exact padding, pre-silence delay, post-silence, and duration correction. The render cache format was bumped to v11.
+5. Added regressions for the long-slot/tiny-audible case, direct-trim planning metadata, and the exact FFmpeg filter shape. Tests also explicitly enable the optional Signalsmith backend where the expected diagnostic wording requires it.
+6. Verification passed with `.venv311`: `174` unit tests, `compileall`, `git diff --check`, a real `process_material_clip_with_progress` render producing `13.351417 s`, and a real-eval rerun of `1000nenyikiteru_JP__vmzJP`.
+7. The rerun produced `status_counts={"rendered":1}`, output `tests_real\output\1000nenyikiteru_JP\vmzJP\1000nenyikiteru_JP.wav`, duration `194.155102 s`, and no new 14:00-hour render error entries. Full-suite strict acceptance and manual listening remain pending.
