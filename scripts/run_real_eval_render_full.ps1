@@ -2,8 +2,12 @@ param(
     [string]$Root = "tests_real",
     [string]$OutputRoot = "tests_real\output",
     [string]$SourceSeparation = "never",
-    [string]$AsrBackend = "funasr",
-    [string]$StopFile = ""
+    [string]$AsrBackend = "whisperx",
+    [string]$Split = "",
+    [string]$Case = "",
+    [int]$MaxCases = 0,
+    [string]$StopFile = "",
+    [switch]$AllowUnverifiedReferenceRender
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,9 +52,24 @@ $realEvalArgs = @(
     "--render",
     "--source-separation",
     $SourceSeparation,
+    "--asr-backend",
+    $AsrBackend,
     "--output-root",
     $OutputRoot
 )
+
+if (-not [string]::IsNullOrWhiteSpace($Split)) {
+    $realEvalArgs += @("--split", $Split)
+}
+if (-not [string]::IsNullOrWhiteSpace($Case)) {
+    $realEvalArgs += @("--case", $Case)
+}
+if ($MaxCases -gt 0) {
+    $realEvalArgs += @("--max-cases", "$MaxCases")
+}
+if ($AllowUnverifiedReferenceRender) {
+    $realEvalArgs += @("--allow-unverified-reference-render")
+}
 
 $effectiveStopFile = $StopFile
 if ([string]::IsNullOrWhiteSpace($effectiveStopFile)) {

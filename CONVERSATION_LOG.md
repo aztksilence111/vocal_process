@@ -1,5 +1,29 @@
 # Conversation Log
 
+## Latest Update - 2026-08-15 Reference Vocal Trust Gate And MGRoid OTO Source Windows
+
+1. User corrected the latest diagnosis: the mismatch was not that the rendered content was unrelated to the material audio, but that it was unrelated to the original/reference vocal content.
+2. Root cause analysis confirmed that `tests_real\lyrics` has no usable truth lyrics/subtitles for this JP case. The reference vocal ASR transcript can therefore hallucinate plausible Japanese text, and the matcher then faithfully orders material against a wrong target string.
+3. Rendered real-eval now blocks formal review audio by default when no verified reference transcript exists. The case reports `render_blocked_unverified_reference_text` and writes no final WAV, instead of producing misleading audio from ASR-only reference text.
+4. An explicit `--allow-unverified-reference-render` / `-AllowUnverifiedReferenceRender` override exists for DSP experiments only. This keeps smoke testing possible while preventing ASR-only reference text from being mistaken for acceptance evidence.
+5. MGRoid `oto.ini` metadata is now used to choose short-material source windows before active-RMS trimming. The lookup avoids decomposing longer labels like `kan` into `ka`, preventing false OTO matches against unrelated short syllables.
+6. Short-CV `atempo` now supports chained FFmpeg filters for high compression/expansion ratios while staying within each filter's supported `0.5..2.0` range. Cache identity is `material_render_filter_mono_atempo_chain_utau_oto_v1`.
+7. Validation passed: `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe`; full `.venv311\Scripts\python.exe -m unittest discover -s tests` with `189` tests; `compileall`; `.venv311\Scripts\python.exe -m audio_processor check`; and `git diff --check` with only existing LF/CRLF warnings.
+8. Strict real rendered gate rerun: `tests_real\output\jp-reference-trust-gate-20260815-rerun\reports\real-eval-20260815-201712\summary.json` returned `render_blocked`, warning `render_blocked_unverified_reference_text`, and produced no audio files under the matching `audio` directory.
+9. A bounded DSP smoke remains available at `.tmp\mgroid-atempo-chain-smoke\ga_chain.wav`: mono, `44100 Hz`, `0.099819 s`, `peak=0.528753`, `jump999=0.083761`, `jumpmax=0.086546`.
+
+## Latest Update - 2026-08-14 JP MGRoid Vocal-Smooth Render Pass
+
+1. User manually reviewed the latest Japanese outputs and reported that Japanese audio remains especially unpleasant; stereo mismatch and formant drift are not solved by the previous `channels=together` change alone.
+2. Added real corpus coverage from the new `tests_real\material_set\MGRoid` material set. It is detected as `JP`, contains 113 WAV files, and produces four JP-compatible evaluation cases: `1000nenyikiteru_JP__MGRoid`, `kamippoina_JP__MGRoid`, `LAB=01_JP__MGRoid`, and `PlasticLove_JP__MGRoid`.
+3. Static open-source review focused on HiFiShifter, Rubber Band, Signalsmith Stretch, SoundTouch, and WORLD. Relevant findings: Rubber Band/SoundTouch both warn against independent stereo-channel processing for coherent stereo; Rubber Band R3/Finer and smoother transient/window settings are more appropriate for vocals; Signalsmith documents that time-stretching sounds best for modest changes around `0.75x..1.5x`; WORLD provides F0/spectral-envelope analysis/synthesis but would be a larger vocoder migration.
+4. Rendering policy changed for short vocal material: large short-label vowel-core expansion no longer defaults to Signalsmith, because that path can exceed Signalsmith's clean-stretch comfort range and does not expose the formant-base controls needed for this project.
+5. Rubber Band now uses a vocal-smooth profile for short or high-ratio vocal material: `transients=smooth`, `detector=soft`, `window=long`, `smoothing=on`, `pitchq=consistency`, `formant=preserved`, and `channels=together`.
+6. Vowel-core region rendering now treats consonant attack and coda as fixed anchors. Those regions are no longer time-stretched, reducing the risk that long Japanese vowel targets repeat the same consonant onset.
+7. Render cache format is bumped to `material_render_filter_v13_jp_vocal_smooth_stereo`, and stretch diagnostics now include `rubberband_profile`.
+8. Local verification passed: targeted material/preflight tests, full `unittest discover` with 175 tests, `compileall`, `git diff --check`, and a real MGRoid FFmpeg smoke output at `.tmp\mgroid-vocal-smooth-smoke\out.wav` with exact `2.000000s` stereo output.
+9. Started background JP+MGRoid rendered evaluation session `C:\Users\WIN11\.codex\tmp\agent_runs\20260814-214154-jp-mgroid-vocal-smooth-real-eval`. Outputs are isolated under `tests_real\output\jp-mgroid-v13\audio`, reports under `tests_real\output\jp-mgroid-v13\reports`, and caches under `tests_real\output\jp-mgroid-v13\cache`.
+
 ## Latest Update - 2026-08-14 Human Listening Review, Stereo Coherence, and Output Layout
 
 1. User completed manual listening review of the latest real rendered audio. The useful progress is that many timelines now align closely enough to the reference start/end/duration targets, which remains the core product goal.
@@ -1578,3 +1602,96 @@ Remaining after this continuation:
 5. Added regressions for the long-slot/tiny-audible case, direct-trim planning metadata, and the exact FFmpeg filter shape. Tests also explicitly enable the optional Signalsmith backend where the expected diagnostic wording requires it.
 6. Verification passed with `.venv311`: `174` unit tests, `compileall`, `git diff --check`, a real `process_material_clip_with_progress` render producing `13.351417 s`, and a real-eval rerun of `1000nenyikiteru_JP__vmzJP`.
 7. The rerun produced `status_counts={"rendered":1}`, output `tests_real\output\1000nenyikiteru_JP\vmzJP\1000nenyikiteru_JP.wav`, duration `194.155102 s`, and no new 14:00-hour render error entries. Full-suite strict acceptance and manual listening remain pending.
+
+### 2026-08-14: JP MGRoid Short-Region And Stereo Shape Render Pass
+
+1. User listening feedback identified unresolved JP quality problems: stereo channel mismatch, repeated consonant artifacts in stretched long syllables, and audible formant drift. The new `tests_real/material_set/MGRoid` set was added as a female JP corpus with mixed source shape: 110 stereo clips, 3 mono clips, 107 clips at 44.1 kHz, and 6 clips at 48 kHz.
+2. Open-source review focused on HiFiShifter, Rubber Band, SoundTouch, Signalsmith Stretch, and WORLD. The implementation took three portable lessons: keep stereo channels processed together, avoid treating ultra-short vocal regions as normal phase-vocoder material, and keep formant/pitch-changing engines out of the path unless the goal explicitly allows timbre changes.
+3. The failed v13 MGRoid run reproduced a real FFmpeg Rubber Band failure on `ha.wav`: about `52.364 ms` of source window and `43.636 ms` of audible target were passed through `rubberband=...:channels=together`, causing `Operation not permitted` and `render_failed`.
+4. `audio_processor.engine` now treats source or target regions at or below `60 ms` as direct trim/pad regions. These regions are reported as `tiny_target_direct_trim` / `direct_trim_no_pitch_shift` so diagnostics no longer claim Rubber Band formant preservation for material that is intentionally not stretched.
+5. Render-cache clips now inherit the reference audio sample rate and channel count when the user did not explicitly set them. This normalizes mixed MGRoid mono/stereo and 44.1/48 kHz clips before concat and prevents the rendered cache from carrying inconsistent channel layout into the final output.
+6. The render cache format is now `material_render_filter_v14_short_region_direct_trim_reference_shape`, invalidating the v13 failed cache and older mixed-shape render caches.
+7. Verification passed: targeted material/render tests, full `.venv311\Scripts\python.exe -m unittest discover` with `178` tests, `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging`, `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` with only existing CRLF warnings.
+8. Real MGRoid smoke on `tests_real/material_set/MGRoid/ha.wav` produced `.tmp\mgroid-short-region-smoke\ha_short_direct.wav`, with no `rubberband=` in the FFmpeg filter, duration `0.043628 s`, sample rate `44100`, and `2` channels.
+9. Background session `C:\Users\WIN11\.codex\tmp\agent_runs\20260814-222927-jp-mgroid-v14-real-eval` completed successfully with no task failures. Report: `tests_real\output\jp-mgroid-v14\reports\real-eval-20260814-222936\summary.json`.
+10. The v14 JP/MGRoid rendered suite completed `4 / 4` cases with `status_counts={"rendered":4}` and generated four review WAVs under `tests_real\output\jp-mgroid-v14\audio`: `1000nenyikiteru_JP`, `kamippoina_JP`, `LAB=01_JP`, and `PlasticLove_JP`.
+11. v14 suite means: `planning_alignment_score=0.520347`, `rendered_audio_alignment_score=0.640260`, `match_ordering_score=0.393758`, `stretch_quality_score=0.825313`, `stretch_naturalness_score=0.801262`, `continuity_warning_ratio=0.154826`, and `render_duration_delta_ratio=0.0`; strict pass remains `0`.
+12. All four v14 output WAVs were verified as `44100 Hz` and `2` channels. Durations were `194.155034 s`, `204.070748 s`, `165.159184 s`, and `308.723810 s` respectively.
+
+### 2026-08-15: JP Render Timing Gate And Microfade Fix
+
+1. User manually rejected the v14 JP/MGRoid rendered outputs as not listenable. The v14 run must be treated as failure evidence, not as audio-quality acceptance evidence.
+2. Root cause analysis found that the direct MGRoid real-eval command did not force the WhisperX character-alignment backend. All four v14 cases had `reference_unit_timing_count=0`, so positioned decisions fell back to `proportional_segment_split` instead of real per-unit timing.
+3. This explained the manual report that syllables did not match the original timeline: segment-level fallback could assign large pre/post timeline slots around very short audible units, and the scorecard duration success only proved total wav length, not character-level alignment.
+4. `audio_processor.real_eval` now blocks rendered output when positioned decisions lack aligned unit timing. Such cases are reported as `render_blocked` with `render_blocked_missing_aligned_unit_timing`, and `run_batch_queue` is not called, preventing misleading review wavs.
+5. `audio_processor.real_eval --render` now defaults `VOCAL_PROCESS_ASR_BACKEND` to `whisperx` for that process when no backend or `auto` is requested. A new `--asr-backend` option makes the backend explicit.
+6. `scripts/run_real_eval_render_full.ps1` now forwards `--asr-backend` and supports `-Split`, `-Case`, and `-MaxCases`, so focused JP/MGRoid rendered runs can use the same official real-eval entry point.
+7. `audio_processor.model_runtime` now preserves already positioned active target durations in absolute-timeline mode when resolving fallback durations. This prevents a short syllable active duration from being globally scaled to the full song duration before silence slots are applied.
+8. `audio_processor.engine` now applies a constrained 1-4 ms microfade to direct-trim short regions. This keeps the no-pitch-shift/no-formant-shift path but avoids hard-cut tails that can sound like pops or electric artifacts.
+9. Render-cache identity was bumped to `material_render_filter_short_region_direct_trim_reference_shape_microfade_v1` so old no-fade short-region caches are not reused.
+10. Verification passed: focused `RealEvalTests`, `ModelRuntimeTests`, and `MaterialAssemblyTests` (`96` tests); full `.venv311\Scripts\python.exe -m unittest discover` (`182` tests); `compileall`; `.venv311\Scripts\python.exe -m audio_processor check`; and `git diff --check` with only existing CRLF warnings.
+11. Real MGRoid smoke on `tests_real/material_set/MGRoid/ha.wav` produced `.tmp\mgroid-microfade-smoke\ha_short_microfade.wav`, duration `0.043628 s`, `44100 Hz`, `2` channels, no `rubberband=`, and `afade=True`.
+12. Next action requested by the user: start a background autonomous rendered scoring run for overnight manual listening review. The run should write outputs under a new separated output root, not into the previous v14 folders.
+
+### 2026-08-15: Short-Region Rubber Band Fallback
+
+1. The background session `C:\Users\WIN11\.codex\tmp\agent_runs\20260815-022144-jp-postfix-microfade-render-score` completed one validation cycle. `dev-preflight`, `compileall`, `unit-tests`, and `audio-check` passed, but `real-eval-render-jp-postfix` failed.
+2. Report: `tests_real\output\jp-postfix-microfade-20260815\reports\real-eval-20260815-022227\summary.json`. It planned `8 / 8` JP cases and skipped `12` language mismatches, but all planned cases ended as `render_failed`; no final review wav files were produced under `audio`.
+3. This was not the previous missing-timing problem: all eight executed cases reported `timed_target_duration_ratio=1.0`. The remaining failure was FFmpeg Rubber Band on short render windows.
+4. Diagnostics showed repeated failures such as `de.wav` with `source_window=0.092532 s`, `target=0.077110 s`, `tempo=1.2`; `cha.wav` with `source_window=0.073048 s`, `target=0.060873 s`; and `go.wav` with `source_window=0.073162 s`, `target=0.060969 s`. FFmpeg returned `Operation not permitted`.
+5. `audio_processor.engine` now treats short labeled render regions at or below `100 ms` as direct-trim/microfade regions instead of sending them through Rubber Band. This extends the prior `60 ms` guard to cover the actual 70-90 ms JP failures.
+6. A guarded runtime fallback now catches Rubber Band `Operation not permitted` / filter errors on short labeled regions up to `150 ms`, removes any partial output, and retries direct trim without pitch/formant processing.
+7. Render-cache identity was bumped to `material_render_filter_short_region_direct_trim_microfade_rubberband_fallback_v1` so failed or no-fallback short-region cache entries are not reused.
+8. Added regressions for the `92.532 ms -> 77.110 ms` direct-trim command shape and for automatic short-region Rubber Band failure retry.
+9. Verification passed: focused `MaterialAssemblyTests`, `RealEvalTests`, and `ModelRuntimeTests` (`98` tests); full `.venv311\Scripts\python.exe -m unittest discover` (`184` tests); `compileall`; `.venv311\Scripts\python.exe -m audio_processor check`; and `git diff --check` with only existing CRLF warnings.
+10. Real MGRoid smoke on `tests_real/material_set/MGRoid/de.wav` produced `.tmp\mgroid-short-region-smoke\de_92ms_to_77ms_direct.wav`, duration `0.077120 s`, `44100 Hz`, `2` channels, no `rubberband=`, and microfade filters enabled.
+
+### 2026-08-15: Coherent Mono Material Render Guard
+
+1. User continued optimization after the JP short-region fallback work, with unresolved manual-listening concerns around stereo mismatch and formant/pitch-like timbre drift.
+2. The running `jp-short-region-fallback-render-score` background session was stopped before final audio output because it had been launched before the new channel-coherence rule and would have produced stale review artifacts.
+3. `audio_processor.engine` now folds each material clip to a coherent mono vocal stream before Rubber Band, direct trim, vowel-core stretch, or exact-duration padding. The final cache/final wav still inherits the reference audio sample rate and channel count, so stereo reference output remains stereo but both ears receive a matched vocal signal.
+4. Rubber Band remains configured with `pitch=1`, `formant=preserved`, `phase=laminar`, and `channels=together`. The new mono fold is an input-channel coherence guard, not a pitch/formant transform.
+5. `render_material_stretch_plan` now reports `channel_coherence=material_mono_fold_then_reference_channels`, and the render cache format was bumped to `material_render_filter_coherent_mono_short_region_fallback_v1`.
+6. Validation passed with `.venv311`: focused `MaterialAssemblyTests` (`29` tests), full `.venv311\Scripts\python.exe -m unittest discover` (`184` tests), `.venv311\Scripts\python.exe -m compileall -q audio_processor tests`, `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` with only existing CRLF warnings.
+7. Real FFmpeg smoke at `.tmp\mono-fold-smoke\stereo_misaligned_folded.wav` used a deliberately mismatched stereo source and produced `0.220000 s`, `44100 Hz`, `2` channels with `aformat=channel_layouts=mono` present in the material filter chain.
+8. The next validation run should use a fresh output root, because old cache roots do not include the coherent-mono render policy.
+
+### 2026-08-15: Consonant-Safe Timing And Declick Repair
+
+1. User manually rejected the coherent-mono JP outputs because audio quality remained poor, electric/click noise was still audible, and consonants were almost cut off.
+2. The running background session `C:\Users\WIN11\.codex\tmp\agent_runs\20260815-132401-jp-coherent-mono-render-score` was stopped to avoid producing more stale bad outputs. It had completed `3 / 8` compatible JP cases.
+3. Objective analysis of the rejected files confirmed the listening report: output peaks hit `1.0`, clipping ratio was about `0.26% - 0.40%`, and `jump999` reached `2.0`, consistent with hard electric clicks.
+4. Root cause for consonant loss was not only DSP choice. The JP unit timing lattice assigned many units to `6-20 ms`; for `1000nenyikiteru_JP__MGRoid`, `417 / 744` clips were proactive direct trims and many examples had `target=0.0114 s` plus `source_window=0.0136 s`. This necessarily removed consonant attack/body.
+5. `audio_processor.model_runtime` now smooths JP positioned active target durations inside each reference segment. Short JP material decisions receive a consonant-safe active floor of about `45 ms`, with duration borrowed from longer neighboring units so the segment total remains stable.
+6. `audio_processor.engine` no longer uses active source-window trimming below the consonant-safe target threshold, and source windows now have a minimum of `90 ms` when trimming is used. Proactive direct trim was reduced to truly tiny regions below `35 ms`; 43-90 ms regions now try Rubber Band first and use direct trim only as a guarded runtime fallback.
+7. Final rendered concat now applies `lowpass=f=12000`, `adeclick`, and a softer `0.90` limiter instead of a hard peak clamp. Cache identity was bumped to `material_render_filter_consonant_safe_declick_v1`.
+8. Validation passed with `.venv311`: full unit discovery `185` tests, `compileall`, `audio_processor check`, and `git diff --check` with only CRLF warnings.
+9. A focused real rendered case `1000nenyikiteru_JP__MGRoid` completed under `tests_real\output\jp-consonant-safe-smoke-20260815`. Compared with the rejected coherent-mono run, direct trims dropped from `417` to `0`, sub-45 ms audible units dropped from `219` to `1`, and the minimum audible target became `0.045 s`.
+10. A review file with the new declick safety filter was written to `tests_real\output\jp-consonant-safe-review-20260815\audio\1000nenyikiteru_JP\MGRoid\1000nenyikiteru_JP.wav`. Metrics: `194.157 s`, `44100 Hz`, `2 ch`, `peak=0.89999`, `clip_ratio=0`, `jump999=0.11084`, `hf9k=0.000458`.
+
+### 2026-08-15: Mono Output And Short-CV Atempo Repair
+
+1. User reported that electric noise was still audible after the declick review file and explicitly requested merging stereo to mono because channel mismatch cannot be solved while preserving stereo output.
+2. The previous policy `material_mono_fold_then_reference_channels` is superseded. Material rendering now forces `channels=1` for cache clips and final output while preserving the reference sample rate. Reports now expose `channel_coherence=material_mono_fold_then_mono_output`.
+3. Root-cause smoke on real `MGRoid/gi.wav` showed the short-CV Rubber Band path itself could generate full-scale discontinuities: Rubber Band produced `peak=1.0`, `jump999=1.999969`; the same source window rendered with FFmpeg `atempo` produced `peak=0.31024`, `jump999=0.112218`.
+4. Short labeled material in the safe tempo range now uses `atempo` instead of Rubber Band. This is a tempo-only path intended to avoid Rubber Band's short-window impulse artifacts while keeping pitch unchanged.
+5. `render_material_stretch_plan` and cache keys now record `stretch_backend=atempo`, `rubberband_profile=atempo_short_cv`, and `formant_preservation=atempo_pitch_preserved_short_cv` for these clips. Cache identity was bumped to `material_render_filter_mono_atempo_short_cv_declick_v1`.
+6. Validation passed: focused material tests, full `.venv311\Scripts\python.exe -m unittest discover -s tests` with `185` tests, `compileall`, `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` with only CRLF warnings.
+7. A full real single-case render completed at `tests_real\output\jp-mono-atempo-smoke-20260815\audio\1000nenyikiteru_JP\MGRoid\1000nenyikiteru_JP.wav`. FFprobe confirms `44100 Hz`, `1` channel, `channel_layout=mono`, duration `194.157211 s`.
+8. New single-case metrics compared to rejected coherent-mono output: `peak` `1.0 -> 0.9`, `clip_ratio` `0.00368229 -> 0`, `jump999` `2.0 -> 0.096502`, `jumpmax` `2.0 -> 0.290299`, `hf9k` `0.150613 -> 0.000189`.
+9. In the same real case, backend counts were `atempo=676`, `rubberband=61`, `signalsmith=7`; direct trims stayed at `0`. Manual listening remains required before expanding to the full JP suite.
+
+### 2026-08-15: Reference Vocal Trust Gate And MGRoid OTO Source Windows
+
+1. User corrected the diagnosis wording: the rendered output was not unrelated to the material audio; it was unrelated to the original/reference vocal content.
+2. The old `1000nenyikiteru_JP__MGRoid` analysis showed that the reference-vocal transcript itself was ASR-only and unverified. The text was valid UTF-8, but it was the wrong Japanese target, so the later ordering and timing machinery could only produce correctly timed wrong content.
+3. `audio_processor.real_eval` now blocks formal rendered output when `--render` is requested but the case has no verified reference text such as lyrics/subtitle truth. Such cases are written as `render_blocked` with `render_blocked_unverified_reference_text`, and no batch render is launched.
+4. The old `reference_asr_unverified` warning is now a hard render blocker by default. `--allow-unverified-reference-render` is available only for controlled DSP experiments where the output is explicitly not content-valid acceptance evidence.
+5. `scripts\run_real_eval_render_full.ps1` now defaults to WhisperX and forwards the new override switch only when explicitly requested.
+6. `audio_processor.engine` now reads nearby UTAU `oto.ini` metadata for MGRoid-style material and uses offset/consonant/cutoff/preutterance fields to choose short-material source windows. This keeps more of the intended recorded syllable body than pure RMS trimming.
+7. A false-key bug in the first OTO lookup draft was fixed: longer labels are no longer split into individual phonetic units for lookup, so files like `kan.wav`, `kai.wav`, and `yan.wav` do not incorrectly match `ka`.
+8. High-ratio short-CV atempo rendering now uses a chain of supported FFmpeg `atempo` filters instead of exceeding a single filter's range. The render cache format is now `material_render_filter_mono_atempo_chain_utau_oto_v1`.
+9. Validation passed with `.venv311`: full `unittest discover -s tests` ran `189` tests, `compileall` passed, `audio_processor check` passed, and `git diff --check` only reported existing LF/CRLF warnings.
+10. Strict real gate evidence is `tests_real\output\jp-reference-trust-gate-20260815-rerun\reports\real-eval-20260815-201712\summary.json`: status `render_blocked`, warning `render_blocked_unverified_reference_text`, no output WAV files under `tests_real\output\jp-reference-trust-gate-20260815-rerun\audio`.
+11. DSP-only smoke evidence is `.tmp\mgroid-atempo-chain-smoke\ga_chain.wav`, measured as mono `44100 Hz`, `0.099819 s`, `peak=0.528753`, `jump999=0.083761`, and `jumpmax=0.086546`.

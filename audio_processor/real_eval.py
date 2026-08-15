@@ -33,7 +33,8 @@ INFRASTRUCTURE_WARNING_KINDS = {
 REAL_EVAL_FAILED_EXIT_CODE = 1
 INFRASTRUCTURE_BLOCKED_EXIT_CODE = 2
 CANCELLED_EXIT_CODE = 130
-FAILED_EXECUTION_STATUSES = {"analysis_failed", "analysis_blocked", "render_failed"}
+FAILED_EXECUTION_STATUSES = {"analysis_failed", "analysis_blocked", "render_failed", "render_blocked"}
+RENDERED_EVAL_DEFAULT_ASR_BACKEND = "whisperx"
 CancelCallback = Callable[[], bool]
 
 
@@ -201,6 +202,7 @@ def run_real_suite(
     *,
     manifest_path: Path | None = None,
     render: bool = False,
+    allow_unverified_reference_render: bool = False,
     compute_device: str = "auto",
     source_separation: str = "never",
     max_cases: int | None = None,
@@ -266,6 +268,46 @@ def run_real_suite(
         case_report_directory = _case_report_directory(report_directory, case)
         analysis_path = case_report_directory / "analysis.json"
         analysis_path.parent.mkdir(parents=True, exist_ok=True)
+        if (
+            render
+            and not allow_unverified_reference_render
+            and not _case_has_verified_reference_text(case)
+        ):
+            warning = _missing_verified_reference_text_render_warning(case)
+            report = _case_render_blocked_report(case, warning)
+            _write_json_atomic(analysis_path, report)
+            render_summary = {
+                "blocked": True,
+                "blocker_kind": warning["kind"],
+                "message": warning["message"],
+            }
+            result = RealCaseResult(
+                case=case,
+                status="render_blocked",
+                analysis_report_path=analysis_path,
+                output_path=None,
+                render_report_path=None,
+                summary=_case_summary(
+                    report,
+                    render_summary,
+                    reference_path=case.reference_path,
+                    output_path=None,
+                    status="render_blocked",
+                ),
+                warnings=list(report.get("warnings", [])),
+            )
+            results.append(result)
+            suite_summary = _suite_summary(
+                root=root,
+                manifest_path=manifest_path,
+                render=render,
+                results=results,
+                planned_case_count=planned_case_count,
+                runtime_preflight=runtime_preflight,
+                skipped_cases=skipped_cases,
+            )
+            _write_suite_outputs(summary_path, markdown_path, suite_summary, results)
+            continue
         try:
             report = build_preflight_report(
                 case.reference_path,
@@ -387,49 +429,63 @@ def run_real_suite(
         status = report.get("status", "unknown")
 
         if render:
-            settings = ProcessingSettings(
-                material_directory=str(case.material_directory),
-                lyrics_file=str(case.lyrics_file or ""),
-                output_directory=str(case.output_directory),
-                output_extension=".wav",
-                overwrite=True,
-                compute_device=compute_device,
-                source_separation=source_separation,
-                render_cache_directory=str(_real_eval_case_cache_directory(root, output_root, case)),
-                diagnostics_directory=str(case_report_directory / "render"),
+            render_blocker = _render_blocker_warning(
+                report,
+                allow_unverified_reference_render=allow_unverified_reference_render,
             )
-            render_output_path = settings.output_path_for(case.reference_path)
-            render_report_path = diagnostic_log_path(render_output_path, case_report_directory / "render")
-            try:
-                if _should_cancel(cancel_checker):
-                    raise AudioProcessorError("Processing cancelled")
-                summary = run_batch_queue(
-                    [QueueItem(case.reference_path, render_output_path)],
-                    settings,
-                    should_cancel=cancel_checker,
-                )
-                if summary.cancelled:
-                    status = "cancelled"
-                    warnings.append(_cancelled_warning("Real-eval rendering was cancelled."))
-                else:
-                    status = "rendered" if summary.failed == 0 else "render_failed"
-                if not render_output_path.exists():
-                    status = "cancelled" if status == "cancelled" else "render_failed"
-                render_summary = {"batch_summary": summary.__dict__}
-            except Exception as exc:
-                status = "cancelled" if _is_cancellation_exception(exc) else "render_failed"
-                render_summary = {"error": str(exc)}
-                if status == "cancelled":
-                    warnings.append(_cancelled_warning("Real-eval rendering was cancelled."))
-                else:
-                    warnings.append(
-                        {
-                            "severity": "error",
-                            "kind": "render_exception",
-                            "message": str(exc),
-                        }
-                    )
+            if render_blocker is not None:
+                status = "render_blocked"
+                warnings.append(render_blocker)
                 report = _report_with_extra_warnings(report, warnings)
+                render_summary = {
+                    "blocked": True,
+                    "blocker_kind": render_blocker["kind"],
+                    "message": render_blocker["message"],
+                }
+            else:
+                settings = ProcessingSettings(
+                    material_directory=str(case.material_directory),
+                    lyrics_file=str(case.lyrics_file or ""),
+                    output_directory=str(case.output_directory),
+                    output_extension=".wav",
+                    overwrite=True,
+                    compute_device=compute_device,
+                    source_separation=source_separation,
+                    render_cache_directory=str(_real_eval_case_cache_directory(root, output_root, case)),
+                    diagnostics_directory=str(case_report_directory / "render"),
+                )
+                render_output_path = settings.output_path_for(case.reference_path)
+                render_report_path = diagnostic_log_path(render_output_path, case_report_directory / "render")
+                try:
+                    if _should_cancel(cancel_checker):
+                        raise AudioProcessorError("Processing cancelled")
+                    summary = run_batch_queue(
+                        [QueueItem(case.reference_path, render_output_path)],
+                        settings,
+                        should_cancel=cancel_checker,
+                    )
+                    if summary.cancelled:
+                        status = "cancelled"
+                        warnings.append(_cancelled_warning("Real-eval rendering was cancelled."))
+                    else:
+                        status = "rendered" if summary.failed == 0 else "render_failed"
+                    if not render_output_path.exists():
+                        status = "cancelled" if status == "cancelled" else "render_failed"
+                    render_summary = {"batch_summary": summary.__dict__}
+                except Exception as exc:
+                    status = "cancelled" if _is_cancellation_exception(exc) else "render_failed"
+                    render_summary = {"error": str(exc)}
+                    if status == "cancelled":
+                        warnings.append(_cancelled_warning("Real-eval rendering was cancelled."))
+                    else:
+                        warnings.append(
+                            {
+                                "severity": "error",
+                                "kind": "render_exception",
+                                "message": str(exc),
+                            }
+                        )
+                    report = _report_with_extra_warnings(report, warnings)
         else:
             render_summary = {}
 
@@ -493,7 +549,6 @@ def run_real_suite(
         skipped_cases=tuple(skipped_cases),
     )
 
-
 def write_manifest_template(root: Path, destination: Path) -> Path:
     root = root.expanduser()
     destination = destination.expanduser()
@@ -525,6 +580,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path("tests_real"), help="real test root directory")
     parser.add_argument("--manifest", type=Path, help="optional manifest JSON file")
     parser.add_argument("--render", action="store_true", help="render audio outputs in addition to analysis")
+    parser.add_argument(
+        "--allow-unverified-reference-render",
+        action="store_true",
+        help=(
+            "Allow rendered output even when reference text comes only from unverified ASR. "
+            "By default rendered real-eval blocks this because content matching cannot be trusted."
+        ),
+    )
+    parser.add_argument(
+        "--asr-backend",
+        help=(
+            "ASR backend for this run. Rendered eval defaults to whisperx when the environment "
+            "does not already request a backend, because strict output review requires character timing."
+        ),
+    )
     parser.add_argument("--compute-device", default="auto", help="model runtime device: auto, cpu, or cuda")
     parser.add_argument("--source-separation", default="never", help="reference separation mode")
     parser.add_argument("--max-cases", type=int, help="limit the number of evaluated cases")
@@ -544,18 +614,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(path)
         return 0
 
-    result = run_real_suite(
-        args.root,
-        manifest_path=args.manifest,
-        render=args.render,
-        compute_device=args.compute_device,
-        source_separation=args.source_separation,
-        max_cases=args.max_cases,
-        case_filter=args.case_filter,
-        split_filter=args.split_filter,
-        output_root=args.output_root,
-        stop_file=args.stop_file,
-    )
+    asr_restore_state = _apply_rendered_eval_asr_backend(args.render, args.asr_backend)
+    try:
+        result = run_real_suite(
+            args.root,
+            manifest_path=args.manifest,
+            render=args.render,
+            allow_unverified_reference_render=args.allow_unverified_reference_render,
+            compute_device=args.compute_device,
+            source_separation=args.source_separation,
+            max_cases=args.max_cases,
+            case_filter=args.case_filter,
+            split_filter=args.split_filter,
+            output_root=args.output_root,
+            stop_file=args.stop_file,
+        )
+    finally:
+        _restore_asr_backend(asr_restore_state)
     print(result.summary_path)
     print(result.markdown_path)
     return _result_exit_code(result)
@@ -806,6 +881,46 @@ def _append_cancelled_case_results(
         )
 
 
+def _case_has_verified_reference_text(case: RealCase) -> bool:
+    return bool(case.lyrics_file is not None and case.lyrics_file.expanduser().exists())
+
+
+def _missing_verified_reference_text_render_warning(case: RealCase) -> dict[str, Any]:
+    return {
+        "severity": "error",
+        "kind": "render_blocked_unverified_reference_text",
+        "reference_path": str(case.reference_path.expanduser()),
+        "message": (
+            "Rendered real-eval requires a lyrics_file or another verified reference transcript. "
+            "No verified reference text was discovered for this case, so producing review audio "
+            "would rely on ASR-only content matching."
+        ),
+    }
+
+
+def _case_render_blocked_report(case: RealCase, warning: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "format": "vocal_process_preflight_analysis_v1",
+        "reference_path": str(case.reference_path.expanduser()),
+        "material_directory": str(case.material_directory.expanduser()),
+        "lyrics_file": str(case.lyrics_file.expanduser()) if case.lyrics_file else "",
+        "status": "render_blocked",
+        "summary": {
+            "material_count": 0,
+            "warning_count": 1,
+            "error_warning_count": 1,
+            "review_required_match_count": 0,
+            "minimum_match_score": 0.0,
+            "extreme_stretch_count": 0,
+            "moderate_stretch_count": 0,
+        },
+        "warnings": [warning],
+        "optimization": {},
+        "ordering": {"ordering": [], "timeline_alignment": {}},
+        "stretch_plan": [],
+    }
+
+
 def _case_cancelled_report(case: RealCase, message: str) -> dict[str, Any]:
     warning = _cancelled_warning(message)
     return {
@@ -1043,6 +1158,105 @@ def _report_with_extra_warnings(report: dict[str, Any], warnings: Sequence[dict[
     return updated
 
 
+def _render_blocker_warning(
+    report: dict[str, Any],
+    *,
+    allow_unverified_reference_render: bool = False,
+) -> dict[str, Any] | None:
+    if not allow_unverified_reference_render:
+        content_blocker = _unverified_reference_render_blocker_warning(report)
+        if content_blocker is not None:
+            return content_blocker
+    return _render_timing_blocker_warning(report)
+
+
+def _unverified_reference_render_blocker_warning(report: dict[str, Any]) -> dict[str, Any] | None:
+    warnings = report.get("warnings", []) if isinstance(report, dict) else []
+    for warning in warnings if isinstance(warnings, list) else []:
+        if not isinstance(warning, dict):
+            continue
+        if warning.get("kind") != "reference_asr_unverified":
+            continue
+        return {
+            "severity": "error",
+            "kind": "render_blocked_unverified_reference_text",
+            "reference_path": warning.get("reference_path", ""),
+            "backend": warning.get("backend", ""),
+            "message": (
+                "Rendered real-eval requires lyrics or another verified reference transcript. "
+                "ASR-only reference text can preserve timing while still selecting the wrong "
+                "pronunciation content, so this case is blocked from producing misleading review audio."
+            ),
+        }
+    return None
+
+
+def _render_timing_blocker_warning(report: dict[str, Any]) -> dict[str, Any] | None:
+    warnings = report.get("warnings", []) if isinstance(report, dict) else []
+    for warning in warnings if isinstance(warnings, list) else []:
+        if isinstance(warning, dict) and warning.get("kind") == "missing_aligned_unit_timing":
+            positioned_count = _positive_int(warning.get("positioned_decision_count"))
+            timed_count = _positive_int(warning.get("timed_target_duration_count"))
+            return {
+                "severity": "error",
+                "kind": "render_blocked_missing_aligned_unit_timing",
+                "positioned_decision_count": positioned_count,
+                "timed_target_duration_count": timed_count,
+                "message": (
+                    "Rendered real-eval requires aligned reference unit timing. "
+                    "This case would otherwise fall back to proportional segment timing and produce "
+                    "misleading review audio."
+                ),
+            }
+
+    ordering = report.get("ordering", {}) if isinstance(report, dict) else {}
+    timeline_alignment = ordering.get("timeline_alignment", {}) if isinstance(ordering, dict) else {}
+    if not isinstance(timeline_alignment, dict):
+        return None
+    positioned_count = _positive_int(timeline_alignment.get("positioned_decision_count"))
+    timed_count = _positive_int(timeline_alignment.get("timed_target_duration_count"))
+    if positioned_count <= 0 or timed_count >= positioned_count:
+        return None
+    return {
+        "severity": "error",
+        "kind": "render_blocked_missing_aligned_unit_timing",
+        "positioned_decision_count": positioned_count,
+        "timed_target_duration_count": timed_count,
+        "message": (
+            "Rendered real-eval requires aligned reference unit timing. "
+            "This case would otherwise fall back to proportional segment timing and produce "
+            "misleading review audio."
+        ),
+    }
+
+
+def _apply_rendered_eval_asr_backend(
+    render: bool,
+    requested_backend: str | None,
+) -> tuple[bool, str | None] | None:
+    backend = str(requested_backend or "").strip()
+    if not backend and render:
+        current = os.environ.get("VOCAL_PROCESS_ASR_BACKEND", "").strip()
+        if not current or current.lower() == "auto":
+            backend = RENDERED_EVAL_DEFAULT_ASR_BACKEND
+    if not backend:
+        return None
+    existed = "VOCAL_PROCESS_ASR_BACKEND" in os.environ
+    previous = os.environ.get("VOCAL_PROCESS_ASR_BACKEND")
+    os.environ["VOCAL_PROCESS_ASR_BACKEND"] = backend
+    return existed, previous
+
+
+def _restore_asr_backend(state: tuple[bool, str | None] | None) -> None:
+    if state is None:
+        return
+    existed, previous = state
+    if existed:
+        os.environ["VOCAL_PROCESS_ASR_BACKEND"] = str(previous or "")
+    else:
+        os.environ.pop("VOCAL_PROCESS_ASR_BACKEND", None)
+
+
 def _case_summary(
     report: dict[str, Any],
     render_summary: dict[str, Any],
@@ -1243,6 +1457,7 @@ def _render_validation(
 ) -> dict[str, Any]:
     render_requested = bool(render_summary)
     render_failed = _render_summary_failed(render_summary)
+    render_blocked = bool(render_summary.get("blocked")) if isinstance(render_summary, dict) else False
     output_exists = bool(output_path and output_path.exists())
     output_duration_seconds = _probe_duration(output_path) if output_exists and not render_failed else None
     delta_seconds = _duration_delta(output_duration_seconds, reference_duration_seconds)
@@ -1250,6 +1465,8 @@ def _render_validation(
     duration_alignment_score = _duration_alignment_score(delta_ratio)
     if not render_requested:
         status = "not_requested"
+    elif render_blocked:
+        status = "render_blocked"
     elif render_failed:
         status = "render_failed"
     elif not output_exists:
@@ -1264,6 +1481,9 @@ def _render_validation(
         "format": "vocal_process_render_validation_v1",
         "status": status,
         "render_requested": render_requested,
+        "render_blocked": render_blocked,
+        "blocker_kind": str(render_summary.get("blocker_kind") or "") if isinstance(render_summary, dict) else "",
+        "blocker_message": str(render_summary.get("message") or "") if isinstance(render_summary, dict) else "",
         "render_failed": render_failed,
         "output_exists": output_exists,
         "output_path": str(output_path) if output_path else "",

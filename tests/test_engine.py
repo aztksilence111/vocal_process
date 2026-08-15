@@ -49,11 +49,13 @@ from audio_processor.engine import (
     get_audio_duration_seconds,
     list_audio_files,
     plan_material_stretch_clips,
+    process_material_clip_with_progress,
     probe_audio,
     render_material_stretch_plan,
     resolve_tool,
     summarize_probe,
     _run_progress_process,
+    _should_retry_rubberband_short_region_with_direct_trim,
     _vowel_core_stretch_regions,
 )
 from audio_processor.gui import LYRICS_EXTENSIONS
@@ -82,15 +84,21 @@ from audio_processor.vst3_bridge import (
 )
 
 
-def _write_test_wave(path: Path, *, duration_seconds: float = 1.0, sample_rate: int = 8000) -> None:
-    n_channels = 1
+def _write_test_wave(
+    path: Path,
+    *,
+    duration_seconds: float = 1.0,
+    sample_rate: int = 8000,
+    channels: int = 1,
+) -> None:
+    n_channels = channels
     sample_width = 2
     n_frames = int(duration_seconds * sample_rate)
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(n_channels)
         handle.setsampwidth(sample_width)
         handle.setframerate(sample_rate)
-        handle.writeframes(b"\x00\x00" * n_frames)
+        handle.writeframes(b"\x00\x00" * n_channels * n_frames)
 
 
 def _write_tone_wave(path: Path, *, duration_seconds: float = 1.0, sample_rate: int = 8000) -> None:
@@ -249,6 +257,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         )
 
         self.assertIn("concat=n=2:v=0:a=1", graph)
+        self.assertIn("aformat=channel_layouts=mono", graph)
         self.assertIn("rubberband=tempo=1.25000000:pitch=1:formant=preserved", graph)
         self.assertIn("apad=whole_dur=3.500000", graph)
         self.assertIn("atrim=duration=3.500000", graph)
@@ -264,7 +273,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         )
 
         self.assertNotIn("concat=", graph)
-        self.assertTrue(graph.startswith("[0:a]rubberband=tempo=0.50000000"))
+        self.assertTrue(graph.startswith("[0:a]aformat=channel_layouts=mono,rubberband=tempo=0.50000000"))
 
     def test_material_clip_command_stretches_without_loop_or_hard_cut(self) -> None:
         args = build_material_clip_args(
@@ -277,6 +286,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         )
 
         filters = args[args.index("-af") + 1]
+        self.assertTrue(filters.startswith("aformat=channel_layouts=mono,rubberband="))
         self.assertIn("rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
         self.assertIn("channels=together", filters)
         self.assertIn("apad=whole_dur=2.000000", filters)
@@ -298,6 +308,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         )
 
         filters = args[args.index("-filter_complex") + 1]
+        self.assertIn("[0:a]aformat=channel_layouts=mono[vc0mono]", filters)
         self.assertIn("asplit=2", filters)
         self.assertIn("atrim=start=0.000000:end=0.140000", filters)
         self.assertIn("atrim=start=0.140000:end=0.500000", filters)
@@ -321,10 +332,12 @@ class MaterialAssemblyTests(unittest.TestCase):
         )
 
         filters = args[args.index("-af") + 1]
+        self.assertTrue(filters.startswith("aformat=channel_layouts=mono,"))
         self.assertNotIn("rubberband=", filters)
         self.assertIn("apad=whole_dur=0.014074", filters)
         self.assertIn("atrim=duration=0.014074", filters)
-        self.assertNotIn("afade=", filters)
+        self.assertIn("afade=t=in:st=0:d=0.002533", filters)
+        self.assertIn("afade=t=out:st=0.011541:d=0.002533", filters)
 
     def test_tiny_audible_material_clip_skips_rubberband_failure_path(self) -> None:
         args = build_material_clip_args(
@@ -341,11 +354,73 @@ class MaterialAssemblyTests(unittest.TestCase):
         )
 
         filters = args[args.index("-af") + 1]
+        self.assertIn("aformat=channel_layouts=mono", filters)
         self.assertNotIn("rubberband=", filters)
         self.assertIn("apad=whole_dur=0.011413", filters)
         self.assertIn("atrim=duration=0.011413", filters)
+        self.assertIn("afade=t=in:st=0:d=0.002054", filters)
+        self.assertIn("afade=t=out:st=0.009359:d=0.002054", filters)
         self.assertIn("adelay=delays=13340:all=1", filters)
         self.assertIn("apad=whole_dur=13.351413", filters)
+
+    def test_short_source_window_material_clip_uses_atempo_to_avoid_rubberband_clicks(self) -> None:
+        args = build_material_clip_args(
+            Path("ha.wav"),
+            Path("clip_short_window.wav"),
+            1.2,
+            ProcessOptions(input_path=Path("ha.wav"), output_path=Path("clip_short_window.wav")),
+            target_duration=0.043636,
+            audible_target_duration=0.043636,
+            source_window_duration_seconds=0.052364,
+            source_duration=0.052364,
+            text_hint="ha",
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertIn("-t", args)
+        self.assertIn("aformat=channel_layouts=mono", filters)
+        self.assertIn("atempo=1.20001833", filters)
+        self.assertNotIn("rubberband=", filters)
+        self.assertIn("apad=whole_dur=0.043636", filters)
+        self.assertIn("atrim=duration=0.043636", filters)
+        self.assertIn("afade=t=in:st=0:d=0.004000", filters)
+        self.assertIn("afade=t=out:st=0.039636:d=0.004000", filters)
+
+    def test_sub_100ms_short_source_window_material_clip_uses_atempo_to_avoid_rubberband_clicks(self) -> None:
+        args = build_material_clip_args(
+            Path("de.wav"),
+            Path("clip_short_window.wav"),
+            1.2,
+            ProcessOptions(input_path=Path("de.wav"), output_path=Path("clip_short_window.wav")),
+            target_duration=0.077110,
+            audible_target_duration=0.077110,
+            source_window_duration_seconds=0.092532,
+            source_duration=0.092532,
+            text_hint="de",
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertIn("-t", args)
+        self.assertIn("aformat=channel_layouts=mono", filters)
+        self.assertIn("atempo=1.20000000", filters)
+        self.assertNotIn("rubberband=", filters)
+        self.assertIn("apad=whole_dur=0.077110", filters)
+        self.assertIn("atrim=duration=0.077110", filters)
+        self.assertIn("afade=t=in:st=0:d=0.006169", filters)
+        self.assertIn("afade=t=out:st=0.070941:d=0.006169", filters)
+
+    def test_short_region_rubberband_failure_retries_direct_trim(self) -> None:
+        retry = _should_retry_rubberband_short_region_with_direct_trim(
+            AudioProcessorError("rubberband filter failed: Operation not permitted"),
+            ["ffmpeg", "-af", "aformat=channel_layouts=mono,rubberband=tempo=1.2"],
+            source_duration=0.130,
+            target_duration=0.400,
+            text_hint="de",
+        )
+
+        self.assertTrue(retry)
 
     def test_tiny_audible_material_plan_reports_direct_trim_strategy(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -366,9 +441,47 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
         self.assertAlmostEqual(clips[0].audible_target_duration_seconds or 0.0, 0.011413)
-        self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.013695, places=4)
+        self.assertIsNone(clips[0].source_window_duration_seconds)
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["formant_preservation"], "direct_trim_no_pitch_shift")
+
+    def test_short_region_material_plan_reports_atempo_backend(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "ha.wav"
+            _write_test_wave(reference, duration_seconds=0.043636)
+            _write_test_wave(material, duration_seconds=0.052364)
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[0.043636],
+                material_text_hints=["ha"],
+            )
+
+        rendered = render_material_stretch_plan(clips)
+        self.assertEqual(clips[0].stretch_strategy, "rubberband_full_clip")
+        self.assertEqual(clips[0].stretch_backend, "atempo")
+        self.assertEqual(rendered[0]["formant_preservation"], "atempo_pitch_preserved_short_cv")
+
+    def test_short_material_high_compression_uses_chained_atempo(self) -> None:
+        args = build_material_clip_args(
+            Path("ha.wav"),
+            Path("clip_short_window.wav"),
+            5.0,
+            ProcessOptions(input_path=Path("ha.wav"), output_path=Path("clip_short_window.wav")),
+            target_duration=0.05,
+            audible_target_duration=0.05,
+            source_window_duration_seconds=0.25,
+            source_duration=0.25,
+            text_hint="ha",
+            progress=True,
+        )
+
+        filters = args[args.index("-af") + 1]
+        self.assertIn("atempo=2.00000000,atempo=2.00000000,atempo=1.25000000", filters)
+        self.assertNotIn("rubberband=", filters)
 
     def test_material_assembly_uses_per_clip_stretch_plan(self) -> None:
         with patch(
@@ -388,8 +501,8 @@ class MaterialAssemblyTests(unittest.TestCase):
             )
 
         filters = args[args.index("-filter_complex") + 1]
-        self.assertIn("[0:a]rubberband=tempo=0.50000000:pitch=1:formant=preserved", filters)
-        self.assertIn("[1:a]rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
+        self.assertIn("[0:a]aformat=channel_layouts=mono,rubberband=tempo=0.50000000:pitch=1:formant=preserved", filters)
+        self.assertIn("[1:a]aformat=channel_layouts=mono,rubberband=tempo=1.50000000:pitch=1:formant=preserved", filters)
         self.assertIn("[clip0][clip1]concat=n=2:v=0:a=1[outa]", filters)
         self.assertIn("atrim=duration=2.000000", filters)
         self.assertIn("afade=t=in:st=0:d=0.010000", filters)
@@ -414,6 +527,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertAlmostEqual(clips[0].target_duration_seconds, 0.014074)
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["formant_preservation"], "direct_trim_no_pitch_shift")
+        self.assertEqual(rendered[0]["channel_coherence"], "material_mono_fold_then_mono_output")
 
     def test_material_stretch_plan_flags_extreme_ratios(self) -> None:
         with patch(
@@ -532,6 +646,31 @@ class MaterialAssemblyTests(unittest.TestCase):
             self.assertIn("-t", args)
             self.assertIn("0.240000", args)
 
+    def test_utau_oto_ini_guides_short_material_source_window(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "ka.wav"
+            _write_test_wave(reference, duration_seconds=0.2)
+            _write_test_wave(material, duration_seconds=0.3)
+            (root / "oto.ini").write_text(
+                "\u304b.wav=,10,120,80,40,5\n",
+                encoding="utf-8",
+            )
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[0.2],
+                material_text_hints=["ka"],
+            )
+
+        self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
+        self.assertAlmostEqual(clips[0].source_window_start_seconds, 0.001, places=3)
+        self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.231, places=3)
+        rendered = render_material_stretch_plan(clips)
+        self.assertEqual(rendered[0]["source_window_source"], "utau_oto_ini")
+
     def test_source_window_skips_vowel_core_graph_for_trimmed_input(self) -> None:
         args = build_material_clip_args(
             Path("shi.wav"),
@@ -551,7 +690,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertIn("-af", args)
         self.assertNotIn("-filter_complex", args)
 
-    def test_source_window_plan_reports_rubberband_not_signalsmith(self) -> None:
+    def test_source_window_plan_reports_atempo_not_signalsmith_for_short_cv(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             reference = root / "reference.wav"
@@ -574,7 +713,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertGreater(clips[0].source_window_start_seconds, 0.0)
         self.assertIsNotNone(clips[0].source_window_duration_seconds)
         self.assertEqual(clips[0].stretch_strategy, "rubberband_full_clip")
-        self.assertEqual(clips[0].stretch_backend, "rubberband")
+        self.assertEqual(clips[0].stretch_backend, "atempo")
         self.assertEqual(clips[0].phoneme_regions, ())
 
     def test_short_material_expansion_uses_vowel_core_stretch(self) -> None:
@@ -597,19 +736,20 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertEqual(clips[0].stretch_strategy, "syllable_vowel_core_stretch")
         self.assertEqual(clips[0].quality_warning, "moderate_stretch_ratio")
         self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
-        self.assertAlmostEqual(clips[0].stretch_naturalness_score, 0.39)
+        self.assertAlmostEqual(clips[0].stretch_naturalness_score, 0.48)
         self.assertAlmostEqual(clips[0].audible_target_duration_seconds or 0.0, 1.0)
         self.assertAlmostEqual(clips[0].post_silence_seconds, 1.0)
         rendered = render_material_stretch_plan(clips)
-        self.assertEqual(clips[0].stretch_backend, "signalsmith")
-        self.assertEqual(rendered[0]["stretch_backend"], "signalsmith")
+        self.assertEqual(clips[0].stretch_backend, "rubberband")
+        self.assertEqual(rendered[0]["stretch_backend"], "rubberband")
+        self.assertEqual(rendered[0]["rubberband_profile"], "vocal_smooth")
         self.assertEqual(
             rendered[0]["boundary_conditioning"],
-            "signalsmith_vowel_core_stretch+fade_in_out+tempo_safe_silence_pad",
+            "vowel_core_stretch+fade_in_out+tempo_safe_silence_pad",
         )
         self.assertAlmostEqual(rendered[0]["audible_target_duration_seconds"], 1.0)
         self.assertAlmostEqual(rendered[0]["post_silence_seconds"], 1.0)
-        self.assertEqual(rendered[0]["formant_preservation"], "signalsmith_pitch_preserved_vowel_core")
+        self.assertEqual(rendered[0]["formant_preservation"], "vowel_core_rubberband_formant_preserved")
         self.assertEqual(
             [region["kind"] for region in rendered[0]["phoneme_regions"]],
             ["consonant_attack", "vowel_core"],
@@ -774,6 +914,70 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(render_mock.call_count, 1)
         self.assertAlmostEqual(final_cache_duration, 1.0)
+
+    def test_render_cache_clips_inherit_reference_rate_but_force_mono_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material_a = root / "material_a.wav"
+            material_b = root / "material_b.wav"
+            output = root / "output.wav"
+            _write_test_wave(reference, duration_seconds=2.0, sample_rate=44100, channels=2)
+            _write_test_wave(material_a, duration_seconds=1.0, sample_rate=8000, channels=1)
+            _write_test_wave(material_b, duration_seconds=1.0, sample_rate=48000, channels=1)
+            render_shapes: list[tuple[int | None, int | None]] = []
+            concat_args: list[str] = []
+
+            def fake_render(
+                input_path: Path,
+                output_path: Path,
+                tempo: float,
+                options: ProcessOptions,
+                *,
+                target_duration: float | None = None,
+                audible_target_duration: float | None = None,
+                pre_silence_seconds: float = 0.0,
+                source_window_start_seconds: float = 0.0,
+                source_window_duration_seconds: float | None = None,
+                text_hint: str = "",
+                on_progress=None,
+                should_cancel=None,
+            ) -> None:
+                del input_path, tempo, audible_target_duration, pre_silence_seconds
+                del source_window_start_seconds, source_window_duration_seconds, text_hint
+                del on_progress, should_cancel
+                render_shapes.append((options.sample_rate, options.channels))
+                _write_test_wave(
+                    output_path,
+                    duration_seconds=target_duration or 1.0,
+                    sample_rate=options.sample_rate or 8000,
+                    channels=options.channels or 1,
+                )
+
+            def fake_concat(args: list[str], **_: object) -> None:
+                concat_args[:] = [str(part) for part in args]
+                _write_test_wave(output, duration_seconds=2.0, sample_rate=44100, channels=2)
+
+            with patch("audio_processor.engine.process_material_clip_with_progress", side_effect=fake_render):
+                with patch("audio_processor.engine._run_progress_process", side_effect=fake_concat):
+                    assemble_material_to_reference_with_progress(
+                        reference,
+                        root,
+                        output,
+                        ProcessOptions(input_path=reference, output_path=output, overwrite=True),
+                        material_paths=[material_a, material_b],
+                        material_target_durations=[1.0, 1.0],
+                    )
+
+        self.assertEqual(render_shapes, [(44100, 1), (44100, 1)])
+        self.assertIn("-ar", concat_args)
+        self.assertEqual(concat_args[concat_args.index("-ar") + 1], "44100")
+        self.assertIn("-ac", concat_args)
+        self.assertEqual(concat_args[concat_args.index("-ac") + 1], "1")
+        concat_command = " ".join(concat_args)
+        self.assertIn("lowpass=f=12000", concat_command)
+        self.assertIn("adeclick=", concat_command)
+        self.assertIn("alimiter=limit=0.900000", concat_command)
 
     def test_large_rendered_clip_concat_uses_concat_list_to_avoid_windows_command_limit(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1502,6 +1706,7 @@ class RealEvalTests(unittest.TestCase):
                         result = real_eval.run_real_suite(
                             root,
                             render=True,
+                            allow_unverified_reference_render=True,
                             source_separation="never",
                             output_root=root / "reports",
                         )
@@ -1596,6 +1801,7 @@ class RealEvalTests(unittest.TestCase):
                         result = real_eval.run_real_suite(
                             root,
                             render=True,
+                            allow_unverified_reference_render=True,
                             source_separation="never",
                             output_root=root / "output",
                         )
@@ -1620,6 +1826,242 @@ class RealEvalTests(unittest.TestCase):
             result.cases[0].render_report_path,
             result.report_directory / "cases" / "song_CN__vmzCN" / "render" / "song_CN.diagnostics.jsonl",
         )
+
+    def test_rendered_real_eval_blocks_output_without_aligned_unit_timing(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzJP"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            _write_test_wave(origin / "song_JP.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "ha.wav", duration_seconds=1.0)
+
+            preflight_report = {
+                "status": "review_required",
+                "summary": {
+                    "material_count": 1,
+                    "warning_count": 1,
+                    "error_warning_count": 1,
+                    "review_required_match_count": 0,
+                    "minimum_match_score": 0.9,
+                    "extreme_stretch_count": 0,
+                    "moderate_stretch_count": 0,
+                },
+                "warnings": [
+                    {
+                        "severity": "error",
+                        "kind": "missing_aligned_unit_timing",
+                        "positioned_decision_count": 1,
+                        "timed_target_duration_count": 0,
+                    }
+                ],
+                "ordering": {
+                    "ordering": [{"rank": 1, "score": 0.9, "confidence_label": "strong"}],
+                    "timeline_alignment": {
+                        "decision_count": 1,
+                        "positioned_decision_count": 1,
+                        "resolved_target_duration_count": 1,
+                        "timed_target_duration_count": 0,
+                        "target_duration_total_seconds": 4.0,
+                    },
+                },
+                "stretch_plan": [
+                    {
+                        "target_duration_seconds": 4.0,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.95,
+                        "continuity_warning": "",
+                    }
+                ],
+            }
+
+            with patch("audio_processor.real_eval.build_preflight_report", return_value=preflight_report):
+                with patch("audio_processor.real_eval.run_batch_queue") as run_batch_mock:
+                    with patch(
+                        "audio_processor.real_eval.probe_audio",
+                        return_value={"streams": [{"codec_type": "audio", "duration": "4.0"}], "format": {}},
+                    ):
+                        result = real_eval.run_real_suite(
+                            root,
+                            render=True,
+                            allow_unverified_reference_render=True,
+                            source_separation="never",
+                            output_root=root / "output",
+                        )
+
+            summary_payload = json.loads(result.summary_path.read_text(encoding="utf-8"))
+
+        run_batch_mock.assert_not_called()
+        self.assertEqual(result.cases[0].status, "render_blocked")
+        self.assertIsNone(result.cases[0].output_path)
+        self.assertEqual(result.cases[0].summary["render_validation"]["status"], "render_blocked")
+        self.assertTrue(
+            any(warning["kind"] == "render_blocked_missing_aligned_unit_timing" for warning in result.cases[0].warnings)
+        )
+        self.assertEqual(summary_payload["suite"]["status_counts"], {"render_blocked": 1})
+        self.assertEqual(summary_payload["suite"]["recommended_exit_code"], 1)
+
+    def test_rendered_real_eval_blocks_unverified_reference_asr_by_default(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzJP"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            _write_test_wave(origin / "song_JP.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "ha.wav", duration_seconds=1.0)
+
+            preflight_report = {
+                "status": "review_required",
+                "summary": {
+                    "material_count": 1,
+                    "warning_count": 1,
+                    "error_warning_count": 1,
+                    "review_required_match_count": 0,
+                    "minimum_match_score": 0.9,
+                    "extreme_stretch_count": 0,
+                    "moderate_stretch_count": 0,
+                },
+                "warnings": [
+                    {
+                        "severity": "error",
+                        "kind": "reference_asr_unverified",
+                        "reference_path": str(origin / "song_JP.wav"),
+                        "backend": "whisperx",
+                    }
+                ],
+                "ordering": {
+                    "ordering": [{"rank": 1, "score": 0.9, "confidence_label": "strong"}],
+                    "timeline_alignment": {
+                        "decision_count": 1,
+                        "positioned_decision_count": 1,
+                        "resolved_target_duration_count": 1,
+                        "timed_target_duration_count": 1,
+                        "target_duration_total_seconds": 4.0,
+                    },
+                },
+                "stretch_plan": [
+                    {
+                        "target_duration_seconds": 4.0,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.95,
+                        "continuity_warning": "",
+                    }
+                ],
+            }
+
+            with patch("audio_processor.real_eval.build_preflight_report", return_value=preflight_report):
+                with patch("audio_processor.real_eval.run_batch_queue") as run_batch_mock:
+                    with patch(
+                        "audio_processor.real_eval.probe_audio",
+                        return_value={"streams": [{"codec_type": "audio", "duration": "4.0"}], "format": {}},
+                    ):
+                        result = real_eval.run_real_suite(
+                            root,
+                            render=True,
+                            source_separation="never",
+                            output_root=root / "output",
+                        )
+
+            summary_payload = json.loads(result.summary_path.read_text(encoding="utf-8"))
+
+        run_batch_mock.assert_not_called()
+        self.assertEqual(result.cases[0].status, "render_blocked")
+        self.assertIsNone(result.cases[0].output_path)
+        self.assertTrue(
+            any(warning["kind"] == "render_blocked_unverified_reference_text" for warning in result.cases[0].warnings)
+        )
+        self.assertEqual(result.cases[0].summary["render_validation"]["blocker_kind"], "render_blocked_unverified_reference_text")
+        self.assertEqual(summary_payload["suite"]["status_counts"], {"render_blocked": 1})
+
+    def test_rendered_real_eval_allows_unverified_reference_asr_when_explicit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzJP"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            _write_test_wave(origin / "song_JP.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "ha.wav", duration_seconds=1.0)
+
+            preflight_report = {
+                "status": "review_required",
+                "summary": {
+                    "material_count": 1,
+                    "warning_count": 1,
+                    "error_warning_count": 1,
+                    "review_required_match_count": 0,
+                    "minimum_match_score": 0.9,
+                    "extreme_stretch_count": 0,
+                    "moderate_stretch_count": 0,
+                },
+                "warnings": [{"severity": "error", "kind": "reference_asr_unverified"}],
+                "ordering": {
+                    "ordering": [{"rank": 1, "score": 0.9, "confidence_label": "strong"}],
+                    "timeline_alignment": {
+                        "decision_count": 1,
+                        "positioned_decision_count": 1,
+                        "resolved_target_duration_count": 1,
+                        "timed_target_duration_count": 1,
+                        "target_duration_total_seconds": 4.0,
+                    },
+                },
+                "stretch_plan": [
+                    {
+                        "target_duration_seconds": 4.0,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.95,
+                        "continuity_warning": "",
+                    }
+                ],
+            }
+
+            def fake_run_batch_queue(
+                items: list[QueueItem],
+                settings: ProcessingSettings,
+                **kwargs: object,
+            ) -> BatchSummary:
+                del settings, kwargs
+                _write_test_wave(items[0].output_path, duration_seconds=4.0)
+                return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+            with patch("audio_processor.real_eval.build_preflight_report", return_value=preflight_report):
+                with patch("audio_processor.real_eval.run_batch_queue", side_effect=fake_run_batch_queue) as run_batch_mock:
+                    with patch(
+                        "audio_processor.real_eval.probe_audio",
+                        return_value={"streams": [{"codec_type": "audio", "duration": "4.0"}], "format": {}},
+                    ):
+                        result = real_eval.run_real_suite(
+                            root,
+                            render=True,
+                            allow_unverified_reference_render=True,
+                            source_separation="never",
+                            output_root=root / "output",
+                        )
+
+        run_batch_mock.assert_called_once()
+        self.assertEqual(result.cases[0].status, "rendered")
+        self.assertIsNotNone(result.cases[0].output_path)
+
+    def test_real_eval_render_defaults_auto_asr_backend_to_whisperx(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            state = real_eval._apply_rendered_eval_asr_backend(render=True, requested_backend=None)
+            try:
+                self.assertEqual(os.environ["VOCAL_PROCESS_ASR_BACKEND"], "whisperx")
+            finally:
+                real_eval._restore_asr_backend(state)
+
+            self.assertNotIn("VOCAL_PROCESS_ASR_BACKEND", os.environ)
+
+    def test_real_eval_render_keeps_explicit_asr_backend(self) -> None:
+        with patch.dict(os.environ, {"VOCAL_PROCESS_ASR_BACKEND": "funasr"}, clear=True):
+            state = real_eval._apply_rendered_eval_asr_backend(render=True, requested_backend=None)
+            try:
+                self.assertIsNone(state)
+                self.assertEqual(os.environ["VOCAL_PROCESS_ASR_BACKEND"], "funasr")
+            finally:
+                real_eval._restore_asr_backend(state)
 
     def test_real_eval_render_failed_validation_ignores_stale_output_duration(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1725,6 +2167,7 @@ class RealEvalTests(unittest.TestCase):
                     result = real_eval.run_real_suite(
                         root,
                         render=True,
+                        allow_unverified_reference_render=True,
                         source_separation="never",
                         output_root=root / "reports",
                     )
@@ -1773,6 +2216,7 @@ class RealEvalTests(unittest.TestCase):
                     result = real_eval.run_real_suite(
                         root,
                         render=True,
+                        allow_unverified_reference_render=True,
                         source_separation="never",
                         output_root=root / "reports",
                     )
@@ -1814,6 +2258,7 @@ class RealEvalTests(unittest.TestCase):
                                 "--root",
                                 str(root),
                                 "--render",
+                                "--allow-unverified-reference-render",
                                 "--source-separation",
                                 "never",
                                 "--output-root",
@@ -3471,6 +3916,123 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["decision_details"][0]["reference_segment_unit_count"], 1)
         self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (0.666667, 0.666667, 0.666667))
 
+    def test_absolute_timeline_duplicate_positions_preserve_segment_active_budget(self) -> None:
+        reference_segments = [
+            VoiceSegment(10.0, 10.5, "ha", timing_source="asr_segment", language_hint="JP"),
+        ]
+        decisions = [
+            MaterialOrderDecision(
+                rank=1,
+                material_path=Path("ha_a.wav"),
+                score=0.8,
+                reference_text="ha",
+                material_text="ha",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=0,
+                phonetic_position=0,
+                phonetic_span_units=1,
+                language_hint="JP",
+            ),
+            MaterialOrderDecision(
+                rank=2,
+                material_path=Path("ha_b.wav"),
+                score=0.8,
+                reference_text="ha",
+                material_text="ha",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                text_position=0,
+                phonetic_position=0,
+                phonetic_span_units=1,
+                language_hint="JP",
+            ),
+        ]
+
+        active_durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=40.0,
+            preserve_positioned_active_total=True,
+        )
+        slots, audible, pre_silences, post_silences = model_runtime._target_timeline_slots_for_decisions(
+            reference_segments,
+            decisions,
+            active_durations,
+            reference_duration=40.0,
+        )
+
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in active_durations), (0.5, 0.5))
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in audible), (0.25, 0.25))
+        self.assertEqual(tuple(round(value, 6) for value in pre_silences), (10.0, 0.0))
+        self.assertEqual(tuple(round(value, 6) for value in post_silences), (0.0, 29.5))
+        self.assertEqual(tuple(round(duration or 0.0, 6) for duration in slots), (10.25, 29.75))
+
+    def test_jp_aligned_unit_timing_smooths_sub_consonant_slots(self) -> None:
+        reference_segments = [
+            VoiceSegment(
+                0.0,
+                1.0,
+                "kakiku",
+                timing_source="asr_segment",
+                language_hint="JP",
+                unit_timings=(
+                    VoiceUnitTiming(0, "ka", 0.0, 0.010, timing_source="whisperx"),
+                    VoiceUnitTiming(1, "ki", 0.010, 0.500, timing_source="whisperx"),
+                    VoiceUnitTiming(2, "ku", 0.500, 1.000, timing_source="whisperx"),
+                ),
+            ),
+        ]
+        decisions = [
+            MaterialOrderDecision(
+                rank=1,
+                material_path=Path("ka.wav"),
+                score=0.8,
+                reference_text="ka",
+                material_text="ka",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                phonetic_position=0,
+                phonetic_span_units=1,
+                language_hint="JP",
+            ),
+            MaterialOrderDecision(
+                rank=2,
+                material_path=Path("ki.wav"),
+                score=0.8,
+                reference_text="ki",
+                material_text="ki",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                phonetic_position=1,
+                phonetic_span_units=1,
+                language_hint="JP",
+            ),
+            MaterialOrderDecision(
+                rank=3,
+                material_path=Path("ku.wav"),
+                score=0.8,
+                reference_text="ku",
+                material_text="ku",
+                reason="reference_text_position",
+                reference_segment_index=0,
+                phonetic_position=2,
+                phonetic_span_units=1,
+                language_hint="JP",
+            ),
+        ]
+
+        durations = model_runtime._target_durations_for_decisions(
+            reference_segments,
+            decisions,
+            reference_duration=1.0,
+            preserve_positioned_active_total=True,
+        )
+
+        self.assertGreaterEqual(durations[0] or 0.0, 0.045)
+        self.assertAlmostEqual(sum(duration or 0.0 for duration in durations), 1.0)
+        self.assertLess(durations[1] or 0.0, 0.490)
+
     def test_preflight_warns_when_filename_pronunciation_matches_multiple_positions(self) -> None:
         decision = model_runtime.OrderingDecision(
             rank=1,
@@ -3568,17 +4130,17 @@ class ModelRuntimeTests(unittest.TestCase):
 
         self.assertEqual(report["summary"]["continuity_warning_count"], 1)
         self.assertEqual(report["summary"]["fade_applied_clip_count"], 1)
-        self.assertAlmostEqual(report["summary"]["stretch_naturalness_score_mean"] or 0.0, 0.39)
+        self.assertAlmostEqual(report["summary"]["stretch_naturalness_score_mean"] or 0.0, 0.48)
         self.assertAlmostEqual(report["stretch_plan"][0]["timeline_requested_tempo"], 0.25)
         self.assertAlmostEqual(report["stretch_plan"][0]["requested_rubberband_tempo"], 0.5)
         self.assertEqual(report["stretch_plan"][0]["continuity_warning"], "single_syllable_boundary_risk")
         self.assertEqual(
             report["stretch_plan"][0]["boundary_conditioning"],
-            "signalsmith_vowel_core_stretch+fade_in_out+tempo_safe_silence_pad",
+            "vowel_core_stretch+fade_in_out+tempo_safe_silence_pad",
         )
         self.assertEqual(
             report["optimization"]["render_continuity"]["boundary_conditioning"],
-            "signalsmith_vowel_core_stretch+per_clip_fade_in_out+tempo_safe_silence_pad",
+            "vowel_core_stretch+per_clip_fade_in_out+tempo_safe_silence_pad",
         )
         self.assertTrue(any(warning["kind"] == "single_syllable_boundary_risk" for warning in report["warnings"]))
 

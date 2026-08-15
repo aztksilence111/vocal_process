@@ -48,6 +48,9 @@ from .uvr_worker import (
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
 
+JP_SHORT_UNIT_MIN_ACTIVE_SECONDS = 0.045
+JP_SHORT_UNIT_MIN_ACTIVE_AVERAGE_FRACTION = 0.80
+
 
 class _WhisperXAudioLoadFailed(RuntimeError):
     pass
@@ -3282,7 +3285,11 @@ def _target_durations_for_decisions(
     if reference_duration <= 0:
         return tuple(None for _ in decisions)
 
-    positioned_targets = _positioned_target_durations(reference_segments, decisions)
+    positioned_targets = _smooth_short_positioned_target_durations(
+        reference_segments,
+        decisions,
+        _positioned_target_durations(reference_segments, decisions),
+    )
     if positioned_targets and any(target is not None for target in positioned_targets):
         if _can_preserve_positioned_target_durations(reference_segments, decisions, positioned_targets):
             if preserve_positioned_active_total:
@@ -3300,6 +3307,7 @@ def _target_durations_for_decisions(
             positioned_targets,
             decisions,
             reference_duration=reference_duration,
+            preserve_explicit_total=preserve_positioned_active_total,
         )
 
     normalized_reference_texts = {
@@ -3350,8 +3358,78 @@ def _target_durations_for_decisions(
             targets,
             decisions,
             reference_duration=reference_duration,
+            preserve_explicit_total=preserve_positioned_active_total,
         )
     return _weighted_target_durations(decisions, reference_duration=reference_duration)
+
+
+def _smooth_short_positioned_target_durations(
+    reference_segments: Sequence[VoiceSegment],
+    decisions: Sequence[MaterialOrderDecision],
+    targets: Sequence[float | None],
+) -> tuple[float | None, ...]:
+    if len(targets) != len(decisions) or not targets:
+        return tuple(targets)
+
+    smoothed: list[float | None] = [
+        float(target) if target is not None else None
+        for target in targets
+    ]
+    groups: dict[int, list[int]] = {}
+    for index, decision in enumerate(decisions):
+        if smoothed[index] is None:
+            continue
+        segment_index = decision.reference_segment_index
+        if segment_index is None or not 0 <= segment_index < len(reference_segments):
+            continue
+        segment = reference_segments[segment_index]
+        language = _normalize_cn_jp_language(decision.language_hint or segment.language_hint)
+        if language != "JP":
+            continue
+        if not _is_short_timeline_decision(decision):
+            continue
+        groups.setdefault(segment_index, []).append(index)
+
+    for indices in groups.values():
+        values = [float(smoothed[index] or 0.0) for index in indices]
+        total = sum(values)
+        if total <= 0 or len(values) < 2:
+            continue
+        average = total / len(values)
+        floor = min(JP_SHORT_UNIT_MIN_ACTIVE_SECONDS, average * JP_SHORT_UNIT_MIN_ACTIVE_AVERAGE_FRACTION)
+        if floor <= 0:
+            continue
+        adjusted = _redistribute_target_durations_with_floor(values, floor)
+        for index, value in zip(indices, adjusted):
+            smoothed[index] = value
+    return tuple(smoothed)
+
+
+def _is_short_timeline_decision(decision: MaterialOrderDecision) -> bool:
+    text = decision.material_text or decision.material_path.stem
+    units = _timeline_units(text, language_hint=decision.language_hint)
+    return 0 < len(units) <= 4
+
+
+def _redistribute_target_durations_with_floor(values: Sequence[float], floor: float) -> list[float]:
+    total = sum(max(float(value), 0.0) for value in values)
+    if total <= 0:
+        return [0.0 for _ in values]
+    if floor * len(values) > total:
+        floor = max(total / len(values) * JP_SHORT_UNIT_MIN_ACTIVE_AVERAGE_FRACTION, 0.0)
+    adjusted = [max(float(value), floor) for value in values]
+    excess = sum(adjusted) - total
+    if excess <= 0:
+        return adjusted
+
+    capacities = [max(value - floor, 0.0) for value in adjusted]
+    capacity_total = sum(capacities)
+    if capacity_total <= 0:
+        return _fit_target_durations_to_total(adjusted, total)
+    return [
+        value - (excess * (capacity / capacity_total))
+        for value, capacity in zip(adjusted, capacities)
+    ]
 
 
 def _target_timeline_slots_for_decisions(
@@ -4046,6 +4124,7 @@ def _fill_unresolved_target_durations(
     decisions: Sequence[MaterialOrderDecision],
     *,
     reference_duration: float,
+    preserve_explicit_total: bool = False,
 ) -> tuple[float | None, ...]:
     if len(targets) != len(decisions):
         return _weighted_target_durations(decisions, reference_duration=reference_duration)
@@ -4061,6 +4140,8 @@ def _fill_unresolved_target_durations(
     explicit_index_set = set(explicit_indices)
     unresolved_indices = [index for index in range(len(targets)) if index not in explicit_index_set]
     if not unresolved_indices:
+        if preserve_explicit_total:
+            return tuple(float(targets[index] or 0.0) for index in explicit_indices)
         return tuple(
             _fit_target_durations_to_total(
                 [float(targets[index] or 0.0) for index in explicit_indices],
@@ -4070,6 +4151,18 @@ def _fill_unresolved_target_durations(
 
     resolved: list[float | None] = [None for _ in targets]
     explicit_sum = sum(float(targets[index] or 0.0) for index in explicit_indices)
+    if preserve_explicit_total:
+        for index in explicit_indices:
+            resolved[index] = float(targets[index] or 0.0)
+        unresolved_budget = _minimum_target_duration_budget(reference_duration, len(unresolved_indices))
+        unresolved_values = _fit_target_durations_to_total(
+            [_decision_text_weight(decisions[index]) for index in unresolved_indices],
+            unresolved_budget,
+        )
+        for index, value in zip(unresolved_indices, unresolved_values):
+            resolved[index] = value
+        return tuple(float(value or 0.0) for value in resolved)
+
     unresolved_reserve = _minimum_target_duration_budget(reference_duration, len(unresolved_indices))
     explicit_budget = max(reference_duration - unresolved_reserve, 0.0)
 
