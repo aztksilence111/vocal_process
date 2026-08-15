@@ -1,5 +1,16 @@
 # Conversation Log
 
+## Latest Update - 2026-08-15 Strict Reference Timeline Gate
+
+1. User corrected the previous diagnosis again: the failure is not only ASR hallucinated target text. The generated timelines themselves can be wrong, and Chinese references can also suffer from ASR recognition errors.
+2. The acceptance rule is now split into three independent gates: verified reference text, exact reference unit timing, and render duration. Total WAV duration matching the original vocal is no longer treated as enough timeline evidence.
+3. `audio_processor.model_runtime` now reports `exact_timed_target_duration_count` and `resampled_timing_lattice_count` in `timeline_alignment`. A decision whose timing lattice was resampled or interpolated is no longer counted as exact per-unit timing.
+4. `audio_processor.preflight` now raises error warnings for `resampled_aligned_unit_timing` and `lyric_timing_conflict`. This applies to CN and JP; ASR-only or retargeted timing cannot silently pass because the language is Chinese.
+5. `audio_processor.real_eval` now blocks rendered review audio for resampled/interpolated unit timing (`render_blocked_resampled_aligned_unit_timing`) and timestamped-lyric/acoustic conflicts (`render_blocked_lyric_timing_conflict`).
+6. Scorecards now expose `exact_timed_target_duration_ratio` and `resampled_timing_lattice_ratio`; `aligned_timing_score` is based on exact unit timing rather than all timed-looking spans.
+7. Validation passed: full `.venv311\Scripts\python.exe -m unittest discover -s tests` with `192` tests, `compileall`, `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` with only existing LF/CRLF warnings.
+8. Strict real JP/MGRoid no-lyrics gate remains blocked at `tests_real\output\jp-reference-timing-trust-gate-20260815\reports\real-eval-20260815-221655\summary.json`; status `render_blocked`, warning `render_blocked_unverified_reference_text`, no audio files produced.
+
 ## Latest Update - 2026-08-15 Reference Vocal Trust Gate And MGRoid OTO Source Windows
 
 1. User corrected the latest diagnosis: the mismatch was not that the rendered content was unrelated to the material audio, but that it was unrelated to the original/reference vocal content.
@@ -1695,3 +1706,15 @@ Remaining after this continuation:
 9. Validation passed with `.venv311`: full `unittest discover -s tests` ran `189` tests, `compileall` passed, `audio_processor check` passed, and `git diff --check` only reported existing LF/CRLF warnings.
 10. Strict real gate evidence is `tests_real\output\jp-reference-trust-gate-20260815-rerun\reports\real-eval-20260815-201712\summary.json`: status `render_blocked`, warning `render_blocked_unverified_reference_text`, no output WAV files under `tests_real\output\jp-reference-trust-gate-20260815-rerun\audio`.
 11. DSP-only smoke evidence is `.tmp\mgroid-atempo-chain-smoke\ga_chain.wav`, measured as mono `44100 Hz`, `0.099819 s`, `peak=0.528753`, `jump999=0.083761`, and `jumpmax=0.086546`.
+
+### 2026-08-15: Strict Reference Timeline Gate
+
+1. User clarified that the time axis is also wrong, not only the ASR target text, and that Chinese references also have ASR recognition errors.
+2. The implementation now treats reference-text correctness and reference-timing correctness as separate gates. A rendered file must not pass just because total duration equals the original vocal.
+3. Timeline summaries now separate exact aligned unit timing from resampled/interpolated timing through `exact_timed_target_duration_count` and `resampled_timing_lattice_count`.
+4. `preflight` now reports `resampled_aligned_unit_timing` as an error, because resampling can place syllable boundaries at interpolated positions even when `timed_target_duration_count` looks complete.
+5. `lyric_timing_conflict` is now also an error. If timestamped lyrics disagree with ASR/acoustic timing, the case is not timeline-trusted.
+6. `real_eval --render` blocks those two timing failures with `render_blocked_resampled_aligned_unit_timing` and `render_blocked_lyric_timing_conflict`.
+7. Scorecards now include `exact_timed_target_duration_ratio` and `resampled_timing_lattice_ratio`, and `aligned_timing_score` uses exact unit timing only.
+8. Verification passed with `.venv311`: `192` full tests, `compileall`, `audio_processor check`, and `git diff --check`.
+9. The real JP/MGRoid no-lyrics gate still produced no audio at `tests_real\output\jp-reference-timing-trust-gate-20260815`; report `real-eval-20260815-221655` remains blocked by unverified reference text before any formal render.

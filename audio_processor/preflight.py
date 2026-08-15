@@ -201,7 +201,7 @@ def _preflight_warnings(
         if isinstance(note, str) and note.startswith("lyric_timing_conflict:"):
             warnings.append(
                 {
-                    "severity": "warning",
+                    "severity": "error",
                     "kind": "lyric_timing_conflict",
                     "message": note,
                 }
@@ -222,6 +222,23 @@ def _preflight_warnings(
                         "Reference alignment does not provide actual start/end timing for every positioned "
                         "word or pronunciation unit; proportional duration fallback is not strict enough for "
                         "automatic rendered-audio acceptance."
+                    ),
+                }
+            )
+        resampled_count = _positive_int(timeline_alignment.get("resampled_timing_lattice_count"))
+        if resampled_count > 0:
+            exact_timed_count = _positive_int(timeline_alignment.get("exact_timed_target_duration_count"))
+            warnings.append(
+                {
+                    "severity": "error",
+                    "kind": "resampled_aligned_unit_timing",
+                    "resampled_timing_lattice_count": resampled_count,
+                    "exact_timed_target_duration_count": exact_timed_count,
+                    "timed_target_duration_count": timed_count,
+                    "message": (
+                        "Reference unit timing had to be resampled or interpolated before timeline assignment. "
+                        "This is not strict start/end timing and can shift syllables even when total duration "
+                        "matches the original vocal."
                     ),
                 }
             )

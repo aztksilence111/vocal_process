@@ -3584,6 +3584,13 @@ def _render_timeline_alignment_summary(
     timed_target_duration_count = sum(
         1 for detail in decision_details if detail.get("target_duration_source") == "aligned_unit_timing"
     )
+    resampled_timing_lattice_count = sum(
+        1
+        for detail in decision_details
+        if detail.get("target_duration_source") == "aligned_unit_timing"
+        and bool(detail.get("timing_lattice_resampled"))
+    )
+    exact_timed_target_duration_count = max(timed_target_duration_count - resampled_timing_lattice_count, 0)
     return {
         "format": "vocal_process_timeline_alignment_summary_v1",
         "reference_segment_count": len(reference_segments),
@@ -3594,6 +3601,8 @@ def _render_timeline_alignment_summary(
         "split_reference_segment_indices": split_segment_indices,
         "resolved_target_duration_count": sum(1 for duration in target_durations if duration is not None),
         "timed_target_duration_count": timed_target_duration_count,
+        "exact_timed_target_duration_count": exact_timed_target_duration_count,
+        "resampled_timing_lattice_count": resampled_timing_lattice_count,
         "target_duration_total_seconds": sum(float(duration or 0.0) for duration in target_durations),
         "target_audible_duration_total_seconds": sum(
             float(duration or 0.0)
@@ -3829,6 +3838,7 @@ def _render_timeline_alignment_details(
             "target_duration_source": "weighted_duration",
             "aligned_unit_count": 0,
             "expected_unit_count": 0,
+            "timing_lattice_resampled": False,
             "target_duration_ratio": None,
             "score": decision.score,
             "confidence_label": decision.confidence_label,

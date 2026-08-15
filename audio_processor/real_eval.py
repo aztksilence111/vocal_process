@@ -1194,6 +1194,32 @@ def _unverified_reference_render_blocker_warning(report: dict[str, Any]) -> dict
 def _render_timing_blocker_warning(report: dict[str, Any]) -> dict[str, Any] | None:
     warnings = report.get("warnings", []) if isinstance(report, dict) else []
     for warning in warnings if isinstance(warnings, list) else []:
+        if isinstance(warning, dict) and warning.get("kind") == "lyric_timing_conflict":
+            return {
+                "severity": "error",
+                "kind": "render_blocked_lyric_timing_conflict",
+                "message": (
+                    "Rendered real-eval requires reference timing that agrees with timestamped lyrics. "
+                    "The current lyrics and ASR/acoustic timing disagree, so this case is blocked instead "
+                    "of producing a timeline-misleading review file."
+                ),
+            }
+        if isinstance(warning, dict) and warning.get("kind") == "resampled_aligned_unit_timing":
+            resampled_count = _positive_int(warning.get("resampled_timing_lattice_count"))
+            exact_timed_count = _positive_int(warning.get("exact_timed_target_duration_count"))
+            timed_count = _positive_int(warning.get("timed_target_duration_count"))
+            return {
+                "severity": "error",
+                "kind": "render_blocked_resampled_aligned_unit_timing",
+                "resampled_timing_lattice_count": resampled_count,
+                "exact_timed_target_duration_count": exact_timed_count,
+                "timed_target_duration_count": timed_count,
+                "message": (
+                    "Rendered real-eval requires exact reference unit start/end timing. "
+                    "This case uses resampled or interpolated unit timing, which can shift syllables "
+                    "even when total duration matches the original vocal."
+                ),
+            }
         if isinstance(warning, dict) and warning.get("kind") == "missing_aligned_unit_timing":
             positioned_count = _positive_int(warning.get("positioned_decision_count"))
             timed_count = _positive_int(warning.get("timed_target_duration_count"))
@@ -1215,6 +1241,21 @@ def _render_timing_blocker_warning(report: dict[str, Any]) -> dict[str, Any] | N
         return None
     positioned_count = _positive_int(timeline_alignment.get("positioned_decision_count"))
     timed_count = _positive_int(timeline_alignment.get("timed_target_duration_count"))
+    resampled_count = _positive_int(timeline_alignment.get("resampled_timing_lattice_count"))
+    if resampled_count > 0:
+        exact_timed_count = _positive_int(timeline_alignment.get("exact_timed_target_duration_count"))
+        return {
+            "severity": "error",
+            "kind": "render_blocked_resampled_aligned_unit_timing",
+            "resampled_timing_lattice_count": resampled_count,
+            "exact_timed_target_duration_count": exact_timed_count,
+            "timed_target_duration_count": timed_count,
+            "message": (
+                "Rendered real-eval requires exact reference unit start/end timing. "
+                "This case uses resampled or interpolated unit timing, which can shift syllables "
+                "even when total duration matches the original vocal."
+            ),
+        }
     if positioned_count <= 0 or timed_count >= positioned_count:
         return None
     return {
@@ -1290,6 +1331,8 @@ def _case_summary(
             "match_ordering_score": scorecard["match_ordering_score"],
             "positioned_decision_ratio": scorecard["positioned_decision_ratio"],
             "timed_target_duration_ratio": scorecard["timed_target_duration_ratio"],
+            "exact_timed_target_duration_ratio": scorecard["exact_timed_target_duration_ratio"],
+            "resampled_timing_lattice_ratio": scorecard["resampled_timing_lattice_ratio"],
             "aligned_timing_score": scorecard["aligned_timing_score"],
             "target_duration_alignment_score": scorecard["target_duration_alignment_score"],
             "stretch_warning_score": scorecard["stretch_warning_score"],
@@ -1341,11 +1384,18 @@ def _alignment_scorecard(
     positioned_decision_count = _positive_int(timeline_alignment.get("positioned_decision_count"))
     resolved_target_count = _positive_int(timeline_alignment.get("resolved_target_duration_count"))
     timed_target_count = _positive_int(timeline_alignment.get("timed_target_duration_count"))
+    resampled_timing_lattice_count = _positive_int(timeline_alignment.get("resampled_timing_lattice_count"))
+    exact_timed_target_count = _positive_int(
+        timeline_alignment.get("exact_timed_target_duration_count"),
+        fallback=max(timed_target_count - resampled_timing_lattice_count, 0),
+    )
     positioned_decision_ratio = _ratio(positioned_decision_count, decision_count)
     resolved_target_duration_ratio = _ratio(resolved_target_count, decision_count)
     timed_target_duration_ratio = _ratio(timed_target_count, decision_count)
+    exact_timed_target_duration_ratio = _ratio(exact_timed_target_count, decision_count)
+    resampled_timing_lattice_ratio = _ratio(resampled_timing_lattice_count, decision_count)
     timeline_position_score = _clamp01(0.7 * positioned_decision_ratio + 0.3 * resolved_target_duration_ratio)
-    aligned_timing_score = timed_target_duration_ratio
+    aligned_timing_score = exact_timed_target_duration_ratio
 
     stretch_penalty = _ratio(extreme_stretch_count + 0.5 * moderate_stretch_count, material_count)
     stretch_warning_score = _clamp01(1.0 - stretch_penalty)
@@ -1404,7 +1454,7 @@ def _alignment_scorecard(
         and target_duration_delta_ratio is not None
         and target_duration_delta_ratio <= STRICT_DURATION_TOLERANCE_RATIO
         and positioned_decision_ratio >= 0.95
-        and timed_target_duration_ratio >= 0.95
+        and exact_timed_target_duration_ratio >= 0.95
     )
 
     return {
@@ -1426,6 +1476,10 @@ def _alignment_scorecard(
         "resolved_target_duration_ratio": _round_float(resolved_target_duration_ratio),
         "timed_target_duration_count": timed_target_count,
         "timed_target_duration_ratio": _round_float(timed_target_duration_ratio),
+        "exact_timed_target_duration_count": exact_timed_target_count,
+        "exact_timed_target_duration_ratio": _round_float(exact_timed_target_duration_ratio),
+        "resampled_timing_lattice_count": resampled_timing_lattice_count,
+        "resampled_timing_lattice_ratio": _round_float(resampled_timing_lattice_ratio),
         "aligned_timing_score": _round_float(aligned_timing_score),
         "timeline_position_score": _round_float(timeline_position_score),
         "reference_duration_seconds": _round_float(reference_duration_seconds),
@@ -1510,6 +1564,8 @@ def _suite_score_summary(results: Sequence[RealCaseResult]) -> dict[str, Any]:
     planning_scores = _summary_values(results, "planning_alignment_score")
     render_scores = _summary_values(results, "rendered_audio_alignment_score")
     match_scores = _summary_values(results, "match_ordering_score")
+    exact_timing_scores = _summary_values(results, "exact_timed_target_duration_ratio")
+    resampled_timing_ratios = _summary_values(results, "resampled_timing_lattice_ratio")
     stretch_quality_scores = _summary_values(results, "stretch_quality_score")
     stretch_naturalness_scores = _summary_values(results, "stretch_naturalness_score")
     continuity_warning_ratios = _summary_values(results, "continuity_warning_ratio")
@@ -1528,6 +1584,8 @@ def _suite_score_summary(results: Sequence[RealCaseResult]) -> dict[str, Any]:
         "planning_alignment_score": _stats(planning_scores),
         "rendered_audio_alignment_score": _stats(render_scores),
         "match_ordering_score": _stats(match_scores),
+        "exact_timed_target_duration_ratio": _stats(exact_timing_scores),
+        "resampled_timing_lattice_ratio": _stats(resampled_timing_ratios),
         "stretch_quality_score": _stats(stretch_quality_scores),
         "stretch_naturalness_score": _stats(stretch_naturalness_scores),
         "continuity_warning_ratio": _stats(continuity_warning_ratios),

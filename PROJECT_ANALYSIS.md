@@ -1,5 +1,30 @@
 # Project Analysis
 
+## Latest Update - 2026-08-15 Strict Reference Timeline Gate
+
+The latest user correction is important: content truth is not the only blocker. A rendered file can also have the wrong timeline even when the output duration matches the original vocal. Chinese cases have the same ASR-risk class as Japanese cases; language-specific confidence must not become a reason to trust ASR-only text or interpolated timing.
+
+Architecture decision:
+
+1. Formal rendered evaluation now has three distinct acceptance dimensions: reference text truth, exact unit timing truth, and final render duration. The old score path over-weighted final duration and `timed_target_duration_count`.
+2. `timed_target_duration_count` only means a duration was assigned from something shaped like unit timing. It is insufficient when the timing lattice was resampled or interpolated.
+3. `exact_timed_target_duration_count` is now the stricter signal for per-unit start/end acceptance. `resampled_timing_lattice_count` exposes how much of a case depends on interpolated timing.
+4. `aligned_timing_score` now follows exact timing, not all timed-looking spans. This makes future score summaries harsher but closer to what manual listening is rejecting.
+5. Timestamped lyric conflicts are timeline blockers. If lyrics and ASR/acoustic segment timing disagree, the system should stop and report the conflict rather than selecting one silently.
+
+Implications:
+
+1. A CN case without trusted lyrics/transcript remains ASR-only and should be blocked for formal render just like a JP case.
+2. A lyrics-backed case can still be blocked if the ASR/forced-alignment timing must be resampled to fit the lyric units.
+3. Future real-eval review should read `exact_timed_target_duration_ratio`, `resampled_timing_lattice_ratio`, and `render_validation.blocker_kind` before any listening pass.
+4. The next valid audio generation pass should use verified text plus exact unit timing coverage. Otherwise manual listening will continue to mix DSP artifacts with wrong target placement.
+
+Validation:
+
+1. Full `.venv311\Scripts\python.exe -m unittest discover -s tests` passed with `192` tests.
+2. `compileall`, `audio_processor check`, and `git diff --check` passed; diff check only reported LF/CRLF warnings.
+3. Real strict gate rerun for `1000nenyikiteru_JP__MGRoid` stayed blocked at `tests_real\output\jp-reference-timing-trust-gate-20260815\reports\real-eval-20260815-221655\summary.json` and produced no audio files.
+
 ## Latest Update - 2026-08-15 Reference Vocal Truth Gate
 
 The latest manual correction changes the failure class. The most damaging mismatch is not that material audio is unrelated to itself; it is that the rendered sequence can become unrelated to the original/reference vocal when the reference-side target text is ASR-only and unverified.
@@ -1953,3 +1978,21 @@ Residual risk:
 
 1. This does not solve the content-valid JP suite by itself; it prevents producing misleading files until verified reference text exists.
 2. Real listening validation must resume from lyrics/subtitle-backed cases, otherwise matching scores can still reward the wrong target sequence.
+
+### Strict Reference Timeline Gate
+
+The project now treats "has unit timing" and "has exact trustworthy unit timing" as different states. The user is correct that time-axis failure remains possible even after text hallucination is blocked.
+
+Policy update:
+
+1. `timed_target_duration_count` is no longer enough for acceptance. Resampled or interpolated timing can still sound off because individual syllable boundaries are not the original vocal boundaries.
+2. `exact_timed_target_duration_count` and `resampled_timing_lattice_count` are now recorded in `timeline_alignment`.
+3. `aligned_timing_score` and strict render pass logic now use exact timing coverage.
+4. `resampled_aligned_unit_timing` is an error in preflight and blocks rendered real-eval.
+5. `lyric_timing_conflict` is also an error and blocks rendered real-eval when timestamped lyrics disagree with ASR/acoustic timing.
+6. These rules are language-agnostic. CN ASR recognition errors are handled by the same verified-text and exact-timing gates as JP.
+
+Residual risk:
+
+1. This is a trust-gate repair, not a final timeline-reconstruction algorithm. It prevents bad outputs from being accepted and makes reports more honest.
+2. The next algorithmic step is to produce exact timing from a better forced-alignment path when lyrics are available, instead of relying on retargeted/resampled ASR timings.

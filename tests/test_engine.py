@@ -1902,6 +1902,89 @@ class RealEvalTests(unittest.TestCase):
         self.assertEqual(summary_payload["suite"]["status_counts"], {"render_blocked": 1})
         self.assertEqual(summary_payload["suite"]["recommended_exit_code"], 1)
 
+    def test_rendered_real_eval_blocks_resampled_unit_timing(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzCN"
+            lyrics_root = root / "lyrics"
+            origin.mkdir(parents=True)
+            material_root.mkdir(parents=True)
+            lyrics_root.mkdir(parents=True)
+            _write_test_wave(origin / "song_CN.wav", duration_seconds=4.0)
+            _write_test_wave(material_root / "wo.wav", duration_seconds=1.0)
+            (lyrics_root / "song_CN.txt").write_text("\u6211", encoding="utf-8")
+
+            preflight_report = {
+                "status": "review_required",
+                "summary": {
+                    "material_count": 1,
+                    "warning_count": 1,
+                    "error_warning_count": 1,
+                    "review_required_match_count": 0,
+                    "minimum_match_score": 0.9,
+                    "extreme_stretch_count": 0,
+                    "moderate_stretch_count": 0,
+                },
+                "warnings": [
+                    {
+                        "severity": "error",
+                        "kind": "resampled_aligned_unit_timing",
+                        "resampled_timing_lattice_count": 1,
+                        "exact_timed_target_duration_count": 0,
+                        "timed_target_duration_count": 1,
+                    }
+                ],
+                "ordering": {
+                    "ordering": [{"rank": 1, "score": 0.9, "confidence_label": "strong"}],
+                    "timeline_alignment": {
+                        "decision_count": 1,
+                        "positioned_decision_count": 1,
+                        "resolved_target_duration_count": 1,
+                        "timed_target_duration_count": 1,
+                        "exact_timed_target_duration_count": 0,
+                        "resampled_timing_lattice_count": 1,
+                        "target_duration_total_seconds": 4.0,
+                    },
+                },
+                "stretch_plan": [
+                    {
+                        "target_duration_seconds": 4.0,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.95,
+                        "continuity_warning": "",
+                    }
+                ],
+            }
+
+            with patch("audio_processor.real_eval.build_preflight_report", return_value=preflight_report):
+                with patch("audio_processor.real_eval.run_batch_queue") as run_batch_mock:
+                    with patch(
+                        "audio_processor.real_eval.probe_audio",
+                        return_value={"streams": [{"codec_type": "audio", "duration": "4.0"}], "format": {}},
+                    ):
+                        result = real_eval.run_real_suite(
+                            root,
+                            render=True,
+                            source_separation="never",
+                            output_root=root / "output",
+                        )
+
+            summary_payload = json.loads(result.summary_path.read_text(encoding="utf-8"))
+
+        run_batch_mock.assert_not_called()
+        self.assertEqual(result.cases[0].status, "render_blocked")
+        self.assertIsNone(result.cases[0].output_path)
+        self.assertTrue(
+            any(
+                warning["kind"] == "render_blocked_resampled_aligned_unit_timing"
+                for warning in result.cases[0].warnings
+            )
+        )
+        self.assertEqual(result.cases[0].summary["aligned_timing_score"], 0.0)
+        self.assertEqual(result.cases[0].summary["render_validation"]["blocker_kind"], "render_blocked_resampled_aligned_unit_timing")
+        self.assertEqual(summary_payload["suite"]["status_counts"], {"render_blocked": 1})
+
     def test_rendered_real_eval_blocks_unverified_reference_asr_by_default(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3684,6 +3767,8 @@ class ModelRuntimeTests(unittest.TestCase):
 
         self.assertEqual(tuple(round(duration or 0.0, 6) for duration in target_durations), (0.5, 0.5, 1.5, 1.5))
         self.assertEqual(summary["timed_target_duration_count"], 4)
+        self.assertEqual(summary["exact_timed_target_duration_count"], 0)
+        self.assertEqual(summary["resampled_timing_lattice_count"], 4)
         self.assertEqual(summary["mode"], "aligned_unit_timing")
         self.assertTrue(all(detail["target_duration_source"] == "aligned_unit_timing" for detail in summary["decision_details"]))
         self.assertTrue(all(detail["timing_lattice_resampled"] for detail in summary["decision_details"]))
@@ -4192,6 +4277,93 @@ class ModelRuntimeTests(unittest.TestCase):
         warnings = preflight._preflight_warnings(ordering, [])
 
         self.assertTrue(any(warning["kind"] == "missing_aligned_unit_timing" for warning in warnings))
+
+    def test_preflight_rejects_resampled_unit_timing_for_strict_timeline(self) -> None:
+        decision = model_runtime.OrderingDecision(
+            rank=1,
+            source_path=Path("wo.wav"),
+            score=0.8,
+            transcript_score=0.0,
+            filename_score=0.9,
+            duration_score=0.8,
+            speaker_score=0.0,
+            vad_score=1.0,
+            phonetic_score=0.9,
+            evidence_count=3,
+            confidence_label="strong",
+            reference_text="\u6211",
+            material_text="wo",
+            reason="reference_text_position",
+            reference_segment_index=0,
+            phonetic_position=0,
+            target_duration_seconds=1.0,
+        )
+        ordering = model_runtime.ModelOrderingResult(
+            reference=model_runtime.ReferenceAnalysis(
+                source_path=Path("reference.wav"),
+                vocal_path=Path("reference.wav"),
+                transcript="\u6211",
+                segments=(VoiceSegment(0.0, 1.0, "\u6211", timing_source="asr_segment_with_lyric_text"),),
+                speaker_embedding=None,
+                backend="test",
+            ),
+            library=model_runtime.MaterialLibraryAnalysis(
+                material_directory=Path("materials"),
+                materials=(),
+                backend_summary={},
+            ),
+            ordered_paths=(Path("wo.wav"),),
+            target_durations=(1.0,),
+            decisions=(decision,),
+            analysis_report={
+                "timeline_alignment": {
+                    "positioned_decision_count": 1,
+                    "timed_target_duration_count": 1,
+                    "exact_timed_target_duration_count": 0,
+                    "resampled_timing_lattice_count": 1,
+                }
+            },
+        )
+
+        warnings = preflight._preflight_warnings(ordering, [])
+
+        self.assertTrue(
+            any(
+                warning["kind"] == "resampled_aligned_unit_timing" and warning["severity"] == "error"
+                for warning in warnings
+            )
+        )
+
+    def test_preflight_marks_lyric_timing_conflict_as_error(self) -> None:
+        ordering = model_runtime.ModelOrderingResult(
+            reference=model_runtime.ReferenceAnalysis(
+                source_path=Path("reference.wav"),
+                vocal_path=Path("reference.wav"),
+                transcript="\u6211",
+                segments=(VoiceSegment(0.0, 1.0, "\u6211", timing_source="asr_segment_with_lyric_text"),),
+                speaker_embedding=None,
+                backend="whisperx",
+            ),
+            library=model_runtime.MaterialLibraryAnalysis(
+                material_directory=Path("materials"),
+                materials=(),
+                backend_summary={},
+            ),
+            ordered_paths=(),
+            target_durations=(),
+            decisions=(),
+            analysis_report={
+                "notes": [
+                    "lyric_timing_conflict: timestamped lyrics disagree with ASR/acoustic timing; conflicts=1/1"
+                ]
+            },
+        )
+
+        warnings = preflight._preflight_warnings(ordering, [])
+
+        self.assertTrue(
+            any(warning["kind"] == "lyric_timing_conflict" and warning["severity"] == "error" for warning in warnings)
+        )
 
     def test_preflight_marks_unverified_reference_asr_for_strict_acceptance(self) -> None:
         ordering = model_runtime.ModelOrderingResult(
