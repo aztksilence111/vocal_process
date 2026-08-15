@@ -114,6 +114,7 @@ def run_batch_queue(
             options = settings.to_process_options(item.input_path, item.output_path)
             _remove_stale_output_before_overwrite(item.output_path, options.overwrite, diagnostics)
             if settings.material_directory:
+                lyrics_file = settings.effective_lyrics_file()
                 diagnostics.event(
                     "model.runtime.preflight",
                     "Speech recognition runtime checked before ordering",
@@ -122,7 +123,7 @@ def run_batch_queue(
                 ordering = build_model_ordering(
                     item.input_path,
                     Path(settings.material_directory),
-                    lyrics_file=Path(settings.lyrics_file) if settings.lyrics_file else None,
+                    lyrics_file=Path(lyrics_file) if lyrics_file else None,
                     work_dir=diagnostics.path.parent / "model_analysis_cache",
                     compute_device=settings.compute_device,
                     source_separation=settings.source_separation,
@@ -377,8 +378,9 @@ def _log_input_diagnostics(
         metadata_failures=material_failures,
     )
 
-    if settings.lyrics_file:
-        lyrics_path = Path(settings.lyrics_file)
+    lyrics_file = settings.effective_lyrics_file()
+    if lyrics_file:
+        lyrics_path = Path(lyrics_file)
         diagnostics.event(
             "inputs.lyrics",
             "Lyrics file path recorded",

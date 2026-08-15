@@ -1,5 +1,14 @@
 # Conversation Log
 
+## Latest Update - 2026-08-15 GUI Manual Lyrics Mode
+
+1. User pointed out that making lyrics mandatory would violate the original product requirement: when no lyrics file is available, the system should still sort and align by the original/reference vocal.
+2. The strict real-eval blocker was kept instead of deleted. It remains a formal evaluation guard, while the normal software workflow now exposes the mode choice in the GUI.
+3. Added a persistent `manual_lyrics_enabled` setting. When disabled, any stored lyrics path is ignored and batch processing uses the original vocal ASR/alignment path. When enabled, the selected lyrics/subtitle file is validated and passed into ordering.
+4. GUI lyrics controls now include a "Manually add lyrics file" checkbox. The file entry, select button, and clear button are enabled only when the checkbox is active; selecting a lyrics file also enables the checkbox.
+5. CLI batch and VST3 bridge requests automatically enable manual lyrics mode when a `lyrics_file` is supplied, preserving existing external-call behavior.
+6. Validation passed: targeted settings/batch/CLI/VST tests, full `.venv311\Scripts\python.exe -m unittest discover -s tests` with `198` tests, `compileall`, `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` with only LF/CRLF warnings.
+
 ## Latest Update - 2026-08-15 Strict Reference Timeline Gate
 
 1. User corrected the previous diagnosis again: the failure is not only ASR hallucinated target text. The generated timelines themselves can be wrong, and Chinese references can also suffer from ASR recognition errors.
@@ -1718,3 +1727,12 @@ Remaining after this continuation:
 7. Scorecards now include `exact_timed_target_duration_ratio` and `resampled_timing_lattice_ratio`, and `aligned_timing_score` uses exact unit timing only.
 8. Verification passed with `.venv311`: `192` full tests, `compileall`, `audio_processor check`, and `git diff --check`.
 9. The real JP/MGRoid no-lyrics gate still produced no audio at `tests_real\output\jp-reference-timing-trust-gate-20260815`; report `real-eval-20260815-221655` remains blocked by unverified reference text before any formal render.
+
+### 2026-08-15: GUI Manual Lyrics Mode
+
+1. User corrected the direction: requiring a lyrics file globally would break the original no-lyrics workflow, where original/reference vocal ASR and alignment should drive sorting when lyrics are unavailable.
+2. The strict real-eval no-lyrics blocker was restored and kept as a formal evaluation guard rather than removed.
+3. GUI batch processing now has an explicit `manual_lyrics_enabled` mode. If unchecked, the batch ignores the lyrics path and uses original-vocal ASR/alignment. If checked, a real lyrics/subtitle file is required and passed into model ordering.
+4. The checkbox state is persisted in settings. Legacy settings that already contain a lyrics file automatically load with manual lyrics enabled for compatibility.
+5. CLI batch and VST3 bridge paths enable manual lyrics automatically when a `lyrics_file` is supplied, so existing non-GUI calls keep their behavior.
+6. Verification passed: focused settings/batch/CLI/VST regression tests and full `unittest discover -s tests` with `198` tests, plus `compileall`, `audio_processor check`, and `git diff --check`.

@@ -1396,6 +1396,7 @@ class SettingsTests(unittest.TestCase):
         settings = ProcessingSettings(
             language="en",
             material_directory="materials",
+            manual_lyrics_enabled=True,
             lyrics_file="lyrics.txt",
             daw_timeline_export=True,
             source_separation="never",
@@ -1416,7 +1417,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(loaded.output_extension, ".wav")
         self.assertEqual(loaded.language, "en")
         self.assertEqual(loaded.material_directory, "materials")
+        self.assertTrue(loaded.manual_lyrics_enabled)
         self.assertEqual(loaded.lyrics_file, "lyrics.txt")
+        self.assertEqual(loaded.effective_lyrics_file(), "lyrics.txt")
         self.assertTrue(loaded.daw_timeline_export)
         self.assertEqual(loaded.source_separation, "never")
         self.assertEqual(loaded.output_directory, "out")
@@ -1425,6 +1428,21 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(loaded.normalize)
         self.assertEqual(loaded.sample_rate, 48000)
         self.assertEqual(loaded.channels, 1)
+
+    def test_legacy_settings_enable_manual_lyrics_when_path_exists(self) -> None:
+        loaded = ProcessingSettings.from_dict({"lyrics_file": "lyrics.txt"})
+
+        self.assertTrue(loaded.manual_lyrics_enabled)
+        self.assertEqual(loaded.effective_lyrics_file(), "lyrics.txt")
+
+    def test_disabled_manual_lyrics_keeps_path_but_ignores_it(self) -> None:
+        settings = ProcessingSettings(
+            manual_lyrics_enabled=False,
+            lyrics_file="lyrics.txt",
+        )
+
+        self.assertEqual(settings.lyrics_file, "lyrics.txt")
+        self.assertEqual(settings.effective_lyrics_file(), "")
 
     def test_create_queue_applies_output_settings(self) -> None:
         settings = ProcessingSettings(output_directory="out", output_extension="mp3")
@@ -1557,6 +1575,78 @@ class DiagnosticsTests(unittest.TestCase):
         materials_record = next(record for record in records if record["stage"] == "inputs.materials")
         self.assertEqual(materials_record["fields"]["metadata_failure_count"], 1)
         self.assertIn("batch.item.failed", [record["stage"] for record in records])
+
+    def test_batch_ignores_stored_lyrics_file_when_manual_lyrics_disabled(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "reference.wav"
+            material_dir = root / "materials"
+            lyrics_file = root / "lyrics.txt"
+            material_dir.mkdir()
+            input_path.write_bytes(b"placeholder")
+            _write_test_wave(material_dir / "wo.wav")
+            lyrics_file.write_text("\u6211", encoding="utf-8")
+            settings = ProcessingSettings(
+                material_directory=str(material_dir),
+                manual_lyrics_enabled=False,
+                lyrics_file=str(lyrics_file),
+                overwrite=True,
+            )
+            item = create_queue([input_path], settings)[0]
+            captured: dict[str, object] = {}
+
+            probe_data = {
+                "streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}],
+                "format": {"duration": "1.0", "format_name": "wav"},
+            }
+
+            def fake_ordering(*args: object, **kwargs: object) -> object:
+                del args
+                captured["lyrics_file"] = kwargs.get("lyrics_file")
+                raise AudioProcessorError("stop after capture")
+
+            with patch("audio_processor.batch.probe_audio", return_value=probe_data):
+                with patch("audio_processor.batch.build_model_ordering", side_effect=fake_ordering):
+                    summary = run_batch_queue([item], settings)
+
+        self.assertEqual(summary.failed, 1)
+        self.assertIsNone(captured["lyrics_file"])
+
+    def test_batch_passes_lyrics_file_when_manual_lyrics_enabled(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "reference.wav"
+            material_dir = root / "materials"
+            lyrics_file = root / "lyrics.txt"
+            material_dir.mkdir()
+            input_path.write_bytes(b"placeholder")
+            _write_test_wave(material_dir / "wo.wav")
+            lyrics_file.write_text("\u6211", encoding="utf-8")
+            settings = ProcessingSettings(
+                material_directory=str(material_dir),
+                manual_lyrics_enabled=True,
+                lyrics_file=str(lyrics_file),
+                overwrite=True,
+            )
+            item = create_queue([input_path], settings)[0]
+            captured: dict[str, object] = {}
+
+            probe_data = {
+                "streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}],
+                "format": {"duration": "1.0", "format_name": "wav"},
+            }
+
+            def fake_ordering(*args: object, **kwargs: object) -> object:
+                del args
+                captured["lyrics_file"] = kwargs.get("lyrics_file")
+                raise AudioProcessorError("stop after capture")
+
+            with patch("audio_processor.batch.probe_audio", return_value=probe_data):
+                with patch("audio_processor.batch.build_model_ordering", side_effect=fake_ordering):
+                    summary = run_batch_queue([item], settings)
+
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(captured["lyrics_file"], lyrics_file)
 
 
 class RealEvalTests(unittest.TestCase):
@@ -2686,6 +2776,32 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(args.source_separation, "never")
+
+    def test_batch_subcommand_enables_manual_lyrics_when_file_is_passed(self) -> None:
+        captured: dict[str, ProcessingSettings] = {}
+
+        def fake_run_batch(items: list[object], settings: ProcessingSettings, **kwargs: object) -> BatchSummary:
+            del items, kwargs
+            captured["settings"] = settings
+            return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+        with patch("audio_processor.cli.run_batch_queue", side_effect=fake_run_batch):
+            exit_code = cli_main(
+                [
+                    "batch",
+                    "reference.wav",
+                    "out.wav",
+                    "--material-directory",
+                    "materials",
+                    "--lyrics-file",
+                    "lyrics.txt",
+                    "--overwrite",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(captured["settings"].manual_lyrics_enabled)
+        self.assertEqual(captured["settings"].effective_lyrics_file(), "lyrics.txt")
 
     def test_vst3_bridge_subcommand_is_registered(self) -> None:
         args = build_parser().parse_args(["vst3-bridge", "request.json", "--response", "response.json"])
@@ -5090,6 +5206,30 @@ class Vst3BridgeTests(unittest.TestCase):
         self.assertEqual(response["status"], "Done")
         self.assertEqual(progress["format"], "vocal_process_vst3_bridge_progress_v1")
         self.assertTrue(progress["done"])
+
+    def test_bridge_request_enables_manual_lyrics_when_file_is_present(self) -> None:
+        request = {
+            "format": BRIDGE_REQUEST_FORMAT,
+            "command": "render",
+            "reference_path": "reference.wav",
+            "material_directory": "materials",
+            "output_path": "out/song.wav",
+            "lyrics_file": "lyrics.txt",
+            "overwrite": True,
+        }
+        captured: dict[str, ProcessingSettings] = {}
+
+        def fake_run_batch(items: list[object], settings: ProcessingSettings, **kwargs: object) -> BatchSummary:
+            del items, kwargs
+            captured["settings"] = settings
+            return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+        with patch("audio_processor.vst3_bridge.run_batch_queue", side_effect=fake_run_batch):
+            response = run_bridge_request(request)
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(captured["settings"].manual_lyrics_enabled)
+        self.assertEqual(captured["settings"].effective_lyrics_file(), "lyrics.txt")
 
     def test_bridge_request_file_writes_response_next_to_request(self) -> None:
         request = {

@@ -62,6 +62,7 @@ def run_bridge_request(request: dict[str, Any]) -> dict[str, Any]:
 
     settings = ProcessingSettings(
         material_directory=str(material_directory),
+        manual_lyrics_enabled=_optional_bool(request, "manual_lyrics_enabled", default=lyrics_file is not None),
         lyrics_file=str(lyrics_file or ""),
         daw_timeline_export=_optional_bool(
             request,

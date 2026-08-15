@@ -16,6 +16,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "original_audio": "Original Audio",
         "material_set": "Material Set",
         "lyrics_file": "Lyrics File",
+        "manual_lyrics_enabled": "Manually add lyrics file",
         "select_original_audio": "Select Original Audio",
         "select_material_folder": "Select Material Folder",
         "select_lyrics_file": "Select Lyrics File",
@@ -24,8 +25,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "supported_formats": "Supported: {formats}",
         "audio_format_hint": ".wav, .mp3, .flac, .m4a, .ogg, .opus, .aac, .aiff, .alac, .wma",
         "material_format_hint": "folder only",
-        "lyrics_format_hint": ".txt, .doc, .docx, .lrc, .srt (optional)",
+        "lyrics_format_hint": ".txt, .doc, .docx, .lrc, .srt (used only when enabled)",
         "lyrics_optional_active": "Lyrics file: not selected; reference ASR transcript will be used.",
+        "lyrics_original_vocal_mode_active": "Lyrics mode: disabled; ordering will use original-vocal ASR/alignment.",
         "material_directory": "Material Folder",
         "lyrics_path": "Lyrics File",
         "remove_selected": "Remove Selected",
@@ -79,6 +81,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "missing_material_directory": "Select a material set folder before starting assembly.",
         "empty_material_directory": "Material set does not contain supported audio files: {path}",
         "invalid_lyrics_file": "Lyrics file must be an existing supported file: {path}",
+        "missing_lyrics_file_when_enabled": "Manual lyrics is enabled; select a supported lyrics/subtitle file or disable manual lyrics.",
         "unsupported_lyrics_format": "Lyrics file format is not supported: {path}",
         "invalid_compute_device": "Compute device must be auto, cpu, or cuda.",
         "invalid_source_separation": "Reference vocal mode must be auto, always, or never.",
@@ -120,7 +123,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "help_body": (
             "VocalProcess assembles a new vocal track from a material folder while preserving the reference vocal timeline.\n\n"
             "1. Select one or more original vocal files, then select a material folder. Each material clip should be a short vocal unit or phrase; clear filename labels such as wo.wav, shi4.wav, a.wav, ai.wav, or kana names improve matching.\n\n"
-            "2. Without a lyrics file, the software uses the original vocal ASR/alignment result as the target unit sequence. Material clips are matched, ordered, and stretched to the recognized units.\n\n"
+            "2. Leave manual lyrics disabled to use the original vocal ASR/alignment result as the target unit sequence. Material clips are matched, ordered, and stretched to the recognized units.\n\n"
             "3. With a lyrics file, lyrics text has priority for unit selection. The original vocal ASR/alignment result remains the timing source, so each lyric unit is mapped to the reference vocal start, end, and duration whenever aligned unit timings are available.\n\n"
             "4. Chinese lyrics/material labels are normalized through pinyin. Japanese lyrics may use kanji, kana, or romaji; kanji/kana are converted to pronunciation units before matching file names or material transcripts. Adjacent kana/romaji annotation lines and inline readings are collapsed so the same Japanese phrase is not treated as duplicated lyrics.\n\n"
             "5. Use Reference Vocals to choose whether the original audio needs separation, choose output options, then start the batch. Enable DAW timeline export when you need every stretched material clip as an editable item."
@@ -145,6 +148,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "original_audio": "原音频",
         "material_set": "素材集",
         "lyrics_file": "歌词文件",
+        "manual_lyrics_enabled": "手动添加歌词文件",
         "select_original_audio": "选择原音频",
         "select_material_folder": "选择素材集文件夹",
         "select_lyrics_file": "选择歌词文件",
@@ -153,8 +157,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "supported_formats": "支持格式：{formats}",
         "audio_format_hint": ".wav、.mp3、.flac、.m4a、.ogg、.opus、.aac、.aiff、.alac、.wma",
         "material_format_hint": "仅支持文件夹",
-        "lyrics_format_hint": ".txt、.doc、.docx、.lrc、.srt（可选）",
+        "lyrics_format_hint": ".txt、.doc、.docx、.lrc、.srt（勾选后使用）",
         "lyrics_optional_active": "歌词文件：未选择，将使用原音频 ASR 转写结果。",
+        "lyrics_original_vocal_mode_active": "歌词模式：未手动添加歌词，将按原人声 ASR/对齐结果排序。",
         "material_directory": "素材集文件夹",
         "lyrics_path": "歌词文件",
         "remove_selected": "移除选中",
@@ -208,6 +213,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "missing_material_directory": "开始拼接前必须先选择素材集文件夹。",
         "empty_material_directory": "素材集中没有受支持的音频文件：{path}",
         "invalid_lyrics_file": "歌词必须是已存在且受支持的文件：{path}",
+        "missing_lyrics_file_when_enabled": "已勾选手动添加歌词文件，请选择受支持的歌词/字幕文件，或取消勾选以按原人声识别排序。",
         "unsupported_lyrics_format": "不支持该歌词文件格式：{path}",
         "invalid_compute_device": "计算设备必须是 auto、cpu 或 cuda。",
         "invalid_source_separation": "原音频人声模式必须是 auto、always 或 never。",
@@ -249,7 +255,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "help_body": (
             "VocalProcess 会使用素材集拼接新的声轨，同时尽量保留原人声的字音顺序和时间轴。\n\n"
             "1. 先选择一个或多个原人声音频，再选择素材集文件夹。素材最好是较短的字音或短词；文件名建议写清楚读音，例如 wo.wav、shi4.wav、a.wav、ai.wav 或假名文件名。\n\n"
-            "2. 不添加歌词文件时，软件以原人声 ASR/对齐后识别出的字音序列作为目标序列，再对素材进行匹配、排序和拉伸。\n\n"
+            "2. 不勾选手动添加歌词文件时，软件以原人声 ASR/对齐后识别出的字音序列作为目标序列，再对素材进行匹配、排序和拉伸。\n\n"
             "3. 添加歌词文件时，歌词文本是选取字音的最高优先项；原人声 ASR/对齐结果作为时间轴来源。只要存在对齐到字音的时间，软件会把每个歌词字音映射到原人声的起点、终点和实际持续时长。\n\n"
             "4. 中文歌词和素材标签会转成拼音匹配。日文歌词可以写汉字、假名或罗马音；汉字/假名会先转为日文发音单元，再和素材文件名或素材转写结果匹配。相邻的假名/罗马音注音行、以及行内注音会先折叠，避免把同一句日文的不同写法当成重复歌词。\n\n"
             "5. 根据原音频选择人声分离模式，设置输出格式后开始批量处理；需要在 DAW 中继续编辑每个素材片段时，勾选导出 DAW 时间轴工程。"

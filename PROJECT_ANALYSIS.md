@@ -1,5 +1,29 @@
 # Project Analysis
 
+## Latest Update - 2026-08-15 Manual Lyrics Mode Boundary
+
+The user clarified a product-level boundary: no-lyrics operation is not an experimental side path. It is one of the original core workflows. The system must be able to sort and align from the original/reference vocal when no lyrics file exists, while still reporting that this mode depends on ASR recognition quality.
+
+Architecture decision:
+
+1. Strict rendered real-eval and normal GUI batch are separate acceptance surfaces. The former may keep blockers that prevent misleading formal score artifacts; the latter must expose a clear user choice between manual lyrics and original-vocal ASR mode.
+2. `manual_lyrics_enabled` now controls whether a stored `lyrics_file` participates in processing. This prevents stale paths from silently changing the run mode.
+3. When manual lyrics is disabled, `ProcessingSettings.effective_lyrics_file()` returns an empty string and batch processing passes no lyrics file into `build_model_ordering()`. The model then follows the original no-lyrics path: reference vocal ASR/alignment defines target sequence and timing evidence.
+4. When manual lyrics is enabled, the GUI validates that a supported lyrics/subtitle file exists before running. The text becomes the target-text authority, while reference vocal alignment remains timing evidence.
+5. CLI batch and VST3 bridge enable manual lyrics automatically when a lyrics path is explicitly provided, preserving existing automation contracts.
+
+Practical impact:
+
+1. Users can save time by leaving manual lyrics disabled for rough or no-lyrics workflows.
+2. Users can enable manual lyrics when they want to reduce ASR text errors, including Chinese ASR mistakes.
+3. Reports still need to distinguish ASR-derived content and exact timing quality; this GUI change does not weaken the timeline trust diagnostics added in the previous pass.
+
+Validation:
+
+1. Full `.venv311\Scripts\python.exe -m unittest discover -s tests` passed with `198` tests.
+2. Focused regression coverage checks settings compatibility, disabled manual lyrics ignoring stored paths, enabled manual lyrics passing the path, CLI batch auto-enable, and VST3 bridge auto-enable.
+3. `compileall`, `.venv311\Scripts\python.exe -m audio_processor check`, and `git diff --check` passed.
+
 ## Latest Update - 2026-08-15 Strict Reference Timeline Gate
 
 The latest user correction is important: content truth is not the only blocker. A rendered file can also have the wrong timeline even when the output duration matches the original vocal. Chinese cases have the same ASR-risk class as Japanese cases; language-specific confidence must not become a reason to trust ASR-only text or interpolated timing.
@@ -1996,3 +2020,18 @@ Residual risk:
 
 1. This is a trust-gate repair, not a final timeline-reconstruction algorithm. It prevents bad outputs from being accepted and makes reports more honest.
 2. The next algorithmic step is to produce exact timing from a better forced-alignment path when lyrics are available, instead of relying on retargeted/resampled ASR timings.
+
+### Manual Lyrics Mode Boundary
+
+The no-lyrics path remains a first-class product workflow. The correct design is not "lyrics required everywhere"; it is an explicit mode switch:
+
+1. Manual lyrics disabled: use original/reference vocal ASR and alignment for ordering and timing. This preserves the user's original requirement and avoids the cost of preparing lyrics for every run.
+2. Manual lyrics enabled: require a selected lyrics/subtitle file and use it as target text authority.
+3. Strict real-eval blockers remain useful for formal score artifacts, but they should not be confused with the everyday GUI batch workflow.
+4. Stale settings are now safer because a saved lyrics path has no effect unless `manual_lyrics_enabled` is true.
+5. External callers keep compatibility: CLI and VST3 bridge automatically enable manual lyrics when they supply `lyrics_file`.
+
+Residual risk:
+
+1. No-lyrics mode still inherits ASR recognition risk in both CN and JP.
+2. Manual lyrics mode reduces text errors but still needs exact forced alignment before timeline quality can be trusted.

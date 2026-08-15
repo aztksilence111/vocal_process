@@ -58,6 +58,7 @@ class AudioProcessorApp(tk.Tk):
     def _build_variables(self) -> None:
         self.output_directory_var = tk.StringVar()
         self.material_directory_var = tk.StringVar()
+        self.manual_lyrics_enabled_var = tk.BooleanVar()
         self.lyrics_file_var = tk.StringVar()
         self.daw_timeline_export_var = tk.BooleanVar()
         self.compute_device_var = tk.StringVar(value="auto")
@@ -187,14 +188,22 @@ class AudioProcessorApp(tk.Tk):
 
         self.lyrics_hint_label = ttk.Label(parent)
         self.lyrics_hint_label.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
-        self._label(parent, "lyrics_path").grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
-        ttk.Entry(parent, textvariable=self.lyrics_file_var, state="readonly").grid(
-            row=1, column=1, sticky="ew", pady=(0, 8)
+        self.manual_lyrics_check = self._checkbutton(
+            parent,
+            "manual_lyrics_enabled",
+            self.manual_lyrics_enabled_var,
+        )
+        self.manual_lyrics_check.configure(command=self._sync_lyrics_controls)
+        self.manual_lyrics_check.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 8))
+        self._label(parent, "lyrics_path").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
+        self.lyrics_entry = ttk.Entry(parent, textvariable=self.lyrics_file_var, state="readonly")
+        self.lyrics_entry.grid(
+            row=2, column=1, sticky="ew", pady=(0, 8)
         )
         self.lyrics_button = self._button(parent, "select_lyrics_file", self.choose_lyrics_file)
-        self.lyrics_button.grid(row=1, column=2, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self.lyrics_button.grid(row=2, column=2, sticky="ew", padx=(8, 0), pady=(0, 8))
         self.clear_lyrics_button = self._button(parent, "clear_lyrics", self.clear_lyrics_file)
-        self.clear_lyrics_button.grid(row=1, column=3, sticky="ew", padx=8, pady=(0, 8))
+        self.clear_lyrics_button.grid(row=2, column=3, sticky="ew", padx=8, pady=(0, 8))
 
     def _build_settings(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -372,11 +381,15 @@ class AudioProcessorApp(tk.Tk):
     def choose_lyrics_file(self) -> None:
         file_name = filedialog.askopenfilename(filetypes=self._lyrics_filetypes())
         if file_name:
+            self.manual_lyrics_enabled_var.set(True)
             self.lyrics_file_var.set(file_name)
+            self._sync_lyrics_controls()
             self._log(self._t("lyrics_selected", path=file_name))
 
     def clear_lyrics_file(self) -> None:
         self.lyrics_file_var.set("")
+        self.manual_lyrics_enabled_var.set(False)
+        self._sync_lyrics_controls()
         self._log(self._t("lyrics_cleared"))
 
     def check_tools(self) -> None:
@@ -538,6 +551,7 @@ class AudioProcessorApp(tk.Tk):
         return ProcessingSettings(
             language=self.language,
             material_directory=self.material_directory_var.get().strip(),
+            manual_lyrics_enabled=self.manual_lyrics_enabled_var.get(),
             lyrics_file=self.lyrics_file_var.get().strip(),
             daw_timeline_export=self.daw_timeline_export_var.get(),
             compute_device=normalize_compute_device(self.compute_device_var.get()),
@@ -560,6 +574,7 @@ class AudioProcessorApp(tk.Tk):
     def _apply_settings_to_vars(self, settings: ProcessingSettings) -> None:
         self.language = normalize_language(settings.language)
         self.material_directory_var.set(settings.material_directory)
+        self.manual_lyrics_enabled_var.set(settings.manual_lyrics_enabled)
         self.lyrics_file_var.set(settings.lyrics_file)
         self.daw_timeline_export_var.set(settings.daw_timeline_export)
         self.compute_device_var.set(settings.compute_device)
@@ -575,6 +590,7 @@ class AudioProcessorApp(tk.Tk):
         self.sample_rate_var.set("" if settings.sample_rate is None else str(settings.sample_rate))
         self.channels_var.set("" if settings.channels is None else str(settings.channels))
         self.codec_var.set(settings.codec or "")
+        self._sync_lyrics_controls()
 
     def _set_language(self, language: str) -> None:
         self.language = normalize_language(language)
@@ -784,8 +800,11 @@ class AudioProcessorApp(tk.Tk):
             if not list_audio_files(material_path):
                 raise ValueError(self._t("empty_material_directory", path=material_path))
 
-        if settings.lyrics_file:
-            lyrics_path = Path(settings.lyrics_file).expanduser()
+        lyrics_file = settings.effective_lyrics_file()
+        if settings.manual_lyrics_enabled and not lyrics_file:
+            raise ValueError(self._t("missing_lyrics_file_when_enabled"))
+        if lyrics_file:
+            lyrics_path = Path(lyrics_file).expanduser()
             if not lyrics_path.is_file():
                 raise ValueError(self._t("invalid_lyrics_file", path=lyrics_path))
             if lyrics_path.suffix.lower() not in LYRICS_EXTENSIONS:
@@ -801,10 +820,20 @@ class AudioProcessorApp(tk.Tk):
             if settings.daw_timeline_export:
                 self._log(self._t("daw_timeline_mode_active"))
             self._log(self._t("material_active", path=settings.material_directory))
-        if settings.lyrics_file:
-            self._log(self._t("lyrics_active", path=settings.lyrics_file))
+        lyrics_file = settings.effective_lyrics_file()
+        if lyrics_file:
+            self._log(self._t("lyrics_active", path=lyrics_file))
         elif settings.material_directory:
-            self._log(self._t("lyrics_optional_active"))
+            self._log(self._t("lyrics_original_vocal_mode_active"))
+
+    def _sync_lyrics_controls(self) -> None:
+        enabled = self.manual_lyrics_enabled_var.get()
+        if hasattr(self, "lyrics_entry"):
+            self.lyrics_entry.configure(state="readonly" if enabled else "disabled")
+        if hasattr(self, "lyrics_button"):
+            self.lyrics_button.configure(state="normal" if enabled else "disabled")
+        if hasattr(self, "clear_lyrics_button"):
+            self.clear_lyrics_button.configure(state="normal" if enabled else "disabled")
 
     def _t(self, key: str, **values: object) -> str:
         return translate(self.language, key, **values)

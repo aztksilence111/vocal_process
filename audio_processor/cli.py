@@ -363,6 +363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "batch":
             settings = ProcessingSettings(
                 material_directory=str(args.material_directory),
+                manual_lyrics_enabled=bool(args.lyrics_file),
                 lyrics_file=str(args.lyrics_file or ""),
                 daw_timeline_export=args.daw_timeline_export,
                 compute_device=args.compute_device,

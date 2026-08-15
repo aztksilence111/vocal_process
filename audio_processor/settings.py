@@ -21,6 +21,7 @@ WINDOW_GEOMETRY_OPTIONS = ("980x680", "1280x800", "1440x900", "1600x1000")
 class ProcessingSettings:
     language: str = DEFAULT_LANGUAGE
     material_directory: str = ""
+    manual_lyrics_enabled: bool = False
     lyrics_file: str = ""
     daw_timeline_export: bool = False
     compute_device: str = "auto"
@@ -70,6 +71,9 @@ class ProcessingSettings:
             codec=self.codec,
         )
 
+    def effective_lyrics_file(self) -> str:
+        return self.lyrics_file.strip() if self.manual_lyrics_enabled else ""
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -79,6 +83,7 @@ class ProcessingSettings:
         return cls(
             language=normalize_language(optional_string(data.get("language"))),
             material_directory=str(data.get("material_directory") or defaults.material_directory),
+            manual_lyrics_enabled=bool(data.get("manual_lyrics_enabled", bool(data.get("lyrics_file")))),
             lyrics_file=str(data.get("lyrics_file") or defaults.lyrics_file),
             daw_timeline_export=bool(data.get("daw_timeline_export", defaults.daw_timeline_export)),
             compute_device=normalize_compute_device(data.get("compute_device")),
