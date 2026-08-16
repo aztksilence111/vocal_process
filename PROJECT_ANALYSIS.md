@@ -2058,3 +2058,27 @@ Residual risk:
 1. Lyrics improve target text trust but do not replace exact forced alignment; resampled/interpolated timing remains blocked by the existing strict real-eval gates.
 2. Residual instrument suppression is implemented as lyric/acoustic mismatch filtering, not as a guarantee that every separation artifact is inaudible.
 3. The next manual-listening evidence should come from the new CN and JP lane-split render roots.
+
+### Channel Topology And Strict Manual-Lyrics Timing
+
+The 2026-08-16 lane-split implementation treated physical stereo as equivalent to independent vocal lanes. That was too broad. Same-content stereo, doubled vocals, and harmony/effect stems can have two channels while still representing one lyric/timing lane. Splitting those files forces two independent ASR/alignment passes and can make both material ordering and audio artifacts worse.
+
+Updated policy:
+
+1. `split_reference_channels` is now gated by content topology, not only `ffprobe` channel count.
+2. The topology check measures waveform correlation, small-lag correlation, amplitude-envelope similarity, envelope difference, side/mid energy, RMS balance, and active duration.
+3. Physical stereo is split only when the channels look independently timed/content-bearing. Same-content stereo/harmony, near-duplicate stereo, delayed stereo effects, weak channels, and unsupported multichannel layouts are treated as one reference lane.
+4. Batch diagnostics now write `reference.channels.split_skipped` with `channel_topology`, so future regressions can be audited from the JSONL log instead of inferred from output filenames.
+5. `prepare_reference_channel_lanes()` repeats the topology guard internally so direct callers cannot bypass it accidentally.
+
+Current real-corpus topology evidence:
+
+1. `LAB=01_JP.wav` is classified as `independent_channel_content` and remains eligible for `_left/_right` mono lane outputs.
+2. `1000nenyikiteru_JP.wav`, `AiRenTongZhi_CN.wav`, `FengZhongYouDuo_CN.wav`, `kamippoina_JP.wav`, `PlasticLove_JP.wav`, and `ShenHua_CN.wav` are classified as same-content stereo/harmony and should render as a single mono material assembly, not lane pairs.
+
+Manual lyrics timing policy is also stricter:
+
+1. Lyrics text is target-text authority, but the original vocal remains the timing authority.
+2. If lyrics cannot be matched to original-vocal acoustic/ASR segments, the system must fail instead of pairing by equal counts or falling back to ASR text.
+3. If lyric retargeting requires resampled/interpolated unit timing, the system must not produce a review WAV. Total duration matching is not enough; every positioned material decision needs exact original-vocal unit timing.
+4. Existing 2026-08-16 CN/JP lane-split outputs are rejected regression evidence. They include measurable large sample jumps and should not be used as manual-listening acceptance files.

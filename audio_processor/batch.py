@@ -18,6 +18,8 @@ from .engine import (
     render_material_stretch_plan,
 )
 from .model_runtime import (
+    ReferenceChannelTopology,
+    analyze_reference_channel_topology,
     build_model_ordering,
     prepare_reference_channel_lanes,
     speech_runtime_preflight_report,
@@ -115,17 +117,25 @@ def run_batch_queue(
             _log_input_diagnostics(diagnostics, item.input_path, settings)
             if should_cancel is not None and should_cancel():
                 raise AudioProcessorError("Processing cancelled")
-            split_channels, reference_channels = _should_split_reference_channels(settings, item.input_path)
+            split_channels, reference_channels, channel_topology = _should_split_reference_channels(
+                settings,
+                item.input_path,
+            )
             if settings.split_reference_channels and not split_channels:
                 diagnostics.event(
                     "reference.channels.split_skipped",
-                    "Reference channel split was requested but the reference is not multichannel",
+                    "Reference channel split was requested but the reference is not independent multichannel vocal content",
                     requested=True,
                     detected_channels=reference_channels,
                     reason=(
-                        "mono_reference"
-                        if reference_channels is not None and reference_channels <= 1
+                        channel_topology.reason
+                        if channel_topology is not None
                         else "channel_count_unavailable"
+                    ),
+                    channel_topology=(
+                        channel_topology.to_dict()
+                        if channel_topology is not None
+                        else None
                     ),
                 )
             if split_channels:
@@ -318,15 +328,19 @@ def run_batch_queue(
 def _should_split_reference_channels(
     settings: ProcessingSettings,
     reference_path: Path,
-) -> tuple[bool, int | None]:
+) -> tuple[bool, int | None, ReferenceChannelTopology | None]:
     if not (
         settings.split_reference_channels
         and settings.material_directory
         and not settings.daw_timeline_export
     ):
-        return False, None
-    channel_count = _audio_channel_count(reference_path)
-    return bool(channel_count is not None and channel_count > 1), channel_count
+        return False, None, None
+    try:
+        topology = analyze_reference_channel_topology(reference_path)
+    except AudioProcessorError:
+        channel_count = _audio_channel_count(reference_path)
+        return False, channel_count, None
+    return topology.split_recommended, topology.channel_count, topology
 
 
 def _audio_channel_count(path: Path) -> int | None:

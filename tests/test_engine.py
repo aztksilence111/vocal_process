@@ -21,6 +21,7 @@ from audio_processor.batch import (
     BatchSummary,
     QueueItem,
     _run_split_reference_channel_item,
+    _should_split_reference_channels,
     create_queue,
     run_batch_queue,
 )
@@ -115,6 +116,48 @@ def _write_tone_wave(path: Path, *, duration_seconds: float = 1.0, sample_rate: 
         frames.extend(value.to_bytes(2, byteorder="little", signed=True))
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(bytes(frames))
+
+
+def _write_duplicate_stereo_tone_wave(
+    path: Path,
+    *,
+    duration_seconds: float = 1.0,
+    sample_rate: int = 8000,
+) -> None:
+    n_frames = int(duration_seconds * sample_rate)
+    frames = bytearray()
+    for index in range(n_frames):
+        value = int(12000 * math.sin(2.0 * math.pi * 220.0 * (index / sample_rate)))
+        frames.extend(value.to_bytes(2, byteorder="little", signed=True))
+        frames.extend(value.to_bytes(2, byteorder="little", signed=True))
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(bytes(frames))
+
+
+def _write_independent_stereo_wave(
+    path: Path,
+    *,
+    duration_seconds: float = 1.0,
+    sample_rate: int = 8000,
+) -> None:
+    n_frames = int(duration_seconds * sample_rate)
+    frames = bytearray()
+    midpoint = n_frames // 2
+    for index in range(n_frames):
+        left_gain = 1.0 if index < midpoint else 0.15
+        right_gain = 0.15 if index < midpoint else 1.0
+        left = int(12000 * left_gain * math.sin(2.0 * math.pi * 220.0 * (index / sample_rate)))
+        right = int(12000 * right_gain * math.sin(2.0 * math.pi * 330.0 * (index / sample_rate)))
+        frames.extend(left.to_bytes(2, byteorder="little", signed=True))
+        frames.extend(right.to_bytes(2, byteorder="little", signed=True))
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(2)
         handle.setsampwidth(2)
         handle.setframerate(sample_rate)
         handle.writeframes(bytes(frames))
@@ -1397,7 +1440,7 @@ class SourceSeparationTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             reference = root / "reference.wav"
-            _write_test_wave(reference, duration_seconds=0.25, sample_rate=8000, channels=2)
+            _write_independent_stereo_wave(reference, duration_seconds=1.0, sample_rate=8000)
 
             lanes = model_runtime.prepare_reference_channel_lanes(
                 reference,
@@ -1412,6 +1455,48 @@ class SourceSeparationTests(unittest.TestCase):
             [stream["channels"] for data in lane_metadata for stream in data["streams"] if stream.get("codec_type") == "audio"],
             [1, 1],
         )
+
+    def test_reference_channel_lanes_do_not_split_duplicate_stereo_content(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            _write_duplicate_stereo_tone_wave(reference, duration_seconds=1.0, sample_rate=8000)
+
+            topology = model_runtime.analyze_reference_channel_topology(reference)
+            lanes = model_runtime.prepare_reference_channel_lanes(
+                reference,
+                work_dir=root / "work",
+                source_separation="never",
+            )
+
+        self.assertFalse(topology.split_recommended)
+        self.assertIn(topology.reason, {"same_content_stereo_or_harmony", "near_duplicate_stereo_channels"})
+        self.assertEqual([lane.label for lane in lanes], ["mono"])
+        self.assertFalse(lanes[0].split_from_stereo)
+
+    def test_batch_split_reference_channels_requires_independent_channel_content(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            material_directory = root / "materials"
+            material_directory.mkdir()
+            settings = ProcessingSettings(
+                material_directory=str(material_directory),
+                split_reference_channels=True,
+            )
+            duplicate = root / "duplicate.wav"
+            independent = root / "independent.wav"
+            _write_duplicate_stereo_tone_wave(duplicate, duration_seconds=1.0, sample_rate=8000)
+            _write_independent_stereo_wave(independent, duration_seconds=1.0, sample_rate=8000)
+
+            duplicate_result = _should_split_reference_channels(settings, duplicate)
+            independent_result = _should_split_reference_channels(settings, independent)
+
+        self.assertFalse(duplicate_result[0])
+        self.assertEqual(duplicate_result[1], 2)
+        self.assertIsNotNone(duplicate_result[2])
+        self.assertTrue(independent_result[0])
+        self.assertEqual(independent_result[1], 2)
+        self.assertEqual(independent_result[2].reason, "independent_channel_content")
 
     def test_split_reference_channel_item_forces_mono_lane_settings(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1967,7 +2052,7 @@ class RealEvalTests(unittest.TestCase):
             material_root.mkdir(parents=True)
             lyrics_root.mkdir()
             reference_path = origin / "song_CN.wav"
-            _write_test_wave(reference_path, duration_seconds=4.0, channels=2)
+            _write_independent_stereo_wave(reference_path, duration_seconds=4.0)
             _write_test_wave(material_root / "wo.wav", duration_seconds=1.0)
             lyrics_path = lyrics_root / "song_CN.txt"
             lyrics_path.write_text("\u6211\n", encoding="utf-8")
@@ -5042,7 +5127,7 @@ class ModelRuntimeTests(unittest.TestCase):
                 model_runtime.TranscriptSegment(
                     0.0,
                     2.0,
-                    "ignored",
+                    "\u611b\u3057\u3066",
                     timing_source="whisperx_char_alignment",
                     unit_timings=(
                         VoiceUnitTiming(0, "x0", 0.0, 0.2, timing_source="whisperx_char_alignment"),
@@ -5071,7 +5156,7 @@ class ModelRuntimeTests(unittest.TestCase):
                 model_runtime.TranscriptSegment(
                     0.0,
                     1.0,
-                    "ignored",
+                    "\u611b\u3057\u3066",
                     timing_source="whisperx_char_alignment",
                     unit_timings=(
                         VoiceUnitTiming(0, "x0", 0.0, 0.3, timing_source="whisperx_char_alignment"),
@@ -5089,6 +5174,33 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(segments[0].unit_timings[0].start_seconds, 0.0)
         self.assertAlmostEqual(segments[0].unit_timings[-1].end_seconds, 1.0)
         self.assertAlmostEqual(sum(timing.duration_seconds for timing in segments[0].unit_timings), 1.0)
+
+    def test_lyrics_alignment_failure_does_not_fall_back_to_asr_text(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "song_JP.txt"
+            lyrics.write_text("\u611b\u3057\u3066\n", encoding="utf-8")
+            transcript_segments = [
+                model_runtime.TranscriptSegment(
+                    0.0,
+                    1.0,
+                    "ignored",
+                    timing_source="whisperx_char_alignment",
+                    unit_timings=(
+                        VoiceUnitTiming(0, "x0", 0.0, 0.5, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(1, "x1", 0.5, 1.0, timing_source="whisperx_char_alignment"),
+                    ),
+                )
+            ]
+
+            segments, notes = model_runtime._segments_from_transcript_with_notes(
+                transcript_segments,
+                lyrics_file=lyrics,
+                language_hint="JP",
+            )
+
+        self.assertEqual(segments, ())
+        self.assertTrue(any("refusing sequential or ASR-text fallback" in note for note in notes))
 
     def test_lyrics_alignment_uses_original_acoustic_timing_and_skips_residual_segments(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -8,6 +8,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -108,6 +109,35 @@ class ReferenceChannelLane:
 
 
 @dataclass(frozen=True)
+class ReferenceChannelTopology:
+    channel_count: int
+    split_recommended: bool
+    reason: str
+    waveform_correlation: float | None = None
+    lagged_correlation: float | None = None
+    envelope_correlation: float | None = None
+    envelope_difference_ratio: float | None = None
+    side_to_mid_ratio: float | None = None
+    rms_balance_ratio: float | None = None
+    analyzed_duration_seconds: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "format": "reference_channel_topology_v1",
+            "channel_count": self.channel_count,
+            "split_recommended": self.split_recommended,
+            "reason": self.reason,
+            "waveform_correlation": self.waveform_correlation,
+            "lagged_correlation": self.lagged_correlation,
+            "envelope_correlation": self.envelope_correlation,
+            "envelope_difference_ratio": self.envelope_difference_ratio,
+            "side_to_mid_ratio": self.side_to_mid_ratio,
+            "rms_balance_ratio": self.rms_balance_ratio,
+            "analyzed_duration_seconds": self.analyzed_duration_seconds,
+        }
+
+
+@dataclass(frozen=True)
 class MaterialLibraryAnalysis:
     material_directory: Path
     materials: tuple[AudioAnalysis, ...]
@@ -196,9 +226,22 @@ DEFAULT_COMPUTE_TYPE = "int8"
 MATERIAL_CACHE_FILE = ".vocalprocess_material_cache.json"
 MATERIAL_CACHE_FORMAT = "vocal_process_material_cache_v4_filename_label_first"
 MATERIAL_LABEL_ANALYSIS_STRATEGY = "filename_label_first_v1"
-REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v2_language_asr_guard"
+REFERENCE_CACHE_FORMAT = "vocal_process_reference_cache_v3_strict_lyrics_timing"
 PYANNOTE_DIA_MODEL = "pyannote/speaker-diarization-community-1"
 SPEAKER_EMBEDDING_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+REFERENCE_CHANNEL_TOPOLOGY_SAMPLE_RATE = 16_000
+REFERENCE_CHANNEL_TOPOLOGY_MAX_SECONDS = 300.0
+REFERENCE_CHANNEL_TOPOLOGY_MIN_ACTIVE_SECONDS = 0.5
+REFERENCE_CHANNEL_DUPLICATE_WAVEFORM_CORRELATION = 0.92
+REFERENCE_CHANNEL_DUPLICATE_LAGGED_CORRELATION = 0.94
+REFERENCE_CHANNEL_DUPLICATE_ENVELOPE_CORRELATION = 0.92
+REFERENCE_CHANNEL_DUPLICATE_ENVELOPE_DIFF_RATIO = 0.18
+REFERENCE_CHANNEL_DUPLICATE_SIDE_MID_RATIO = 0.28
+REFERENCE_CHANNEL_SPLIT_MAX_ENVELOPE_CORRELATION = 0.85
+REFERENCE_CHANNEL_SPLIT_MIN_ENVELOPE_DIFF_RATIO = 0.18
+REFERENCE_CHANNEL_SPLIT_MIN_SIDE_MID_RATIO = 0.35
+REFERENCE_CHANNEL_SPLIT_MAX_WAVEFORM_CORRELATION = 0.90
+REFERENCE_CHANNEL_MIN_RMS_BALANCE_RATIO = 0.05
 TORCH_NATIVE_RUNTIME_HINT = (
     "PyTorch native runtime is incomplete or not loadable. Use the full portable package, "
     "extract the whole ZIP directory, and verify _internal\\torch\\_C.cp311-win_amd64.pyd "
@@ -886,6 +929,8 @@ def build_model_ordering(
         "backend_summary": backend_summary,
         "notes": notes,
     }
+    if lyrics_file is not None:
+        _raise_for_untrusted_lyrics_timeline(report)
     _notify_progress(on_progress, 1.0, "Model-assisted ordering complete")
     return ModelOrderingResult(
         reference=reference,
@@ -1009,6 +1054,13 @@ def analyze_reference(
         language_hint=transcript_language_hint,
     )
     notes.extend(lyric_alignment_notes)
+    if lyrics_file is not None and not segments:
+        detail = "; ".join(lyric_alignment_notes) or "no lyric/acoustic alignment details"
+        raise AudioProcessorError(
+            "Lyrics could not be aligned to the original vocal timing; "
+            "refusing to fall back to ASR text or sequential timing. "
+            f"Details: {detail}"
+        )
     if not segments:
         segments = (
             VoiceSegment(
@@ -2037,6 +2089,294 @@ def prepare_reference_channel_lanes(
     )
 
 
+def analyze_reference_channel_topology(
+    reference_path: Path,
+    *,
+    sample_rate: int = REFERENCE_CHANNEL_TOPOLOGY_SAMPLE_RATE,
+    max_duration_seconds: float = REFERENCE_CHANNEL_TOPOLOGY_MAX_SECONDS,
+    should_cancel: CancelCallback | None = None,
+) -> ReferenceChannelTopology:
+    _raise_if_cancelled(should_cancel)
+    normalized_reference = reference_path.expanduser()
+    channel_count = _audio_channel_count(normalized_reference)
+    if channel_count <= 1:
+        return ReferenceChannelTopology(
+            channel_count=channel_count,
+            split_recommended=False,
+            reason="mono_reference",
+        )
+    if channel_count != 2:
+        return ReferenceChannelTopology(
+            channel_count=channel_count,
+            split_recommended=False,
+            reason="multichannel_requires_manual_review",
+        )
+
+    metrics = _reference_stereo_similarity_metrics(
+        normalized_reference,
+        sample_rate=sample_rate,
+        max_duration_seconds=max_duration_seconds,
+        should_cancel=should_cancel,
+    )
+    if metrics is None:
+        return ReferenceChannelTopology(
+            channel_count=channel_count,
+            split_recommended=False,
+            reason="channel_similarity_unavailable",
+        )
+
+    rms_balance = metrics["rms_balance_ratio"]
+    waveform_correlation = metrics["waveform_correlation"]
+    lagged_correlation = metrics["lagged_correlation"]
+    envelope_correlation = metrics["envelope_correlation"]
+    envelope_difference = metrics["envelope_difference_ratio"]
+    side_to_mid = metrics["side_to_mid_ratio"]
+    analyzed_duration = metrics["analyzed_duration_seconds"]
+
+    if analyzed_duration < REFERENCE_CHANNEL_TOPOLOGY_MIN_ACTIVE_SECONDS:
+        reason = "insufficient_active_audio"
+        split_recommended = False
+    elif rms_balance < REFERENCE_CHANNEL_MIN_RMS_BALANCE_RATIO:
+        reason = "one_channel_too_weak"
+        split_recommended = False
+    elif (
+        envelope_correlation >= REFERENCE_CHANNEL_DUPLICATE_ENVELOPE_CORRELATION
+        and envelope_difference <= REFERENCE_CHANNEL_DUPLICATE_ENVELOPE_DIFF_RATIO
+    ):
+        reason = "same_content_stereo_or_harmony"
+        split_recommended = False
+    elif (
+        waveform_correlation >= REFERENCE_CHANNEL_DUPLICATE_WAVEFORM_CORRELATION
+        and side_to_mid <= REFERENCE_CHANNEL_DUPLICATE_SIDE_MID_RATIO
+    ):
+        reason = "near_duplicate_stereo_channels"
+        split_recommended = False
+    elif (
+        lagged_correlation >= REFERENCE_CHANNEL_DUPLICATE_LAGGED_CORRELATION
+        and side_to_mid <= REFERENCE_CHANNEL_DUPLICATE_SIDE_MID_RATIO
+    ):
+        reason = "delayed_stereo_effect_channels"
+        split_recommended = False
+    elif (
+        side_to_mid >= REFERENCE_CHANNEL_SPLIT_MIN_SIDE_MID_RATIO
+        and envelope_correlation <= REFERENCE_CHANNEL_SPLIT_MAX_ENVELOPE_CORRELATION
+        and envelope_difference >= REFERENCE_CHANNEL_SPLIT_MIN_ENVELOPE_DIFF_RATIO
+        and waveform_correlation <= REFERENCE_CHANNEL_SPLIT_MAX_WAVEFORM_CORRELATION
+    ):
+        reason = "independent_channel_content"
+        split_recommended = True
+    else:
+        reason = "channel_content_not_independent_enough"
+        split_recommended = False
+
+    return ReferenceChannelTopology(
+        channel_count=channel_count,
+        split_recommended=split_recommended,
+        reason=reason,
+        waveform_correlation=_round_metric(waveform_correlation),
+        lagged_correlation=_round_metric(lagged_correlation),
+        envelope_correlation=_round_metric(envelope_correlation),
+        envelope_difference_ratio=_round_metric(envelope_difference),
+        side_to_mid_ratio=_round_metric(side_to_mid),
+        rms_balance_ratio=_round_metric(rms_balance),
+        analyzed_duration_seconds=_round_metric(analyzed_duration),
+    )
+
+
+def _reference_stereo_similarity_metrics(
+    path: Path,
+    *,
+    sample_rate: int,
+    max_duration_seconds: float,
+    should_cancel: CancelCallback | None = None,
+) -> dict[str, float] | None:
+    _raise_if_cancelled(should_cancel)
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        return None
+
+    ensure_runtime_tool_paths()
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
+        str(max(int(sample_rate), 1)),
+        "-t",
+        f"{max(float(max_duration_seconds), 0.1):.6f}",
+        "-f",
+        "s16le",
+        "-",
+    ]
+    try:
+        run = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return None
+    _raise_if_cancelled(should_cancel)
+    if run.returncode != 0 or not run.stdout:
+        return None
+
+    samples = np.frombuffer(run.stdout, dtype="<i2")
+    frame_count = samples.size // 2
+    if frame_count <= 0:
+        return None
+    stereo = samples[: frame_count * 2].reshape(frame_count, 2).astype("float32") / 32768.0
+    left = stereo[:, 0]
+    right = stereo[:, 1]
+    peak = float(np.max(np.maximum(np.abs(left), np.abs(right)))) if frame_count else 0.0
+    if peak <= 0.0:
+        return None
+    active_threshold = max(0.005, peak * 0.01)
+    active = np.maximum(np.abs(left), np.abs(right)) >= active_threshold
+    if int(active.sum()) < int(sample_rate * REFERENCE_CHANNEL_TOPOLOGY_MIN_ACTIVE_SECONDS):
+        return {
+            "waveform_correlation": 1.0,
+            "lagged_correlation": 1.0,
+            "envelope_correlation": 1.0,
+            "envelope_difference_ratio": 0.0,
+            "side_to_mid_ratio": 0.0,
+            "rms_balance_ratio": 0.0,
+            "analyzed_duration_seconds": float(active.sum()) / float(sample_rate),
+        }
+    left_active = left[active]
+    right_active = right[active]
+    left_rms = _np_rms(np, left_active)
+    right_rms = _np_rms(np, right_active)
+    rms_balance = min(left_rms, right_rms) / max(max(left_rms, right_rms), 1e-12)
+    mid = (left_active + right_active) * 0.5
+    side = (left_active - right_active) * 0.5
+    side_to_mid = _np_rms(np, side) / max(_np_rms(np, mid), 1e-12)
+    waveform_correlation = _np_abs_correlation(np, left_active, right_active)
+    lagged_correlation = _np_lagged_abs_correlation(
+        np,
+        left_active,
+        right_active,
+        max_lag_samples=max(1, int(sample_rate * 0.03)),
+    )
+    envelope_correlation, envelope_difference = _np_envelope_similarity(
+        np,
+        left_active,
+        right_active,
+        frame_size=max(128, int(sample_rate * 0.064)),
+    )
+    return {
+        "waveform_correlation": waveform_correlation,
+        "lagged_correlation": lagged_correlation,
+        "envelope_correlation": envelope_correlation,
+        "envelope_difference_ratio": envelope_difference,
+        "side_to_mid_ratio": side_to_mid,
+        "rms_balance_ratio": rms_balance,
+        "analyzed_duration_seconds": float(active.sum()) / float(sample_rate),
+    }
+
+
+def _np_rms(np: Any, values: Any) -> float:
+    if getattr(values, "size", 0) <= 0:
+        return 0.0
+    return float(np.sqrt(np.mean(values * values)))
+
+
+def _np_abs_correlation(np: Any, left: Any, right: Any) -> float:
+    if getattr(left, "size", 0) <= 1 or getattr(right, "size", 0) <= 1:
+        return 1.0
+    denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+    if denominator <= 1e-12:
+        return 1.0
+    value = float(np.dot(left, right) / denominator)
+    if not math.isfinite(value):
+        return 1.0
+    return min(max(abs(value), 0.0), 1.0)
+
+
+def _np_lagged_abs_correlation(
+    np: Any,
+    left: Any,
+    right: Any,
+    *,
+    max_lag_samples: int,
+) -> float:
+    sample_count = int(min(getattr(left, "size", 0), getattr(right, "size", 0)))
+    if sample_count <= 1:
+        return 1.0
+    stride = max(sample_count // 120_000, 1)
+    left = left[::stride]
+    right = right[::stride]
+    sample_count = int(min(getattr(left, "size", 0), getattr(right, "size", 0)))
+    max_lag = min(max(int(max_lag_samples // stride), 1), max(sample_count // 2, 1))
+    lag_step = max(max_lag // 24, 1)
+    best = _np_abs_correlation(np, left, right)
+    for lag in range(-max_lag, max_lag + 1, lag_step):
+        if lag == 0:
+            continue
+        if lag > 0:
+            current = _np_abs_correlation(np, left[lag:], right[:-lag])
+        else:
+            current = _np_abs_correlation(np, left[:lag], right[-lag:])
+        best = max(best, current)
+    return best
+
+
+def _np_envelope_similarity(
+    np: Any,
+    left: Any,
+    right: Any,
+    *,
+    frame_size: int,
+) -> tuple[float, float]:
+    frame_size = max(int(frame_size), 1)
+    frame_count = int(min(getattr(left, "size", 0), getattr(right, "size", 0)) // frame_size)
+    if frame_count <= 2:
+        return 1.0, 0.0
+    trimmed = frame_count * frame_size
+    left_env = np.sqrt(np.mean(left[:trimmed].reshape(frame_count, frame_size) ** 2, axis=1))
+    right_env = np.sqrt(np.mean(right[:trimmed].reshape(frame_count, frame_size) ** 2, axis=1))
+    max_env = np.maximum(left_env, right_env)
+    valid = max_env >= max(float(np.max(max_env)) * 0.02, 1e-6)
+    left_env = left_env[valid]
+    right_env = right_env[valid]
+    if getattr(left_env, "size", 0) <= 2:
+        return 1.0, 0.0
+    if float(np.std(left_env)) <= 1e-12 or float(np.std(right_env)) <= 1e-12:
+        correlation = 1.0
+    else:
+        correlation = float(np.corrcoef(left_env, right_env)[0, 1])
+        if not math.isfinite(correlation):
+            correlation = 1.0
+    difference = float(
+        np.mean(np.abs(left_env - right_env)) / max(float(np.mean(np.maximum(left_env, right_env))), 1e-12)
+    )
+    return min(max(correlation, 0.0), 1.0), max(difference, 0.0)
+
+
+def _round_metric(value: float | None) -> float | None:
+    if value is None or not math.isfinite(float(value)):
+        return None
+    return round(float(value), 6)
+
+
+def _positive_int(value: Any, *, fallback: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
 def _reference_channel_lanes_for_vocal(
     source_path: Path,
     vocal_path: Path,
@@ -2046,8 +2386,12 @@ def _reference_channel_lanes_for_vocal(
     should_cancel: CancelCallback | None = None,
 ) -> tuple[ReferenceChannelLane, ...]:
     _raise_if_cancelled(should_cancel)
-    channels = _audio_channel_count(vocal_path)
-    if channels <= 1:
+    topology = analyze_reference_channel_topology(vocal_path, should_cancel=should_cancel)
+    topology_note = (
+        "reference_channel_topology="
+        + json.dumps(topology.to_dict(), ensure_ascii=False, sort_keys=True)
+    )
+    if not topology.split_recommended:
         return (
             ReferenceChannelLane(
                 index=0,
@@ -2055,7 +2399,13 @@ def _reference_channel_lanes_for_vocal(
                 reference_path=vocal_path,
                 source_path=source_path,
                 split_from_stereo=False,
-                notes=tuple(notes),
+                notes=tuple(
+                    [
+                        *notes,
+                        f"reference_channel_split_skipped={topology.reason}",
+                        topology_note,
+                    ]
+                ),
             ),
         )
 
@@ -2063,7 +2413,7 @@ def _reference_channel_lanes_for_vocal(
     lane_root.mkdir(parents=True, exist_ok=True)
     sample_rate = _audio_sample_rate(vocal_path)
     lanes: list[ReferenceChannelLane] = []
-    for index in range(channels):
+    for index in range(topology.channel_count):
         _raise_if_cancelled(should_cancel)
         label = _reference_channel_label(index)
         lane_path = lane_root / f"{vocal_path.stem}_{label}.wav"
@@ -2084,6 +2434,7 @@ def _reference_channel_lanes_for_vocal(
                 notes=tuple(
                     [
                         *notes,
+                        topology_note,
                         f"reference_channel_lane={label}",
                         f"reference_channel_source={vocal_path}",
                     ]
@@ -3127,6 +3478,8 @@ def _reference_cache_path(
         "language_hint": _normalize_cn_jp_language(language_hint),
         "reference_unit_timing_format": "voice_unit_timing_v1",
         "funasr_timestamp_mismatch_policy": "resample_to_reference_units_v1",
+        "lyrics_acoustic_alignment_policy": "strict_no_sequential_or_asr_fallback_v1",
+        "lyrics_exact_timeline_policy": "block_resampled_or_missing_unit_timing_v1",
         "whisperx_return_char_alignments": True,
         "speaker_model": SPEAKER_EMBEDDING_MODEL,
         "compute_device": compute_device,
@@ -3374,7 +3727,7 @@ def _lyric_transcript_similarity(left: str, right: str, *, language_hint: str = 
 
 
 def _lyric_transcript_match_threshold(language_hint: str) -> float:
-    return 0.24 if _normalize_cn_jp_language(language_hint) in {"CN", "JP"} else 0.30
+    return 0.42 if _normalize_cn_jp_language(language_hint) in {"CN", "JP"} else 0.30
 
 
 def _merge_transcript_segments(segments: Sequence[TranscriptSegment]) -> TranscriptSegment:
@@ -3497,7 +3850,7 @@ def _segments_from_transcript_with_notes(
                     segments,
                     language_hint=language_hint,
                 )
-                if alignment.segments:
+                if alignment.segments and alignment.unmatched_lyric_count == 0:
                     notes = [
                         "lyric_acoustic_alignment: "
                         f"matched_lyrics={alignment.matched_count}/{len(lyric_segments)}; "
@@ -3506,24 +3859,16 @@ def _segments_from_transcript_with_notes(
                         f"mean_score={alignment.mean_score if alignment.mean_score is not None else 'n/a'}"
                     ]
                     return alignment.segments, tuple(notes)
-                if len(lyric_segments) == len(segments):
-                    fallback_segments = tuple(
-                        _split_transcript_segment_for_lyrics(
-                            transcript,
-                            (lyric,),
-                            language_hint=language_hint,
-                        )[0]
-                        for lyric, transcript in zip(lyric_segments, segments)
-                    )
-                    return fallback_segments, (
-                        "lyric_acoustic_alignment_fallback: "
-                        f"paired_equal_counts={len(fallback_segments)}; "
-                        "acoustic segment timing retained because transcript text was not reliable enough",
-                    )
                 return (), (
-                    "lyric_acoustic_alignment_failed: no lyric lines could be aligned to acoustic transcript segments",
+                    "lyric_acoustic_alignment_failed: "
+                    f"matched_lyrics={len(alignment.segments)}/{len(lyric_segments)}; "
+                    f"unmatched_lyrics={alignment.unmatched_lyric_count}; "
+                    f"skipped_acoustic_segments={alignment.skipped_acoustic_count}/{len(segments)}; "
+                    "refusing sequential or ASR-text fallback",
                 )
-            return tuple(lyric_segments), ("lyric_acoustic_alignment_absent: lyrics used without ASR segment timing",)
+            return (), (
+                "lyric_acoustic_alignment_absent: lyrics cannot be timed without original vocal ASR/acoustic segments",
+            )
 
     return (
         tuple(
@@ -4131,6 +4476,32 @@ def _render_timeline_alignment_summary(
             else "phonetic_or_text_position_split" if split_segment_indices else "segment_or_weighted_duration"
         ),
     }
+
+
+def _raise_for_untrusted_lyrics_timeline(report: dict[str, Any]) -> None:
+    timeline = report.get("timeline_alignment", {})
+    if not isinstance(timeline, dict):
+        raise AudioProcessorError(
+            "Lyrics ordering did not produce a timeline alignment report; refusing to render."
+        )
+    positioned_count = _positive_int(timeline.get("positioned_decision_count"))
+    exact_count = _positive_int(timeline.get("exact_timed_target_duration_count"))
+    resampled_count = _positive_int(timeline.get("resampled_timing_lattice_count"))
+    timed_count = _positive_int(timeline.get("timed_target_duration_count"))
+    if positioned_count <= 0:
+        raise AudioProcessorError(
+            "Lyrics ordering could not position material decisions on the original vocal timeline; refusing to render."
+        )
+    if resampled_count > 0:
+        raise AudioProcessorError(
+            "Lyrics ordering used resampled/interpolated unit timing instead of exact original vocal timing; "
+            f"resampled={resampled_count}, exact={exact_count}, positioned={positioned_count}."
+        )
+    if timed_count < positioned_count or exact_count < positioned_count:
+        raise AudioProcessorError(
+            "Lyrics ordering did not preserve exact timing for every positioned material decision; "
+            f"timed={timed_count}, exact={exact_count}, positioned={positioned_count}."
+        )
 
 
 def _render_timeline_alignment_details(

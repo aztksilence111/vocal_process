@@ -13,6 +13,7 @@ from .batch import QueueItem, run_batch_queue
 from .engine import AudioProcessorError, get_audio_duration_seconds, list_audio_files, probe_audio
 from .diagnostics import diagnostic_log_path
 from .model_runtime import (
+    analyze_reference_channel_topology,
     infer_cn_jp_language_from_name,
     reference_material_language_compatibility,
     speech_runtime_preflight_report,
@@ -757,24 +758,12 @@ def _find_lyrics_file(lyrics_root: Path, stem: str) -> Path | None:
 
 def _expected_channel_output_paths(reference_path: Path, base_output_path: Path) -> list[Path]:
     try:
-        probe_data = probe_audio(reference_path)
+        topology = analyze_reference_channel_topology(reference_path)
     except Exception:
         return [base_output_path]
 
-    streams = probe_data.get("streams", []) if isinstance(probe_data, dict) else []
-    audio_stream = next(
-        (
-            stream
-            for stream in streams
-            if isinstance(stream, dict) and stream.get("codec_type") == "audio"
-        ),
-        {},
-    )
-    try:
-        channels = int(audio_stream.get("channels") or 1)
-    except (TypeError, ValueError):
-        channels = 1
-    if channels <= 1:
+    channels = topology.channel_count
+    if not topology.split_recommended or channels <= 1:
         return [base_output_path]
 
     labels = ["left", "right"] if channels == 2 else [f"ch{index + 1}" for index in range(channels)]
