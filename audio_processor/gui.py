@@ -61,6 +61,7 @@ class AudioProcessorApp(tk.Tk):
         self.manual_lyrics_enabled_var = tk.BooleanVar()
         self.lyrics_file_var = tk.StringVar()
         self.daw_timeline_export_var = tk.BooleanVar()
+        self.split_reference_channels_var = tk.BooleanVar()
         self.compute_device_var = tk.StringVar(value="auto")
         self.source_separation_var = tk.StringVar(value="auto")
         self.window_geometry_var = tk.StringVar(value="980x680")
@@ -233,6 +234,14 @@ class AudioProcessorApp(tk.Tk):
         )
         self.daw_timeline_export_check.configure(command=self._update_outputs_from_settings)
         self.daw_timeline_export_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+
+        row += 1
+        self.split_reference_channels_check = self._checkbutton(
+            parent,
+            "split_reference_channels",
+            self.split_reference_channels_var,
+        )
+        self.split_reference_channels_check.grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
 
         row += 1
         self._label(parent, "compute_device").grid(row=row, column=0, sticky="w", pady=4)
@@ -554,6 +563,7 @@ class AudioProcessorApp(tk.Tk):
             manual_lyrics_enabled=self.manual_lyrics_enabled_var.get(),
             lyrics_file=self.lyrics_file_var.get().strip(),
             daw_timeline_export=self.daw_timeline_export_var.get(),
+            split_reference_channels=self.split_reference_channels_var.get(),
             compute_device=normalize_compute_device(self.compute_device_var.get()),
             source_separation=normalize_source_separation(self.source_separation_var.get()),
             window_geometry=normalize_window_geometry(self.window_geometry_var.get()),
@@ -577,6 +587,7 @@ class AudioProcessorApp(tk.Tk):
         self.manual_lyrics_enabled_var.set(settings.manual_lyrics_enabled)
         self.lyrics_file_var.set(settings.lyrics_file)
         self.daw_timeline_export_var.set(settings.daw_timeline_export)
+        self.split_reference_channels_var.set(settings.split_reference_channels)
         self.compute_device_var.set(settings.compute_device)
         self.source_separation_var.set(settings.source_separation)
         self.window_geometry_var.set(settings.window_geometry)

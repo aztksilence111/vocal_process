@@ -23,6 +23,7 @@ class ProcessingSettings:
     material_directory: str = ""
     manual_lyrics_enabled: bool = False
     lyrics_file: str = ""
+    split_reference_channels: bool = False
     daw_timeline_export: bool = False
     compute_device: str = "auto"
     source_separation: str = "auto"
@@ -85,6 +86,9 @@ class ProcessingSettings:
             material_directory=str(data.get("material_directory") or defaults.material_directory),
             manual_lyrics_enabled=bool(data.get("manual_lyrics_enabled", bool(data.get("lyrics_file")))),
             lyrics_file=str(data.get("lyrics_file") or defaults.lyrics_file),
+            split_reference_channels=bool(
+                data.get("split_reference_channels", defaults.split_reference_channels)
+            ),
             daw_timeline_export=bool(data.get("daw_timeline_export", defaults.daw_timeline_export)),
             compute_device=normalize_compute_device(data.get("compute_device")),
             source_separation=normalize_source_separation(data.get("source_separation")),

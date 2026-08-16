@@ -17,7 +17,13 @@ from audio_processor.phoneme import VowelConsonantProfile
 from audio_processor import maintenance
 from audio_processor import real_eval
 from audio_processor import tls
-from audio_processor.batch import BatchSummary, create_queue, run_batch_queue
+from audio_processor.batch import (
+    BatchSummary,
+    QueueItem,
+    _run_split_reference_channel_item,
+    create_queue,
+    run_batch_queue,
+)
 from audio_processor.cli import build_parser
 from audio_processor.cli import main as cli_main
 from audio_processor.diagnostics import DiagnosticLogger, diagnostic_log_path
@@ -1387,6 +1393,87 @@ class SourceSeparationTests(unittest.TestCase):
 
         self.assertNotEqual(first.name, second.name)
 
+    def test_reference_channel_lanes_extract_stereo_input_as_mono_files(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            _write_test_wave(reference, duration_seconds=0.25, sample_rate=8000, channels=2)
+
+            lanes = model_runtime.prepare_reference_channel_lanes(
+                reference,
+                work_dir=root / "work",
+                source_separation="never",
+            )
+            lane_metadata = [probe_audio(lane.reference_path) for lane in lanes]
+
+        self.assertEqual([lane.label for lane in lanes], ["left", "right"])
+        self.assertTrue(all(lane.split_from_stereo for lane in lanes))
+        self.assertEqual(
+            [stream["channels"] for data in lane_metadata for stream in data["streams"] if stream.get("codec_type") == "audio"],
+            [1, 1],
+        )
+
+    def test_split_reference_channel_item_forces_mono_lane_settings(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            output = root / "out" / "render.wav"
+            material_directory = root / "materials"
+            material_directory.mkdir()
+            diagnostics = DiagnosticLogger(root / "diagnostics.jsonl")
+            settings = ProcessingSettings(
+                material_directory=str(material_directory),
+                split_reference_channels=True,
+                channels=2,
+                source_separation="auto",
+                output_directory=str(output.parent),
+            )
+            item = QueueItem(reference, output)
+            lanes = (
+                model_runtime.ReferenceChannelLane(
+                    index=0,
+                    label="left",
+                    reference_path=root / "left.wav",
+                    source_path=reference,
+                    split_from_stereo=True,
+                ),
+                model_runtime.ReferenceChannelLane(
+                    index=1,
+                    label="right",
+                    reference_path=root / "right.wav",
+                    source_path=reference,
+                    split_from_stereo=True,
+                ),
+            )
+            captured: list[tuple[Path, Path, ProcessingSettings]] = []
+
+            def fake_run_batch(
+                lane_items: list[object],
+                lane_settings: ProcessingSettings,
+                **kwargs: object,
+            ) -> BatchSummary:
+                del kwargs
+                lane_item = lane_items[0]
+                captured.append((lane_item.input_path, lane_item.output_path, lane_settings))
+                return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+            with patch("audio_processor.batch.prepare_reference_channel_lanes", return_value=lanes):
+                with patch("audio_processor.batch.run_batch_queue", side_effect=fake_run_batch):
+                    outputs = _run_split_reference_channel_item(
+                        item,
+                        settings,
+                        diagnostics,
+                        lambda _progress, _message: None,
+                        None,
+                    )
+
+        self.assertEqual(outputs, [root / "out" / "render_left.wav", root / "out" / "render_right.wav"])
+        self.assertEqual([entry[0] for entry in captured], [root / "left.wav", root / "right.wav"])
+        self.assertEqual([entry[1] for entry in captured], outputs)
+        self.assertTrue(all(entry[2].channels == 1 for entry in captured))
+        self.assertTrue(all(entry[2].source_separation == "never" for entry in captured))
+        self.assertTrue(all(not entry[2].split_reference_channels for entry in captured))
+
 
 class SettingsTests(unittest.TestCase):
     def test_default_output_extension_is_wav(self) -> None:
@@ -1398,6 +1485,7 @@ class SettingsTests(unittest.TestCase):
             material_directory="materials",
             manual_lyrics_enabled=True,
             lyrics_file="lyrics.txt",
+            split_reference_channels=True,
             daw_timeline_export=True,
             source_separation="never",
             output_directory="out",
@@ -1420,6 +1508,7 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(loaded.manual_lyrics_enabled)
         self.assertEqual(loaded.lyrics_file, "lyrics.txt")
         self.assertEqual(loaded.effective_lyrics_file(), "lyrics.txt")
+        self.assertTrue(loaded.split_reference_channels)
         self.assertTrue(loaded.daw_timeline_export)
         self.assertEqual(loaded.source_separation, "never")
         self.assertEqual(loaded.output_directory, "out")
@@ -1826,6 +1915,104 @@ class RealEvalTests(unittest.TestCase):
         self.assertIn("Boundary Risks", markdown)
         self.assertIn("Timed", markdown)
         self.assertIn("Strict Pass", markdown)
+
+    def test_rendered_real_eval_splits_stereo_reference_and_enables_real_lyrics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            origin = root / "origin_vocal"
+            material_root = root / "material_set" / "vmzCN"
+            lyrics_root = root / "lyrics"
+            origin.mkdir()
+            material_root.mkdir(parents=True)
+            lyrics_root.mkdir()
+            reference_path = origin / "song_CN.wav"
+            _write_test_wave(reference_path, duration_seconds=4.0, channels=2)
+            _write_test_wave(material_root / "wo.wav", duration_seconds=1.0)
+            lyrics_path = lyrics_root / "song_CN.txt"
+            lyrics_path.write_text("\u6211\n", encoding="utf-8")
+
+            preflight_report = {
+                "status": "ok",
+                "summary": {
+                    "material_count": 1,
+                    "warning_count": 0,
+                    "error_warning_count": 0,
+                    "review_required_match_count": 0,
+                    "minimum_match_score": 0.9,
+                    "extreme_stretch_count": 0,
+                    "moderate_stretch_count": 0,
+                },
+                "warnings": [],
+                "ordering": {
+                    "ordering": [{"rank": 1, "score": 0.9, "confidence_label": "strong"}],
+                    "timeline_alignment": {
+                        "decision_count": 1,
+                        "positioned_decision_count": 1,
+                        "resolved_target_duration_count": 1,
+                        "timed_target_duration_count": 1,
+                        "exact_timed_target_duration_count": 1,
+                        "target_duration_total_seconds": 4.0,
+                    },
+                },
+                "stretch_plan": [
+                    {
+                        "target_duration_seconds": 4.0,
+                        "quality_warning": "",
+                        "stretch_naturalness_score": 0.95,
+                        "continuity_warning": "",
+                    }
+                ],
+            }
+            captured: dict[str, object] = {}
+
+            def fake_run_batch_queue(
+                items: list[QueueItem],
+                settings: ProcessingSettings,
+                **kwargs: object,
+            ) -> BatchSummary:
+                del kwargs
+                captured["settings"] = settings
+                base = items[0].output_path
+                _write_test_wave(base.with_name(f"{base.stem}_left{base.suffix}"), duration_seconds=4.0)
+                _write_test_wave(base.with_name(f"{base.stem}_right{base.suffix}"), duration_seconds=4.0)
+                return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
+
+            def fake_probe(path: Path) -> dict[str, object]:
+                path = Path(path)
+                return {
+                    "streams": [
+                        {
+                            "codec_type": "audio",
+                            "duration": "4.0",
+                            "channels": 2 if path == reference_path else 1,
+                        }
+                    ],
+                    "format": {},
+                }
+
+            with patch("audio_processor.real_eval.build_preflight_report", return_value=preflight_report):
+                with patch("audio_processor.real_eval.run_batch_queue", side_effect=fake_run_batch_queue):
+                    with patch("audio_processor.real_eval.probe_audio", side_effect=fake_probe):
+                        result = real_eval.run_real_suite(
+                            root,
+                            render=True,
+                            allow_unverified_reference_render=True,
+                            source_separation="never",
+                            output_root=root / "output",
+                        )
+
+        settings = captured["settings"]
+        self.assertEqual(result.cases[0].status, "rendered")
+        self.assertTrue(settings.manual_lyrics_enabled)
+        self.assertTrue(settings.split_reference_channels)
+        self.assertEqual(
+            result.cases[0].summary["render_validation"]["status"],
+            "ok",
+        )
+        self.assertEqual(
+            len(result.cases[0].summary["render_validation"]["channel_outputs"]),
+            2,
+        )
 
     def test_real_eval_output_root_separates_audio_reports_and_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -2736,6 +2923,7 @@ class CliTests(unittest.TestCase):
                 "materials",
                 "--lyrics-file",
                 "lyrics.txt",
+                "--split-reference-channels",
                 "--overwrite",
             ]
         )
@@ -2745,6 +2933,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.output, Path("out.wav"))
         self.assertEqual(args.material_directory, Path("materials"))
         self.assertEqual(args.lyrics_file, Path("lyrics.txt"))
+        self.assertTrue(args.split_reference_channels)
         self.assertTrue(args.overwrite)
 
     def test_batch_subcommand_accepts_compute_device(self) -> None:
@@ -4859,6 +5048,35 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(segments[0].unit_timings[0].start_seconds, 0.0)
         self.assertAlmostEqual(segments[0].unit_timings[-1].end_seconds, 1.0)
         self.assertAlmostEqual(sum(timing.duration_seconds for timing in segments[0].unit_timings), 1.0)
+
+    def test_lyrics_alignment_uses_original_acoustic_timing_and_skips_residual_segments(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "song_CN.txt"
+            lyrics.write_text("\u6211\n\u662f\n", encoding="utf-8")
+            transcript_segments = [
+                model_runtime.TranscriptSegment(0.0, 1.0, "\u6211", timing_source="whisperx_alignment"),
+                model_runtime.TranscriptSegment(
+                    1.0,
+                    2.0,
+                    "electric guitar solo",
+                    timing_source="whisperx_alignment",
+                ),
+                model_runtime.TranscriptSegment(2.0, 3.0, "\u662f", timing_source="whisperx_alignment"),
+            ]
+
+            segments, notes = model_runtime._segments_from_transcript_with_notes(
+                transcript_segments,
+                lyrics_file=lyrics,
+                language_hint="CN",
+            )
+
+        self.assertEqual([segment.text for segment in segments], ["\u6211", "\u662f"])
+        self.assertEqual(
+            [(segment.start_seconds, segment.end_seconds) for segment in segments],
+            [(0.0, 1.0), (2.0, 3.0)],
+        )
+        self.assertTrue(any("skipped_acoustic_segments=1/3" in note for note in notes))
 
     def test_auto_asr_skips_uncached_accelerated_backends(self) -> None:
         with TemporaryDirectory() as temp_dir:

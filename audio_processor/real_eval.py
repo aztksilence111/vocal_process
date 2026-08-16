@@ -445,7 +445,9 @@ def run_real_suite(
             else:
                 settings = ProcessingSettings(
                     material_directory=str(case.material_directory),
+                    manual_lyrics_enabled=bool(case.lyrics_file),
                     lyrics_file=str(case.lyrics_file or ""),
+                    split_reference_channels=True,
                     output_directory=str(case.output_directory),
                     output_extension=".wav",
                     overwrite=True,
@@ -454,13 +456,21 @@ def run_real_suite(
                     render_cache_directory=str(_real_eval_case_cache_directory(root, output_root, case)),
                     diagnostics_directory=str(case_report_directory / "render"),
                 )
-                render_output_path = settings.output_path_for(case.reference_path)
-                render_report_path = diagnostic_log_path(render_output_path, case_report_directory / "render")
+                base_render_output_path = settings.output_path_for(case.reference_path)
+                expected_output_paths = _expected_channel_output_paths(
+                    case.reference_path,
+                    base_render_output_path,
+                )
+                render_output_path = expected_output_paths[0]
+                render_report_path = diagnostic_log_path(
+                    base_render_output_path,
+                    case_report_directory / "render",
+                )
                 try:
                     if _should_cancel(cancel_checker):
                         raise AudioProcessorError("Processing cancelled")
                     summary = run_batch_queue(
-                        [QueueItem(case.reference_path, render_output_path)],
+                        [QueueItem(case.reference_path, base_render_output_path)],
                         settings,
                         should_cancel=cancel_checker,
                     )
@@ -469,9 +479,12 @@ def run_real_suite(
                         warnings.append(_cancelled_warning("Real-eval rendering was cancelled."))
                     else:
                         status = "rendered" if summary.failed == 0 else "render_failed"
-                    if not render_output_path.exists():
+                    if not all(path.exists() for path in expected_output_paths):
                         status = "cancelled" if status == "cancelled" else "render_failed"
-                    render_summary = {"batch_summary": summary.__dict__}
+                    render_summary = {
+                        "batch_summary": summary.__dict__,
+                        "channel_output_paths": [str(path) for path in expected_output_paths],
+                    }
                 except Exception as exc:
                     status = "cancelled" if _is_cancellation_exception(exc) else "render_failed"
                     render_summary = {"error": str(exc)}
@@ -740,6 +753,37 @@ def _find_lyrics_file(lyrics_root: Path, stem: str) -> Path | None:
         if file.stem in search_stems or file.name in {f"{value}{file.suffix}" for value in search_stems}:
             candidates.append(file)
     return sorted(candidates)[0] if candidates else None
+
+
+def _expected_channel_output_paths(reference_path: Path, base_output_path: Path) -> list[Path]:
+    try:
+        probe_data = probe_audio(reference_path)
+    except Exception:
+        return [base_output_path]
+
+    streams = probe_data.get("streams", []) if isinstance(probe_data, dict) else []
+    audio_stream = next(
+        (
+            stream
+            for stream in streams
+            if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+        ),
+        {},
+    )
+    try:
+        channels = int(audio_stream.get("channels") or 1)
+    except (TypeError, ValueError):
+        channels = 1
+    if channels <= 1:
+        return [base_output_path]
+
+    labels = ["left", "right"] if channels == 2 else [f"ch{index + 1}" for index in range(channels)]
+    suffix = base_output_path.suffix
+    stem = base_output_path.stem if suffix else base_output_path.name
+    return [
+        base_output_path.with_name(f"{stem}_{label}{suffix}")
+        for label in labels
+    ]
 
 
 def _infer_language(stem: str) -> str:
@@ -1512,11 +1556,36 @@ def _render_validation(
     render_requested = bool(render_summary)
     render_failed = _render_summary_failed(render_summary)
     render_blocked = bool(render_summary.get("blocked")) if isinstance(render_summary, dict) else False
-    output_exists = bool(output_path and output_path.exists())
-    output_duration_seconds = _probe_duration(output_path) if output_exists and not render_failed else None
-    delta_seconds = _duration_delta(output_duration_seconds, reference_duration_seconds)
-    delta_ratio = _duration_delta_ratio(output_duration_seconds, reference_duration_seconds)
-    duration_alignment_score = _duration_alignment_score(delta_ratio)
+    channel_output_paths = _render_summary_channel_output_paths(render_summary)
+    validation_paths = channel_output_paths or ([output_path] if output_path else [])
+    channel_outputs = [
+        _channel_output_validation(path, reference_duration_seconds, render_failed)
+        for path in validation_paths
+    ]
+    output_exists = bool(channel_outputs) and all(entry["exists"] for entry in channel_outputs)
+    output_duration_seconds = (
+        _safe_float(channel_outputs[0].get("duration_seconds"))
+        if channel_outputs
+        else None
+    )
+    delta_seconds_values = [
+        _safe_float(entry.get("duration_delta_seconds"))
+        for entry in channel_outputs
+        if _safe_float(entry.get("duration_delta_seconds")) is not None
+    ]
+    delta_ratio_values = [
+        _safe_float(entry.get("duration_delta_ratio"))
+        for entry in channel_outputs
+        if _safe_float(entry.get("duration_delta_ratio")) is not None
+    ]
+    score_values = [
+        _safe_float(entry.get("duration_alignment_score"))
+        for entry in channel_outputs
+        if _safe_float(entry.get("duration_alignment_score")) is not None
+    ]
+    delta_seconds = max(delta_seconds_values) if delta_seconds_values else None
+    delta_ratio = max(delta_ratio_values) if delta_ratio_values else None
+    duration_alignment_score = min(score_values) if score_values else None
     if not render_requested:
         status = "not_requested"
     elif render_blocked:
@@ -1525,7 +1594,7 @@ def _render_validation(
         status = "render_failed"
     elif not output_exists:
         status = "missing_output"
-    elif output_duration_seconds is None or reference_duration_seconds is None:
+    elif not channel_outputs or any(entry.get("duration_seconds") is None for entry in channel_outputs) or reference_duration_seconds is None:
         status = "duration_unavailable"
     elif delta_ratio is not None and delta_ratio <= STRICT_DURATION_TOLERANCE_RATIO:
         status = "ok"
@@ -1541,11 +1610,40 @@ def _render_validation(
         "render_failed": render_failed,
         "output_exists": output_exists,
         "output_path": str(output_path) if output_path else "",
+        "channel_outputs": channel_outputs,
         "output_duration_seconds": _round_float(output_duration_seconds),
         "reference_duration_seconds": _round_float(reference_duration_seconds),
         "duration_delta_seconds": _round_float(delta_seconds),
         "duration_delta_ratio": _round_float(delta_ratio),
         "duration_alignment_score": _round_float(duration_alignment_score),
+    }
+
+
+def _render_summary_channel_output_paths(render_summary: dict[str, Any]) -> list[Path]:
+    if not isinstance(render_summary, dict):
+        return []
+    raw_paths = render_summary.get("channel_output_paths")
+    if not isinstance(raw_paths, list):
+        return []
+    return [Path(str(path)) for path in raw_paths if str(path or "").strip()]
+
+
+def _channel_output_validation(
+    path: Path,
+    reference_duration_seconds: float | None,
+    render_failed: bool,
+) -> dict[str, Any]:
+    exists = path.exists()
+    duration_seconds = _probe_duration(path) if exists and not render_failed else None
+    delta_seconds = _duration_delta(duration_seconds, reference_duration_seconds)
+    delta_ratio = _duration_delta_ratio(duration_seconds, reference_duration_seconds)
+    return {
+        "path": str(path),
+        "exists": exists,
+        "duration_seconds": _round_float(duration_seconds),
+        "duration_delta_seconds": _round_float(delta_seconds),
+        "duration_delta_ratio": _round_float(delta_ratio),
+        "duration_alignment_score": _round_float(_duration_alignment_score(delta_ratio)),
     }
 
 

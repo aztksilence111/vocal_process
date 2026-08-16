@@ -99,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     batch_parser.add_argument("--lyrics-file", type=Path, help="optional lyrics text, LRC, SRT, or DOCX file")
     batch_parser.add_argument(
+        "--split-reference-channels",
+        action="store_true",
+        help="match each reference channel separately and write one mono output per channel",
+    )
+    batch_parser.add_argument(
         "--daw-timeline-export",
         action="store_true",
         help="write a DAW timeline project instead of a flat WAV",
@@ -365,6 +370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 material_directory=str(args.material_directory),
                 manual_lyrics_enabled=bool(args.lyrics_file),
                 lyrics_file=str(args.lyrics_file or ""),
+                split_reference_channels=args.split_reference_channels,
                 daw_timeline_export=args.daw_timeline_export,
                 compute_device=args.compute_device,
                 source_separation=args.source_separation,
@@ -388,8 +394,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if summary.failed or summary.cancelled:
                 print(f"error: {item.message}", file=sys.stderr)
                 return 1
-            print(f"Wrote {item.output_path}")
-            print(item.message)
+            if args.split_reference_channels:
+                print(item.message)
+            else:
+                print(f"Wrote {item.output_path}")
+                print(item.message)
             return 0
 
         if args.command == "export-daw":

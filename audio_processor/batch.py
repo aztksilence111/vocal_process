@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -17,7 +17,11 @@ from .engine import (
     process_audio_with_progress,
     render_material_stretch_plan,
 )
-from .model_runtime import build_model_ordering, speech_runtime_preflight_report
+from .model_runtime import (
+    build_model_ordering,
+    prepare_reference_channel_lanes,
+    speech_runtime_preflight_report,
+)
 from .settings import ProcessingSettings
 
 
@@ -111,6 +115,32 @@ def run_batch_queue(
             _log_input_diagnostics(diagnostics, item.input_path, settings)
             if should_cancel is not None and should_cancel():
                 raise AudioProcessorError("Processing cancelled")
+            if _should_split_reference_channels(settings):
+                lane_outputs = _run_split_reference_channel_item(
+                    item,
+                    settings,
+                    diagnostics,
+                    progress_callback,
+                    should_cancel,
+                )
+                item.elapsed_seconds = _elapsed_since(item_started_at)
+                diagnostics.event(
+                    "batch.item.completed",
+                    "Queued item completed",
+                    elapsed_seconds=item.elapsed_seconds,
+                    total_elapsed_seconds=_elapsed_since(batch_started_at),
+                )
+                item.status = "Done"
+                item.progress = 1.0
+                item.message = _message_with_diagnostics(
+                    "Complete; channel outputs: "
+                    + ", ".join(str(path.expanduser()) for path in lane_outputs),
+                    diagnostics,
+                )
+                completed += 1
+                _notify_item(on_item_update, index, item)
+                _notify_queue(on_queue_progress, (index + 1) / total, f"{index + 1}/{total}: complete")
+                continue
             options = settings.to_process_options(item.input_path, item.output_path)
             _remove_stale_output_before_overwrite(item.output_path, options.overwrite, diagnostics)
             if settings.material_directory:
@@ -270,6 +300,120 @@ def run_batch_queue(
         _notify_queue(on_queue_progress, (index + 1) / total, f"{index + 1}/{total}: complete")
 
     return BatchSummary(total=total, completed=completed, failed=failed, cancelled=cancelled)
+
+
+def _should_split_reference_channels(settings: ProcessingSettings) -> bool:
+    return bool(
+        settings.split_reference_channels
+        and settings.material_directory
+        and not settings.daw_timeline_export
+    )
+
+
+def _run_split_reference_channel_item(
+    item: QueueItem,
+    settings: ProcessingSettings,
+    diagnostics: DiagnosticLogger,
+    progress_callback: Callable[[float, str], None],
+    should_cancel: CancelCallback | None,
+) -> list[Path]:
+    lane_work_dir = diagnostics.path.parent / "reference_channel_lanes"
+    lanes = prepare_reference_channel_lanes(
+        item.input_path,
+        work_dir=lane_work_dir,
+        compute_device=settings.compute_device,
+        source_separation=settings.source_separation,
+        should_cancel=should_cancel,
+    )
+    if not lanes:
+        raise AudioProcessorError("Reference channel splitting produced no usable lanes")
+
+    diagnostics.event(
+        "reference.channels.split",
+        "Reference channel lanes prepared for independent mono rendering",
+        lane_count=len(lanes),
+        lanes=[
+            {
+                "index": lane.index,
+                "label": lane.label,
+                "reference_path": lane.reference_path,
+                "source_path": lane.source_path,
+                "split_from_stereo": lane.split_from_stereo,
+                "notes": list(lane.notes),
+            }
+            for lane in lanes
+        ],
+    )
+
+    base_render_cache = (
+        Path(settings.render_cache_directory).expanduser()
+        if settings.render_cache_directory
+        else None
+    )
+    lane_outputs: list[Path] = []
+    for lane_index, lane in enumerate(lanes):
+        if should_cancel is not None and should_cancel():
+            raise AudioProcessorError("Processing cancelled")
+
+        lane_output = (
+            item.output_path
+            if lane.label == "mono"
+            else _channel_output_path(item.output_path, lane.label)
+        )
+        lane_cache = base_render_cache / lane.label if base_render_cache is not None else None
+        lane_settings = replace(
+            settings,
+            split_reference_channels=False,
+            source_separation="never",
+            channels=1,
+            render_cache_directory=str(lane_cache) if lane_cache is not None else "",
+        )
+        lane_item = QueueItem(input_path=lane.reference_path, output_path=lane_output)
+
+        def lane_progress(
+            progress: float,
+            message: str,
+            *,
+            lane_index: int = lane_index,
+            lane_label: str = lane.label,
+        ) -> None:
+            progress_callback(
+                (lane_index + max(min(progress, 1.0), 0.0)) / len(lanes),
+                f"{lane_label} channel: {message}",
+            )
+
+        lane_summary = run_batch_queue(
+            [lane_item],
+            lane_settings,
+            on_queue_progress=lane_progress,
+            should_cancel=should_cancel,
+        )
+        if lane_summary.cancelled:
+            raise AudioProcessorError("Processing cancelled")
+        if lane_summary.failed:
+            raise AudioProcessorError(
+                f"Reference channel lane {lane.label} failed: {lane_item.message}"
+            )
+        lane_outputs.append(lane_output)
+        progress_callback(
+            (lane_index + 1) / len(lanes),
+            f"{lane.label} channel complete",
+        )
+
+    diagnostics.event(
+        "reference.channels.rendered",
+        "Reference channel lanes rendered as independent mono outputs",
+        lane_count=len(lane_outputs),
+        output_paths=lane_outputs,
+        output_channels=1,
+    )
+    return lane_outputs
+
+
+def _channel_output_path(output_path: Path, label: str) -> Path:
+    suffix = output_path.suffix
+    stem = output_path.stem if suffix else output_path.name
+    return output_path.with_name(f"{stem}_{label}{suffix}")
 
 
 def _remove_stale_output_before_overwrite(

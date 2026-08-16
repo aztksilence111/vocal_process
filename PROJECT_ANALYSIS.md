@@ -2035,3 +2035,26 @@ Residual risk:
 
 1. No-lyrics mode still inherits ASR recognition risk in both CN and JP.
 2. Manual lyrics mode reduces text errors but still needs exact forced alignment before timeline quality can be trusted.
+
+### CN/JP Lyrics And Channel-Independent Render Policy
+
+The verified-lyrics workflow now separates three concerns that were previously conflated:
+
+1. Text identity: Japanese kana, romaji, bracketed readings, and inline readings are normalized and collapsed before matching. Non-vocal lyric markers are filtered.
+2. Timing authority: lyric text supplies the trusted target sequence, while original-vocal acoustic/ASR segments supply start/end timing. Unmatched acoustic segments are recorded as skipped residue instead of becoming material targets.
+3. Channel authority: a stereo original vocal is split into independent mono lanes before model ordering and material assembly. Each lane is rendered separately with forced mono output. The base output name is suffixed with `_left`, `_right`, or `_chN`.
+
+The normal no-lyrics workflow remains unchanged unless `split_reference_channels` is enabled. Rendered real-eval uses the verified lyrics discovered beside each reference and enables channel splitting automatically. Its validation requires all lane files to exist and each lane duration to match the reference.
+
+Verification:
+
+1. The seven current files in `tests_real/lyrics` parse without adjacent Japanese annotation duplicates.
+2. Stereo lane extraction was tested with real FFmpeg and both extracted files probe as one channel.
+3. Full unit discovery passed with `202` tests.
+4. `compileall` and `audio_processor check` passed.
+
+Residual risk:
+
+1. Lyrics improve target text trust but do not replace exact forced alignment; resampled/interpolated timing remains blocked by the existing strict real-eval gates.
+2. Residual instrument suppression is implemented as lyric/acoustic mismatch filtering, not as a guarantee that every separation artifact is inaudible.
+3. The next manual-listening evidence should come from the new CN and JP lane-split render roots.

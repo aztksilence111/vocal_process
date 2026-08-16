@@ -1736,3 +1736,14 @@ Remaining after this continuation:
 4. The checkbox state is persisted in settings. Legacy settings that already contain a lyrics file automatically load with manual lyrics enabled for compatibility.
 5. CLI batch and VST3 bridge paths enable manual lyrics automatically when a `lyrics_file` is supplied, so existing non-GUI calls keep their behavior.
 6. Verification passed: focused settings/batch/CLI/VST regression tests and full `unittest discover -s tests` with `198` tests, plus `compileall`, `audio_processor check`, and `git diff --check`.
+
+### 2026-08-16: CN/JP Lyrics Dedup, Stereo Lane Split, And Residual-Noise Skip
+
+1. User clarified that lyrics files have no timestamps because the original vocal is the timing source; stereo original vocals must be matched per channel and rendered as two separate mono material-splice outputs.
+2. Japanese lyric parsing now collapses inline readings, bracketed readings, and adjacent kana/romaji annotation lines so one phrase is not counted twice. The seven current CN/JP files in `tests_real/lyrics` parse with zero remaining adjacent annotation pairs.
+3. Lyrics parsing ignores non-vocal markers such as `Music`, `Instrumental`, `Intro`, `Solo`, and Chinese equivalents.
+4. Lyrics-driven alignment now compares each lyric line against original-vocal transcript timing, skips unmatched acoustic residue, and falls back to sequential timing only when lyric and acoustic segment counts are equal.
+5. `split_reference_channels` now extracts reference lanes, renders each independently with `channels=1`, and writes output names such as `_left.wav` and `_right.wav`. Batch diagnostics record lane source and output paths.
+6. Rendered real-eval now enables discovered lyrics explicitly, requests channel split output, and requires every expected channel output to exist and pass duration validation.
+7. GUI, CLI, persisted settings, i18n, and tests were updated for the lane-split control.
+8. Verification passed: full `.venv311\Scripts\python.exe -m unittest discover -s tests` with `202` tests, `compileall`, `audio_processor check`, and `git diff --check`.

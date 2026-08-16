@@ -16,6 +16,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -30,6 +31,8 @@ from .model_assist import (
     _japanese_timeline_unit_spans,
     _phonetic_units,
     _text_units,
+    phonetic_similarity,
+    text_similarity,
     list_model_candidates,
     plan_material_ordering,
     render_ordering_score_matrix,
@@ -95,6 +98,16 @@ class ReferenceAnalysis:
 
 
 @dataclass(frozen=True)
+class ReferenceChannelLane:
+    index: int
+    label: str
+    reference_path: Path
+    source_path: Path
+    split_from_stereo: bool
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class MaterialLibraryAnalysis:
     material_directory: Path
     materials: tuple[AudioAnalysis, ...]
@@ -120,6 +133,15 @@ class _MaterialFilenameLabelAuthority:
     notes: tuple[str, ...]
     parsed_units: tuple[str, ...]
     parsed_phonetic_units: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _LyricTranscriptAlignment:
+    segments: tuple[VoiceSegment, ...]
+    matched_count: int
+    skipped_acoustic_count: int
+    unmatched_lyric_count: int
+    mean_score: float | None
 
 
 @dataclass(frozen=True)
@@ -981,11 +1003,12 @@ def analyze_reference(
     transcript_language_hint = language_hint or _language_from_asr_notes(
         tuple(str(note) for note in transcript_result.get("notes", ()) if isinstance(note, str))
     )
-    segments = _segments_from_transcript(
+    segments, lyric_alignment_notes = _segments_from_transcript_with_notes(
         transcript_result["segments"],
         lyrics_file=lyrics_file,
         language_hint=transcript_language_hint,
     )
+    notes.extend(lyric_alignment_notes)
     if not segments:
         segments = (
             VoiceSegment(
@@ -1425,6 +1448,8 @@ def _lyrics_text_to_segments(text: str, *, suffix: str, language_hint: str = "")
                 continue
             timestamps = re.findall(r"\[(\d{1,2}:\d{2}(?:[.:]\d{1,3})?)\]", stripped)
             cleaned = _strip_lrc_timestamp(stripped)
+            if _is_non_vocal_lyric_line(cleaned):
+                continue
             if cleaned and timestamps:
                 for timestamp in timestamps:
                     start = _parse_lrc_timestamp(timestamp)
@@ -1449,6 +1474,7 @@ def _lyrics_text_to_segments(text: str, *, suffix: str, language_hint: str = "")
             _normalize_lyric_annotation_text(_strip_lrc_timestamp(raw_line.strip()), language_hint=language_hint)
             for raw_line in text.splitlines()
             if _strip_lrc_timestamp(raw_line.strip())
+            and not _is_non_vocal_lyric_line(_strip_lrc_timestamp(raw_line.strip()))
         ]
     elif suffix == ".srt":
         timed_segments = _parse_srt_segments(text, language_hint=language_hint)
@@ -1456,7 +1482,11 @@ def _lyrics_text_to_segments(text: str, *, suffix: str, language_hint: str = "")
             return timed_segments
         lines = _srt_text_lines_without_timing(text)
     else:
-        lines = [_normalize_lyric_annotation_text(line.strip(), language_hint=language_hint) for line in text.splitlines() if line.strip()]
+        lines = [
+            _normalize_lyric_annotation_text(line.strip(), language_hint=language_hint)
+            for line in text.splitlines()
+            if line.strip() and not _is_non_vocal_lyric_line(line.strip())
+        ]
 
     lines = _collapse_lyric_annotation_lines(lines, language_hint=language_hint)
 
@@ -1472,6 +1502,28 @@ def _lyrics_text_to_segments(text: str, *, suffix: str, language_hint: str = "")
         for index, line in enumerate(lines)
         if line
     ]
+
+
+def _is_non_vocal_lyric_line(text: str) -> bool:
+    normalized = _normalize_lyric_spaces(text).strip("-_*# ")
+    lowered = normalized.lower()
+    if not lowered:
+        return True
+    markers = {
+        "music",
+        "instrumental",
+        "interlude",
+        "intro",
+        "outro",
+        "solo",
+        "guitar solo",
+        "间奏",
+        "前奏",
+        "尾奏",
+        "伴奏",
+        "音乐",
+    }
+    return lowered in markers
 
 
 def _collapse_timed_lyric_annotation_lines(
@@ -1514,6 +1566,7 @@ def _normalize_lyric_annotation_text(text: str, *, language_hint: str = "") -> s
         return stripped
 
     normalized = _strip_html_ruby_annotations(stripped)
+    normalized = _strip_inline_japanese_readings(normalized)
     normalized = _strip_bracketed_japanese_annotations(normalized, language_hint=language_hint)
     normalized = _collapse_separated_japanese_annotations(normalized, language_hint=language_hint)
     normalized = _strip_trailing_japanese_annotation(normalized, language_hint=language_hint)
@@ -1532,6 +1585,21 @@ def _should_process_japanese_lyric_annotations(text: str, *, language_hint: str 
 def _strip_html_ruby_annotations(text: str) -> str:
     without_rt = re.sub(r"<rt\b[^>]*>.*?</rt>", "", text, flags=re.IGNORECASE | re.DOTALL)
     return re.sub(r"</?(?:ruby|rb|rp)\b[^>]*>", "", without_rt, flags=re.IGNORECASE)
+
+
+def _strip_inline_japanese_readings(text: str) -> str:
+    pattern = re.compile(
+        r"(?P<base>[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff])"
+        r"\s*[\(\uff08\[\u3010]"
+        r"(?P<reading>[\u3040-\u30ff\u31f0-\u31ffA-Za-z0-9'\-\s]+)"
+        r"[\)\uff09\]\u3011]"
+    )
+    current = text
+    while True:
+        updated = pattern.sub(lambda match: match.group("base"), current)
+        if updated == current:
+            return updated
+        current = updated
 
 
 def _strip_bracketed_japanese_annotations(text: str, *, language_hint: str = "") -> str:
@@ -1612,7 +1680,9 @@ def _is_japanese_annotation_pair(left: str, right: str, *, language_hint: str = 
         return True
     if _has_cjk(right_text) and left_compact in right_compact:
         return True
-    return False
+    if len(left_compact) < 4 or len(right_compact) < 4:
+        return False
+    return SequenceMatcher(None, left_compact, right_compact, autojunk=False).ratio() >= 0.78
 
 
 def _preferred_japanese_lyric_text(left: str, right: str) -> str:
@@ -1934,6 +2004,166 @@ def _maybe_separate_vocals(
 
     notes.append("demucs completed but no vocals stem was found")
     return path
+
+
+def prepare_reference_channel_lanes(
+    reference_path: Path,
+    *,
+    work_dir: Path | None = None,
+    compute_device: str = DEFAULT_DEVICE,
+    source_separation: str = "auto",
+    should_cancel: CancelCallback | None = None,
+) -> tuple[ReferenceChannelLane, ...]:
+    notes: list[str] = []
+    normalized_reference = reference_path.expanduser()
+    if not normalized_reference.exists():
+        raise AudioProcessorError(f"Reference audio does not exist: {normalized_reference}")
+
+    work_root = _prepare_work_root(work_dir)
+    vocal_path = _maybe_separate_vocals(
+        normalized_reference,
+        work_dir=work_root,
+        compute_device=compute_device,
+        source_separation=source_separation,
+        notes=notes,
+        should_cancel=should_cancel,
+    )
+    return _reference_channel_lanes_for_vocal(
+        normalized_reference,
+        vocal_path,
+        work_root=work_root,
+        notes=notes,
+        should_cancel=should_cancel,
+    )
+
+
+def _reference_channel_lanes_for_vocal(
+    source_path: Path,
+    vocal_path: Path,
+    *,
+    work_root: Path,
+    notes: Sequence[str],
+    should_cancel: CancelCallback | None = None,
+) -> tuple[ReferenceChannelLane, ...]:
+    _raise_if_cancelled(should_cancel)
+    channels = _audio_channel_count(vocal_path)
+    if channels <= 1:
+        return (
+            ReferenceChannelLane(
+                index=0,
+                label="mono",
+                reference_path=vocal_path,
+                source_path=source_path,
+                split_from_stereo=False,
+                notes=tuple(notes),
+            ),
+        )
+
+    lane_root = work_root / "reference_channel_lanes" / _safe_cache_stem(vocal_path)
+    lane_root.mkdir(parents=True, exist_ok=True)
+    sample_rate = _audio_sample_rate(vocal_path)
+    lanes: list[ReferenceChannelLane] = []
+    for index in range(channels):
+        _raise_if_cancelled(should_cancel)
+        label = _reference_channel_label(index)
+        lane_path = lane_root / f"{vocal_path.stem}_{label}.wav"
+        _extract_reference_channel_lane(
+            vocal_path,
+            lane_path,
+            index=index,
+            sample_rate=sample_rate,
+            should_cancel=should_cancel,
+        )
+        lanes.append(
+            ReferenceChannelLane(
+                index=index,
+                label=label,
+                reference_path=lane_path,
+                source_path=source_path,
+                split_from_stereo=True,
+                notes=tuple(
+                    [
+                        *notes,
+                        f"reference_channel_lane={label}",
+                        f"reference_channel_source={vocal_path}",
+                    ]
+                ),
+            )
+        )
+    return tuple(lanes)
+
+
+def _extract_reference_channel_lane(
+    input_path: Path,
+    output_path: Path,
+    *,
+    index: int,
+    sample_rate: int | None,
+    should_cancel: CancelCallback | None = None,
+) -> None:
+    _raise_if_cancelled(should_cancel)
+    if output_path.exists() and _duration_close(input_path, output_path):
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_path),
+        "-af",
+        f"pan=mono|c0=c{max(index, 0)}",
+    ]
+    if sample_rate is not None and sample_rate > 0:
+        args.extend(["-ar", str(sample_rate)])
+    args.extend(["-ac", "1", "-codec:a", "pcm_s16le", str(output_path)])
+    run = subprocess.run(args, capture_output=True, text=True)
+    if run.returncode != 0:
+        details = (run.stderr or run.stdout or "").strip()
+        raise AudioProcessorError(f"Could not extract reference channel {index} from {input_path}: {details}")
+
+
+def _duration_close(left: Path, right: Path, tolerance_seconds: float = 0.05) -> bool:
+    try:
+        return abs(reference_duration_for(left) - reference_duration_for(right)) <= tolerance_seconds
+    except Exception:
+        return False
+
+
+def _audio_channel_count(path: Path) -> int:
+    try:
+        stream = next(
+            (stream for stream in probe_audio(path).get("streams", []) if stream.get("codec_type") == "audio"),
+            {},
+        )
+        return max(int(stream.get("channels") or 1), 1)
+    except Exception:
+        return 1
+
+
+def _audio_sample_rate(path: Path) -> int | None:
+    try:
+        stream = next(
+            (stream for stream in probe_audio(path).get("streams", []) if stream.get("codec_type") == "audio"),
+            {},
+        )
+        value = int(stream.get("sample_rate") or 0)
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
+def _reference_channel_label(index: int) -> str:
+    labels = ("left", "right")
+    return labels[index] if 0 <= index < len(labels) else f"ch{index + 1}"
+
+
+def _safe_cache_stem(path: Path) -> str:
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8", errors="ignore")).hexdigest()[:10]
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._") or "reference"
+    return f"{stem}-{digest}"
 
 
 def _transcribe_audio(
@@ -3057,12 +3287,278 @@ def _speechbrain_model_cached(savedir: Path) -> bool:
     return (savedir / "hyperparams.yaml").exists()
 
 
+def _align_lyrics_to_transcript_segments(
+    lyric_segments: Sequence[VoiceSegment],
+    transcript_segments: Sequence[TranscriptSegment],
+    *,
+    language_hint: str = "",
+) -> _LyricTranscriptAlignment:
+    lyrics = tuple(lyric_segments)
+    transcripts = tuple(transcript_segments)
+    if not lyrics or not transcripts:
+        return _LyricTranscriptAlignment((), 0, len(transcripts), len(lyrics), None)
+
+    cursor = 0
+    aligned: list[VoiceSegment] = []
+    scores: list[float] = []
+    skipped_acoustic_count = 0
+    unmatched_lyric_count = 0
+    lyric_index = 0
+    while lyric_index < len(lyrics) and cursor < len(transcripts):
+        best: tuple[float, int, int, int] | None = None
+        for lyric_count in range(1, min(3, len(lyrics) - lyric_index) + 1):
+            lyric_text = " ".join(
+                lyrics[index].text
+                for index in range(lyric_index, lyric_index + lyric_count)
+            )
+            for transcript_start in range(cursor, len(transcripts)):
+                for transcript_count in range(1, min(3, len(transcripts) - transcript_start) + 1):
+                    transcript_text = " ".join(
+                        transcripts[index].text
+                        for index in range(transcript_start, transcript_start + transcript_count)
+                    )
+                    score = _lyric_transcript_similarity(
+                        lyric_text,
+                        transcript_text,
+                        language_hint=language_hint,
+                    )
+                    score -= 0.025 * max(lyric_count - 1, 0)
+                    score -= 0.025 * max(transcript_count - 1, 0)
+                    score -= 0.02 * max(transcript_start - cursor, 0)
+                    candidate = (score, lyric_count, transcript_start, transcript_count)
+                    if best is None or candidate[0] > best[0]:
+                        best = candidate
+
+        if best is None or best[0] < _lyric_transcript_match_threshold(language_hint):
+            unmatched_lyric_count += 1
+            lyric_index += 1
+            continue
+
+        score, lyric_count, transcript_start, transcript_count = best
+        skipped_acoustic_count += max(transcript_start - cursor, 0)
+        transcript_end = transcript_start + transcript_count
+        merged = _merge_transcript_segments(transcripts[transcript_start:transcript_end])
+        aligned.extend(
+            _split_transcript_segment_for_lyrics(
+                merged,
+                lyrics[lyric_index : lyric_index + lyric_count],
+                language_hint=language_hint,
+            )
+        )
+        scores.append(score)
+        lyric_index += lyric_count
+        cursor = transcript_end
+
+    unmatched_lyric_count += max(len(lyrics) - lyric_index, 0)
+    skipped_acoustic_count += max(len(transcripts) - cursor, 0)
+    return _LyricTranscriptAlignment(
+        segments=tuple(aligned),
+        matched_count=len(aligned),
+        skipped_acoustic_count=skipped_acoustic_count,
+        unmatched_lyric_count=unmatched_lyric_count,
+        mean_score=(sum(scores) / len(scores)) if scores else None,
+    )
+
+
+def _lyric_transcript_similarity(left: str, right: str, *, language_hint: str = "") -> float:
+    text_score = text_similarity(left, right)
+    phonetic_score = phonetic_similarity(left, right, language_hint=language_hint)
+    left_compact = _phonetic_compact_for_annotation(left, language_hint=language_hint or "JP")
+    right_compact = _phonetic_compact_for_annotation(right, language_hint=language_hint or "JP")
+    compact_score = (
+        SequenceMatcher(None, left_compact, right_compact, autojunk=False).ratio()
+        if left_compact and right_compact
+        else 0.0
+    )
+    return max(text_score, phonetic_score, compact_score)
+
+
+def _lyric_transcript_match_threshold(language_hint: str) -> float:
+    return 0.24 if _normalize_cn_jp_language(language_hint) in {"CN", "JP"} else 0.30
+
+
+def _merge_transcript_segments(segments: Sequence[TranscriptSegment]) -> TranscriptSegment:
+    if not segments:
+        return TranscriptSegment(0.0, 0.0, "")
+    merged_timings: list[VoiceUnitTiming] = []
+    for segment in segments:
+        position_offset = len(merged_timings)
+        merged_timings.extend(
+            replace(timing, position=position_offset + index)
+            for index, timing in enumerate(segment.unit_timings)
+        )
+    return TranscriptSegment(
+        start_seconds=min(segment.start_seconds for segment in segments),
+        end_seconds=max(segment.end_seconds for segment in segments),
+        text=" ".join(segment.text for segment in segments).strip(),
+        confidence=_mean_optional_float(segment.confidence for segment in segments),
+        speaker_id=next((segment.speaker_id for segment in segments if segment.speaker_id), None),
+        timing_source=(
+            segments[0].timing_source
+            if len(segments) == 1
+            else f"{segments[0].timing_source}_merged"
+        ),
+        unit_timings=tuple(merged_timings),
+    )
+
+
+def _split_transcript_segment_for_lyrics(
+    transcript: TranscriptSegment,
+    lyrics: Sequence[VoiceSegment],
+    *,
+    language_hint: str = "",
+) -> tuple[VoiceSegment, ...]:
+    if not lyrics:
+        return ()
+    if len(lyrics) == 1:
+        lyric = lyrics[0]
+        return (
+            VoiceSegment(
+                start_seconds=transcript.start_seconds,
+                end_seconds=transcript.end_seconds,
+                text=lyric.text,
+                confidence=transcript.confidence,
+                speaker_id=transcript.speaker_id,
+                timing_source="asr_segment_with_lyric_text",
+                unit_timings=_retarget_unit_timings_to_text(
+                    transcript.unit_timings,
+                    lyric.text,
+                    language_hint=lyric.language_hint or language_hint,
+                ),
+                language_hint=lyric.language_hint or language_hint,
+            ),
+        )
+
+    weights = [
+        max(len(_timeline_units(lyric.text, language_hint=lyric.language_hint or language_hint)), 1)
+        for lyric in lyrics
+    ]
+    boundaries = _weighted_boundaries(transcript.start_seconds, transcript.end_seconds, weights)
+    timing_boundaries = _weighted_boundaries(0.0, float(len(transcript.unit_timings)), weights)
+    result: list[VoiceSegment] = []
+    for index, lyric in enumerate(lyrics):
+        start_seconds = boundaries[index]
+        end_seconds = boundaries[index + 1]
+        timing_start = min(max(int(round(timing_boundaries[index])), 0), len(transcript.unit_timings))
+        timing_end = min(
+            max(int(round(timing_boundaries[index + 1])), timing_start),
+            len(transcript.unit_timings),
+        )
+        lyric_timings = transcript.unit_timings[timing_start:timing_end]
+        result.append(
+            VoiceSegment(
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                text=lyric.text,
+                confidence=transcript.confidence,
+                speaker_id=transcript.speaker_id,
+                timing_source=(
+                    "asr_segment_with_aligned_lyric_text"
+                    if lyric_timings
+                    else "lyrics_group_acoustic_split"
+                ),
+                unit_timings=_retarget_unit_timings_to_text(
+                    lyric_timings,
+                    lyric.text,
+                    language_hint=lyric.language_hint or language_hint,
+                ),
+                language_hint=lyric.language_hint or language_hint,
+            )
+        )
+    return tuple(result)
+
+
+def _weighted_boundaries(start_seconds: float, end_seconds: float, weights: Sequence[int]) -> tuple[float, ...]:
+    total = sum(max(int(weight), 1) for weight in weights)
+    if total <= 0:
+        return (start_seconds, end_seconds)
+    span = max(end_seconds - start_seconds, 0.0)
+    boundaries = [float(start_seconds)]
+    cumulative = 0
+    for weight in weights:
+        cumulative += max(int(weight), 1)
+        boundaries.append(float(start_seconds) + span * cumulative / total)
+    boundaries[-1] = float(end_seconds)
+    return tuple(boundaries)
+
+
+def _segments_from_transcript_with_notes(
+    segments: Sequence[TranscriptSegment],
+    *,
+    lyrics_file: Path | None = None,
+    language_hint: str = "",
+) -> tuple[tuple[VoiceSegment, ...], tuple[str, ...]]:
+    if lyrics_file is not None:
+        lyric_segments = parse_lyrics_file(lyrics_file)
+        if lyric_segments:
+            if segments:
+                alignment = _align_lyrics_to_transcript_segments(
+                    lyric_segments,
+                    segments,
+                    language_hint=language_hint,
+                )
+                if alignment.segments:
+                    notes = [
+                        "lyric_acoustic_alignment: "
+                        f"matched_lyrics={alignment.matched_count}/{len(lyric_segments)}; "
+                        f"skipped_acoustic_segments={alignment.skipped_acoustic_count}/{len(segments)}; "
+                        f"unmatched_lyrics={alignment.unmatched_lyric_count}; "
+                        f"mean_score={alignment.mean_score if alignment.mean_score is not None else 'n/a'}"
+                    ]
+                    return alignment.segments, tuple(notes)
+                if len(lyric_segments) == len(segments):
+                    fallback_segments = tuple(
+                        _split_transcript_segment_for_lyrics(
+                            transcript,
+                            (lyric,),
+                            language_hint=language_hint,
+                        )[0]
+                        for lyric, transcript in zip(lyric_segments, segments)
+                    )
+                    return fallback_segments, (
+                        "lyric_acoustic_alignment_fallback: "
+                        f"paired_equal_counts={len(fallback_segments)}; "
+                        "acoustic segment timing retained because transcript text was not reliable enough",
+                    )
+                return (), (
+                    "lyric_acoustic_alignment_failed: no lyric lines could be aligned to acoustic transcript segments",
+                )
+            return tuple(lyric_segments), ("lyric_acoustic_alignment_absent: lyrics used without ASR segment timing",)
+
+    return (
+        tuple(
+            VoiceSegment(
+                start_seconds=segment.start_seconds,
+                end_seconds=segment.end_seconds,
+                text=segment.text,
+                confidence=segment.confidence,
+                speaker_id=segment.speaker_id,
+                timing_source=(
+                    "asr_segment_with_unit_timing"
+                    if segment.unit_timings
+                    else "asr_segment"
+                ),
+                unit_timings=segment.unit_timings,
+                language_hint=language_hint,
+            )
+            for segment in segments
+        ),
+        (),
+    )
+
+
 def _segments_from_transcript(
     segments: Sequence[TranscriptSegment],
     *,
     lyrics_file: Path | None = None,
     language_hint: str = "",
 ) -> tuple[VoiceSegment, ...]:
+    return _segments_from_transcript_with_notes(
+        segments,
+        lyrics_file=lyrics_file,
+        language_hint=language_hint,
+    )[0]
+
     if lyrics_file is not None:
         lyric_segments = parse_lyrics_file(lyrics_file)
         if lyric_segments:
