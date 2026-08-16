@@ -1474,6 +1474,47 @@ class SourceSeparationTests(unittest.TestCase):
         self.assertTrue(all(entry[2].source_separation == "never" for entry in captured))
         self.assertTrue(all(not entry[2].split_reference_channels for entry in captured))
 
+    def test_batch_split_reference_channels_skips_mono_reference_before_lane_preparation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            _write_test_wave(reference, channels=1)
+            _write_test_wave(material_dir / "wo.wav")
+            settings = ProcessingSettings(
+                material_directory=str(material_dir),
+                split_reference_channels=True,
+                output_directory=str(root / "out"),
+                overwrite=True,
+            )
+            item = create_queue([reference], settings)[0]
+            captured: dict[str, object] = {}
+
+            def fake_ordering(reference_path: Path, *args: object, **kwargs: object) -> object:
+                del args, kwargs
+                captured["reference_path"] = reference_path
+                raise AudioProcessorError("stop after mono split decision")
+
+            with patch("audio_processor.batch.prepare_reference_channel_lanes") as lane_mock:
+                with patch("audio_processor.batch.speech_runtime_preflight_report", return_value={}):
+                    with patch("audio_processor.batch.build_model_ordering", side_effect=fake_ordering):
+                        summary = run_batch_queue([item], settings)
+
+            records = [
+                json.loads(line)
+                for line in diagnostic_log_path(item.output_path).read_text(encoding="utf-8").splitlines()
+            ]
+            split_skipped = next(
+                record for record in records if record["stage"] == "reference.channels.split_skipped"
+            )
+
+        lane_mock.assert_not_called()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(captured["reference_path"], reference)
+        self.assertEqual(split_skipped["fields"]["detected_channels"], 1)
+        self.assertEqual(split_skipped["fields"]["reason"], "mono_reference")
+
 
 class SettingsTests(unittest.TestCase):
     def test_default_output_extension_is_wav(self) -> None:

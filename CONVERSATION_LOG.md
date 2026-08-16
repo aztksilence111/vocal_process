@@ -1747,3 +1747,4 @@ Remaining after this continuation:
 6. Rendered real-eval now enables discovered lyrics explicitly, requests channel split output, and requires every expected channel output to exist and pass duration validation.
 7. GUI, CLI, persisted settings, i18n, and tests were updated for the lane-split control.
 8. Verification passed: full `.venv311\Scripts\python.exe -m unittest discover -s tests` with `202` tests, `compileall`, `audio_processor check`, and `git diff --check`.
+9. Follow-up fix: the split branch now pre-probes reference audio channels and only prepares lane extraction for multichannel inputs. Mono or unknown-channel references log `reference.channels.split_skipped` and use the normal render path. Verification passed with `203` tests, `compileall`, and `audio_processor check`.

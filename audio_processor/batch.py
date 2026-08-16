@@ -115,7 +115,20 @@ def run_batch_queue(
             _log_input_diagnostics(diagnostics, item.input_path, settings)
             if should_cancel is not None and should_cancel():
                 raise AudioProcessorError("Processing cancelled")
-            if _should_split_reference_channels(settings):
+            split_channels, reference_channels = _should_split_reference_channels(settings, item.input_path)
+            if settings.split_reference_channels and not split_channels:
+                diagnostics.event(
+                    "reference.channels.split_skipped",
+                    "Reference channel split was requested but the reference is not multichannel",
+                    requested=True,
+                    detected_channels=reference_channels,
+                    reason=(
+                        "mono_reference"
+                        if reference_channels is not None and reference_channels <= 1
+                        else "channel_count_unavailable"
+                    ),
+                )
+            if split_channels:
                 lane_outputs = _run_split_reference_channel_item(
                     item,
                     settings,
@@ -302,12 +315,38 @@ def run_batch_queue(
     return BatchSummary(total=total, completed=completed, failed=failed, cancelled=cancelled)
 
 
-def _should_split_reference_channels(settings: ProcessingSettings) -> bool:
-    return bool(
+def _should_split_reference_channels(
+    settings: ProcessingSettings,
+    reference_path: Path,
+) -> tuple[bool, int | None]:
+    if not (
         settings.split_reference_channels
         and settings.material_directory
         and not settings.daw_timeline_export
+    ):
+        return False, None
+    channel_count = _audio_channel_count(reference_path)
+    return bool(channel_count is not None and channel_count > 1), channel_count
+
+
+def _audio_channel_count(path: Path) -> int | None:
+    try:
+        data = probe_audio(path.expanduser())
+    except AudioProcessorError:
+        return None
+    stream = next(
+        (
+            stream
+            for stream in data.get("streams", [])
+            if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+        ),
+        {},
     )
+    try:
+        parsed = int(stream.get("channels") or 0)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _run_split_reference_channel_item(
