@@ -29,6 +29,7 @@ def build_preflight_report(
         reference_path,
         material_directory,
         lyrics_file=lyrics_file,
+        enforce_exact_lyrics_timeline=False,
         work_dir=work_dir,
         material_cache_dir=material_cache_dir,
         compute_device=compute_device,

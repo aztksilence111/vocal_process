@@ -2082,3 +2082,102 @@ Manual lyrics timing policy is also stricter:
 2. If lyrics cannot be matched to original-vocal acoustic/ASR segments, the system must fail instead of pairing by equal counts or falling back to ASR text.
 3. If lyric retargeting requires resampled/interpolated unit timing, the system must not produce a review WAV. Total duration matching is not enough; every positioned material decision needs exact original-vocal unit timing.
 4. Existing 2026-08-16 CN/JP lane-split outputs are rejected regression evidence. They include measurable large sample jumps and should not be used as manual-listening acceptance files.
+
+### Exact Pronunciation Text And Unit-Timing Lattice
+
+The manual-lyrics path now separates display text from pronunciation/timeline text. This is necessary for Japanese lyrics where the written line can contain kanji, numbers, punctuation, and annotation syntax while the sung units are kana or romaji mora.
+
+Updated model:
+
+1. `VoiceSegment.text` remains the verified lyric/display text.
+2. `VoiceSegment.alignment_text` carries verified pronunciation text extracted from inline readings, bracketed readings, adjacent kana/romaji annotation lines, or forced-alignment target selection.
+3. Forced alignment uses pronunciation text when it improves alignment, but pure-kana JP text is preferred over low-quality Latin annotation targets.
+4. Phonetic ordering, reference unit durations, and timeline reports use pronunciation text when present, so examples like `1000年 -> センネン` and `晒し者 -> さらしもの` no longer force resampled timing.
+5. JP pure-kana unitization bypasses Janome. This keeps mora spans consistent between phonetic ordering and char alignment, especially for yoon/gemination such as `いっしょう -> i/sho`.
+6. Non-vocal units such as digits, spaces, and punctuation are not part of JP vocal-unit timing. They remain in display text but not in strict timing counts.
+7. If a selected material span overruns the verified reference segment unit count, the timeline clamps it to the exact reference boundary instead of expanding the timing lattice. Expanding exact reference timing would reintroduce interpolation under a different name.
+
+Real evidence:
+
+1. CN `AiRenTongZhi_CN__chickenOTTO` now has zero resampled timing lattice units. Its remaining block is a final lyric line without aligned unit timing, which is a valid strict blocker.
+2. JP `1000nenyikiteru_JP__MGRoid` now reaches exact aligned timing in real analysis: `timed=525/525`, `exact=525/525`, `resampled=0` in `jp-analysis-v9`.
+3. A pre-final full render `jp-smoke-v7` also produced status `rendered` with `resampled=0`, proving the render path can proceed once the timing gate is satisfied.
+
+Residual risk:
+
+1. JP/MGRoid strict pass is still false because stretch quality is poor for many single-syllable clips. This is now a material/stretch-quality problem, not a reference timeline trust problem.
+2. The final code after the tuple/list and overlong-span fixes has been verified analysis-only, not with another full render, because the previous full-render run wrote a valid report but did not return cleanly before the tool timeout.
+3. Next work should focus on reducing extreme stretch and boundary risk after exact timing is preserved, rather than weakening the strict timing gate.
+
+### Short-Target OTO Window Policy
+
+The JP/MGRoid strict blocker after exact timing was not a text-ordering failure. It was a render-planning quality failure: many verified lyric units are intentionally very short, while UTAU OTO windows describe a larger recorded syllable region. Compressing the entire OTO window into a 20-150 ms slot can create an extreme stretch ratio even when the slot itself is exactly aligned.
+
+Updated policy:
+
+1. For short labeled material targets at or below `150 ms`, OTO/RMS source windows are capped to `1.95x` the audible target duration.
+2. The cap keeps OTO start/overlap guidance but does not require preserving an OTO consonant/preutterance window that physically cannot fit into the reference unit.
+3. Tiny direct-trim clips with a short vocal text hint are not counted as stretch-quality errors, because no time-stretch filter is applied. Unknown-text tiny targets still report extreme stretch.
+4. This preserves the strict timing gate: total target duration, audible target duration, pre-silence, and exact aligned unit timings remain unchanged. Only the render source window and stretch-quality classification change.
+
+Real evidence:
+
+1. JP analysis v12 for `1000nenyikiteru_JP__MGRoid` reached `status=ok`, `error_warning_count=0`, `extreme_stretch_count=0`, `timed=525/525`, `exact=525/525`, and `resampled=0`.
+2. Full JP render v13 at `tests_real\output\cn-jp-topology-fix-20260817\jp-render-v13` reached `strict_render_pass=true`, `rendered_audio_alignment_score=0.830973`, and `duration_delta_ratio=0.000144`.
+3. Remaining JP warnings are moderate stretch/boundary risks. They should guide manual listening and later DSP tuning, but they no longer block automated strict acceptance.
+
+Residual risk:
+
+1. The OTO cap is a conservative render-planning policy, not a full phoneme-level model. Very short units can still sound clipped or softened; manual listening remains necessary.
+2. The current accepted JP case uses WhisperX character alignment. Running the same command with Faster Whisper alone produces no strict unit timings and is not equivalent validation.
+3. The next known blocker is the CN case whose final lyric line still lacks exact aligned unit timing.
+
+### CN Exact-Timing Repair And Vowel-Core Atempo Safety
+
+The CN `AiRenTongZhi_CN__chickenOTTO` blocker was a forced-alignment edge case, not a lyric text or material ordering failure. WhisperX could align almost every lyric line, but failed the final repeated `爱人同志` line and kept only a tiny segment-level span. That must remain a strict blocker unless another aligner can supply exact unit timings.
+
+Updated timing policy:
+
+1. WhisperX remains the primary lyrics forced-aligner for the CN/JP verified-lyrics workflow.
+2. For Chinese lyrics only, missing or incomplete lyric unit timings may be repaired from FunASR when FunASR provides a contiguous exact unit sequence matching the expected lyric units.
+3. The repair is bounded by neighboring lyric timings, so repeated phrases are matched by timeline context rather than by text alone.
+4. FunASR resampled timestamps are explicitly not accepted as exact timing. The strict gate still requires real unit timings and still reports missing/resampled timing as errors.
+5. Reference analysis caches include the FunASR exact-repair policy version, preventing older missing-line caches from passing through future runs.
+
+Updated render policy:
+
+1. Short vowel-core expansion now shares the short-CV `atempo` safety path when the core source/target region is small enough. This prevents FFmpeg Rubber Band from receiving unstable sub-100 ms vowel-core windows such as the `ju.wav` `~89 ms -> ~256 ms` failure.
+2. Chained `atempo` is allowed down to `0.25` for short text material, so ratios like `0.35` can be represented as legal FFmpeg filters instead of requiring Rubber Band.
+3. Longer vowel-core regions still use the existing Rubber Band or Signalsmith path according to the existing planning rules.
+
+Real evidence:
+
+1. CN analysis v12 reached `status=ok`, `error_warning_count=0`, `timed=351/351`, `exact=351/351`, and `resampled=0`. The report records `lyrics_funasr_timing_repair: exact_unit_timing_lines=40/40`.
+2. CN render v12 failed on a Rubber Band `Operation not permitted` error for a short `ju.wav` vowel-core region. That is preserved as failure evidence for the old render policy.
+3. CN render v13 reached `status=rendered`, `strict_render_pass=true`, `rendered_audio_alignment_score=0.900868`, `error_warning_count=0`, `timed=351/351`, `exact=351/351`, and `resampled=0`.
+4. The v13 output WAV is mono `44100 Hz` `pcm_s24le` with duration `256.968707 s`, matching the reference duration.
+
+Residual risk:
+
+1. CN still has non-blocking warnings: moderate stretch, boundary risk, and weak text-signal warnings. They no longer invalidate the strict timing/render gate, but they remain useful targets for manual listening and future material-selection work.
+2. The FunASR repair is currently Chinese-specific. Japanese continues to rely on WhisperX plus verified pronunciation text because FunASR's default Chinese Paraformer path is not suitable for JP.
+### CN/JP Phonetic Candidate Ranking And Filename Variant Policy (2026-08-18)
+
+The remaining low-match findings in the v13 real reports were a ranking-policy defect rather than a missing material inventory. In the CN corpus, `zhi1.wav` was present, but the sequence selector could choose `zha`, `zhui`, or `zhu` for other `zhi` positions. Two mechanisms combined to produce this: filename-authority suffixes such as `zhi1` were interpreted as tone 1, and the selector rewarded an unused material before comparing exact local phonetic-unit identity. JP short syllables also received artificially low match scores because the whole-reference score and tiny target duration dominated the score even after the current unit was correctly positioned.
+
+Durable policy:
+
+1. Filename numeric suffixes are variant indices only when all of the following hold: the language is CN, the material is a single filename-authority token, and the suffix-bearing filename token is the authoritative parsed token. This keeps ordinary tone-number Pinyin inputs such as `shi4` tone-aware.
+2. In reference phonetic-unit sequence mode, candidate priority is exact local unit match, then selection score, duration fit, unused-material preference, reuse count, and filename tie-break. Diversity cannot override a phonetic mismatch.
+3. A selected exact local unit match contributes directly to the decision phonetic score. Exact matches are reported as `phonetic_score=1.0` and receive a conservative score floor of `0.82`; stretch duration and boundary quality remain independent warning dimensions.
+4. Compact matching remains available for multi-unit material phrases and non-JP matching, but it cannot win over an exact same-unit candidate merely because it is unused.
+
+Evidence:
+
+1. Replaying the v13 CN analysis metadata after the policy change moved every `zhi` position to `zhi1.wav`, removed weak-text candidates, and raised the reconstructed minimum/mean ordering scores to `0.82` / `0.871834` before the final render report.
+2. Replaying the v13 JP analysis metadata produced minimum/mean scores `0.82` / `0.828675`, with exact unit matches reported as strong instead of weak.
+3. Fresh CN v14 and JP v14 renders both passed the strict render gate with exact timing coverage and no error warnings. Their remaining warnings are quality-review warnings from stretch and boundary handling, not text-position or timing-trust failures.
+
+Next architecture priority:
+
+Continue improving source-window and boundary planning for very short CN/JP units while preserving the current ordering invariant: local phonetic identity is authoritative, exact original-vocal unit timing is authoritative for the time axis, and stretch quality is reported separately rather than hidden inside match confidence.

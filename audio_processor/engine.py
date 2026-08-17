@@ -18,7 +18,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
 
-from .model_assist import _phonetic_units
+from .model_assist import _looks_like_pinyin_or_romaji_unit, _phonetic_units
 from .phoneme import analyze_vowel_consonant_profile
 from .signalsmith_stretch import (
     SignalsmithStretchError,
@@ -62,6 +62,7 @@ class MaterialPhonemeRegion:
     target_duration_seconds: float
     tempo: float
     loop_fill: bool = False
+    text_hint: str = ""
 
     @property
     def source_duration_seconds(self) -> float:
@@ -139,7 +140,7 @@ MATERIAL_RENDER_MIN_CONSONANT_SAFE_TARGET_SECONDS = 0.045
 MATERIAL_SHORT_TEXT_SOURCE_WINDOW_MIN_SECONDS = 0.090
 MATERIAL_SHORT_TEXT_ATEMPO_MAX_SOURCE_SECONDS = 0.300
 MATERIAL_SHORT_TEXT_ATEMPO_MAX_TARGET_SECONDS = 0.250
-MATERIAL_SHORT_TEXT_ATEMPO_MIN_TEMPO = 0.5
+MATERIAL_SHORT_TEXT_ATEMPO_MIN_TEMPO = 0.25
 MATERIAL_SHORT_TEXT_ATEMPO_MAX_TEMPO = 8.0
 MATERIAL_ATEMPO_FILTER_MIN = 0.5
 MATERIAL_ATEMPO_FILTER_MAX = 2.0
@@ -162,13 +163,15 @@ MATERIAL_SHORT_TEXT_MAX_AUDIBLE_EXTENSION_SECONDS = 0.75
 MATERIAL_SIGNALSMITH_MAX_CLEAN_STRETCH_RATIO = 1.5
 MATERIAL_SHORT_TEXT_SOURCE_WINDOW_TRIM_RATIO = 1.75
 MATERIAL_SHORT_TEXT_SOURCE_WINDOW_RENDER_RATIO = 1.20
+MATERIAL_SHORT_TEXT_COMPRESSED_SOURCE_WINDOW_MAX_TARGET_SECONDS = 0.250
+MATERIAL_SHORT_TEXT_COMPRESSED_SOURCE_WINDOW_MAX_RATIO = 1.95
 MATERIAL_SOURCE_WINDOW_ANALYSIS_FRAME_SECONDS = 0.010
 MATERIAL_SOURCE_WINDOW_ANALYSIS_HOP_SECONDS = 0.005
 MATERIAL_SOURCE_WINDOW_ANALYSIS_RELATIVE_DB = 32.0
 MATERIAL_SOURCE_WINDOW_ANALYSIS_ABSOLUTE_FLOOR = 0.003
 MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS = 0.025
 MATERIAL_RENDER_COHERENT_MONO_FILTER = "aformat=channel_layouts=mono"
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_mono_atempo_chain_utau_oto_v1"
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_mono_atempo_chain_utau_oto_vowel_core_v1"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -1489,6 +1492,9 @@ def plan_material_stretch_clips(
             and signalsmith_stretch_available()
             and _should_use_signalsmith_vowel_core(render_requested_tempo, text_hint)
             else "atempo"
+            if strategy == "syllable_vowel_core_stretch"
+            and _vowel_core_regions_use_atempo(phoneme_regions)
+            else "atempo"
             if atempo_short_material
             else "rubberband"
         )
@@ -1515,7 +1521,12 @@ def plan_material_stretch_clips(
                 source_window_start_seconds=source_window_start,
                 source_window_duration_seconds=source_window_duration,
                 source_window_source=source_window_source,
-                quality_warning=_stretch_quality_warning(render_requested_tempo),
+                quality_warning=(
+                    ""
+                    if strategy == "tiny_target_direct_trim"
+                    and _is_short_material_text(text_hint)
+                    else _stretch_quality_warning(render_requested_tempo)
+                ),
                 requested_tempo=render_requested_tempo,
                 stretch_strategy=strategy,
                 text_hint=text_hint,
@@ -1992,7 +2003,7 @@ def _vowel_region_filter_chain(region: MaterialPhonemeRegion) -> list[str]:
             target_duration,
             target_duration,
             source_duration=source_duration,
-            text_hint=region.kind,
+            text_hint=region.text_hint or region.kind,
         )
         and abs(target_duration - source_duration) > 0.002
     ):
@@ -2003,7 +2014,14 @@ def _vowel_region_filter_chain(region: MaterialPhonemeRegion) -> list[str]:
             else RUBBERBAND_VOWEL_CORE_STRETCH_TEMPO
         )
         tempo = max(min(requested_tempo, RUBBERBAND_MAX_TEMPO), minimum_tempo)
-        filters.append(_rubberband_filter(tempo, "vocal_smooth"))
+        filters.append(
+            _material_stretch_filter(
+                tempo,
+                text_hint=region.text_hint or region.kind,
+                source_duration=source_duration,
+                target_duration=target_duration,
+            )
+        )
 
     filters.extend(
         _exact_duration_filters(
@@ -2013,6 +2031,33 @@ def _vowel_region_filter_chain(region: MaterialPhonemeRegion) -> list[str]:
         )
     )
     return filters
+
+
+def _vowel_core_regions_use_atempo(regions: Sequence[MaterialPhonemeRegion]) -> bool:
+    if not regions:
+        return False
+    for region in regions:
+        if region.kind != "vowel_core":
+            continue
+        source_duration = region.source_duration_seconds
+        target_duration = region.target_duration_seconds
+        if source_duration <= 0 or target_duration <= 0:
+            continue
+        if abs(target_duration - source_duration) <= 0.002:
+            continue
+        requested_tempo = source_duration / target_duration
+        tempo = max(
+            min(requested_tempo, RUBBERBAND_MAX_TEMPO),
+            RUBBERBAND_SHORT_TEXT_MIN_TEMPO,
+        )
+        if _should_use_atempo_short_material(
+            tempo,
+            region.text_hint,
+            source_duration,
+            target_duration,
+        ):
+            return True
+    return False
 
 
 def _should_use_vowel_core_stretch(
@@ -2135,6 +2180,7 @@ def _vowel_core_stretch_regions(
                 source_end_seconds=attack_duration,
                 target_duration_seconds=attack_target,
                 tempo=attack_duration / attack_target if attack_target > 0 else 1.0,
+                text_hint=text_hint,
             )
         )
 
@@ -2149,6 +2195,7 @@ def _vowel_core_stretch_regions(
                 RUBBERBAND_SHORT_TEXT_MIN_TEMPO,
             ),
             loop_fill=core_source_duration / core_target < RUBBERBAND_SHORT_TEXT_MIN_TEMPO,
+            text_hint=text_hint,
         )
     )
 
@@ -2160,6 +2207,7 @@ def _vowel_core_stretch_regions(
                 source_end_seconds=source_duration,
                 target_duration_seconds=coda_target,
                 tempo=coda_duration / coda_target if coda_target > 0 else 1.0,
+                text_hint=text_hint,
             )
         )
     return tuple(regions)
@@ -2221,6 +2269,22 @@ def _should_direct_trim_tiny_render_target(
 ) -> bool:
     render_target = audible_target_duration if audible_target_duration is not None else target_duration
     return _should_direct_trim_short_render_region(source_duration, render_target, text_hint)
+
+
+def _short_text_compression_source_window_limit(
+    target_duration: float | None,
+    text_hint: str,
+) -> float | None:
+    if target_duration is None or target_duration <= MIN_MATERIAL_TARGET_DURATION_SECONDS:
+        return None
+    if target_duration > MATERIAL_SHORT_TEXT_COMPRESSED_SOURCE_WINDOW_MAX_TARGET_SECONDS:
+        return None
+    if not _is_short_material_text(text_hint):
+        return None
+    return max(
+        target_duration,
+        target_duration * MATERIAL_SHORT_TEXT_COMPRESSED_SOURCE_WINDOW_MAX_RATIO,
+    )
 
 
 def _target_duration_filters(target_duration: float, *, loop_fill: bool = False) -> list[str]:
@@ -2658,15 +2722,21 @@ def _source_window_for_render(
     if active_duration <= target_duration + 0.0005:
         return active_start, active_duration if active_start > 0.0005 else None, "active_rms"
 
+    short_window_limit = _short_text_compression_source_window_limit(target_duration, text_hint)
+    minimum_window = MATERIAL_SHORT_TEXT_SOURCE_WINDOW_MIN_SECONDS
+    if short_window_limit is not None:
+        minimum_window = min(minimum_window, short_window_limit)
     window_duration = min(
         active_duration,
         max(
             target_duration * MATERIAL_SHORT_TEXT_SOURCE_WINDOW_RENDER_RATIO,
             target_duration,
-            MATERIAL_SHORT_TEXT_SOURCE_WINDOW_MIN_SECONDS,
+            minimum_window,
             MIN_MATERIAL_TARGET_DURATION_SECONDS,
         ),
     )
+    if short_window_limit is not None:
+        window_duration = min(window_duration, short_window_limit)
     if window_duration >= source_duration - 0.0005 and active_start <= 0.0005:
         return 0.0, None, ""
     return active_start, window_duration, "active_rms"
@@ -2710,6 +2780,10 @@ def _utau_oto_source_window(
         end = min(end + missing, source_duration)
         if end - start < fixed_minimum:
             start = max(end - fixed_minimum, 0.0)
+
+    short_window_limit = _short_text_compression_source_window_limit(target_duration, text_hint or path.stem)
+    if short_window_limit is not None and end - start > short_window_limit:
+        end = min(start + short_window_limit, source_duration)
 
     duration = max(end - start, 0.0)
     if duration <= MIN_MATERIAL_TARGET_DURATION_SECONDS:
@@ -2891,6 +2965,12 @@ def _detect_active_audio_window(path: Path, fallback_duration: float) -> tuple[f
 def _is_short_material_text(text: str) -> bool:
     units = re.findall(r"[a-z0-9]+|[\u3040-\u30ff\u31f0-\u31ff]|[\u4e00-\u9fff]", text.lower())
     compact = "".join(units)
+    if len(units) == 1:
+        token = units[0]
+        if re.fullmatch(r"[a-z\u00fcv]+[1-5]?", token) and _looks_like_pinyin_or_romaji_unit(
+            token.rstrip("12345")
+        ):
+            return True
     return 0 < len(compact) <= 4
 
 

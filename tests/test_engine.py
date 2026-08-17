@@ -62,6 +62,7 @@ from audio_processor.engine import (
     resolve_tool,
     summarize_probe,
     _run_progress_process,
+    _build_vowel_core_filter_graph,
     _should_retry_rubberband_short_region_with_direct_trim,
     _vowel_core_stretch_regions,
 )
@@ -491,6 +492,7 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
         self.assertAlmostEqual(clips[0].audible_target_duration_seconds or 0.0, 0.011413)
         self.assertIsNone(clips[0].source_window_duration_seconds)
+        self.assertEqual(clips[0].quality_warning, "")
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["formant_preservation"], "direct_trim_no_pitch_shift")
 
@@ -574,9 +576,29 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
         self.assertAlmostEqual(clips[0].target_duration_seconds, 0.014074)
+        self.assertEqual(clips[0].quality_warning, "")
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["formant_preservation"], "direct_trim_no_pitch_shift")
         self.assertEqual(rendered[0]["channel_coherence"], "material_mono_fold_then_mono_output")
+
+    def test_tone_number_pinyin_material_counts_as_short_text_for_tiny_direct_trim(self) -> None:
+        with patch(
+            "audio_processor.engine.probe_audio",
+            side_effect=[
+                {"format": {"duration": "1.0"}, "streams": []},
+                {"format": {"duration": "0.14"}, "streams": []},
+            ],
+        ):
+            clips = plan_material_stretch_clips(
+                Path("reference.wav"),
+                [Path("liang1.wav")],
+                target_durations=[0.02],
+                material_text_hints=["liang1"],
+            )
+
+        self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
+        self.assertEqual(clips[0].quality_warning, "")
+        self.assertEqual(clips[0].continuity_warning, "single_syllable_boundary_risk")
 
     def test_material_stretch_plan_flags_extreme_ratios(self) -> None:
         with patch(
@@ -720,6 +742,57 @@ class MaterialAssemblyTests(unittest.TestCase):
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["source_window_source"], "utau_oto_ini")
 
+    def test_utau_oto_short_target_window_avoids_extreme_compression_warning(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "shi.wav"
+            _write_test_wave(reference, duration_seconds=0.045)
+            _write_test_wave(material, duration_seconds=0.35)
+            (root / "oto.ini").write_text(
+                "shi.wav=,0,220,0,132,46\n",
+                encoding="utf-8",
+            )
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[0.045],
+                material_text_hints=["shi"],
+            )
+
+        self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
+        self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.08775, places=5)
+        self.assertLess(clips[0].requested_tempo or 0.0, 2.0)
+        self.assertEqual(clips[0].quality_warning, "moderate_stretch_ratio")
+        self.assertEqual(clips[0].continuity_warning, "moderate_boundary_risk")
+        rendered = render_material_stretch_plan(clips)
+        self.assertEqual(rendered[0]["quality_warning"], "moderate_stretch_ratio")
+
+    def test_utau_oto_mid_short_target_window_avoids_extreme_compression_warning(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "zi1.wav"
+            _write_test_wave(reference, duration_seconds=0.2)
+            _write_test_wave(material, duration_seconds=0.5)
+            (root / "oto.ini").write_text(
+                "zi1.wav=,0,420,0,120,0\n",
+                encoding="utf-8",
+            )
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[0.2],
+                material_text_hints=["zi1"],
+            )
+
+        self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
+        self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.39, places=5)
+        self.assertLess(clips[0].requested_tempo or 0.0, 2.0)
+        self.assertEqual(clips[0].quality_warning, "moderate_stretch_ratio")
+
     def test_source_window_skips_vowel_core_graph_for_trimmed_input(self) -> None:
         args = build_material_clip_args(
             Path("shi.wav"),
@@ -835,6 +908,33 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertAlmostEqual(regions[2].source_end_seconds, 1.037)
         self.assertLess(regions[0].target_duration_seconds / regions[0].source_duration_seconds, 1.21)
         self.assertLess(regions[2].target_duration_seconds / regions[2].source_duration_seconds, 1.13)
+
+    def test_short_vowel_core_expansion_uses_atempo_chain(self) -> None:
+        acoustic_profile = VowelConsonantProfile(
+            vowel_start_seconds=0.046717,
+            vowel_end_seconds=0.136,
+            detection_source="librosa_voiced_f0",
+            confidence=0.95,
+            voiced_ratio=0.70,
+        )
+        with patch(
+            "audio_processor.engine.analyze_vowel_consonant_profile",
+            return_value=acoustic_profile,
+        ):
+            graph = _build_vowel_core_filter_graph(
+                "[0:a]",
+                "outa",
+                source_duration=0.166848,
+                target_duration=0.333696,
+                text_hint="ju",
+                options=ProcessOptions(input_path=Path("ju.wav"), output_path=Path("out.wav")),
+                label_prefix="vc0",
+                source_path=Path("ju.wav"),
+                output_duration=0.4,
+            )
+
+        self.assertIn("atempo=0.50000000,atempo=0.70000000", graph)
+        self.assertNotIn("rubberband=", graph)
 
     def test_duration_correction_command_preserves_exact_duration_without_extra_fades(self) -> None:
         args = _build_duration_correction_args(
@@ -3441,6 +3541,33 @@ class ModelAssistTests(unittest.TestCase):
         self.assertGreater(plan.decisions[0].duration_score, 0.9)
         self.assertLess(model_assist._stretch_naturalness_score_for_target(0.5, 2.0, "ni"), 0.2)
 
+    def test_reference_sequence_scores_exact_unit_match_independent_of_tiny_target_duration(self) -> None:
+        reference_segments = [
+            VoiceSegment(
+                0.0,
+                0.03,
+                "shi",
+                language_hint="JP",
+                unit_timings=(VoiceUnitTiming(0, "shi", 0.0, 0.03, timing_source="aligned"),),
+            )
+        ]
+        materials = [
+            MaterialAnalysis(
+                Path("shi.wav"),
+                transcript="shi",
+                filename_text="shi",
+                duration_seconds=0.3,
+                language_hint="JP",
+            )
+        ]
+
+        plan = plan_material_ordering(reference_segments, materials)
+
+        self.assertEqual(plan.strategy, "reference_phonetic_unit_sequence")
+        self.assertEqual(plan.decisions[0].material_path.name, "shi.wav")
+        self.assertEqual(plan.decisions[0].phonetic_score, 1.0)
+        self.assertGreaterEqual(plan.decisions[0].score, 0.8)
+
     def test_orders_tone_number_pinyin_filenames_by_phonetic_position(self) -> None:
         decisions = order_materials_for_reference(
             [VoiceSegment(0.0, 3.0, "\u6211\u662f\u4f60")],
@@ -3487,6 +3614,45 @@ class ModelAssistTests(unittest.TestCase):
         self.assertGreater(decisions[0].phonetic_tone_score, 0.9)
         self.assertEqual(score.phonetic_tone_position, 1)
 
+    def test_filename_label_variant_suffix_does_not_tone_lock_chinese_material(self) -> None:
+        reference_segments = [VoiceSegment(0.0, 4.0, "\u540c\u5fd7\u540c\u5fd7", language_hint="CN")]
+        materials = [
+            MaterialAnalysis(
+                Path("zhi1.wav"),
+                transcript="zhi1",
+                filename_text="zhi1",
+                duration_seconds=0.3,
+                language_hint="CN",
+                material_text_source="filename_label_authority",
+                asr_skipped_for_filename_label=True,
+                parsed_filename_units=("zhi1",),
+                parsed_filename_phonetic_units=("zhi",),
+            ),
+            MaterialAnalysis(
+                Path("tong.wav"),
+                transcript="tong",
+                filename_text="tong",
+                duration_seconds=0.3,
+                language_hint="CN",
+                material_text_source="filename_label_authority",
+                asr_skipped_for_filename_label=True,
+                parsed_filename_units=("tong",),
+                parsed_filename_phonetic_units=("tong",),
+            ),
+        ]
+
+        plan = plan_material_ordering(reference_segments, materials)
+
+        self.assertEqual(plan.strategy, "reference_phonetic_unit_sequence")
+        self.assertEqual(
+            [decision.material_path.name for decision in plan.decisions],
+            ["tong.wav", "zhi1.wav", "tong.wav", "zhi1.wav"],
+        )
+        self.assertEqual([decision.phonetic_position for decision in plan.decisions], [0, 1, 2, 3])
+        self.assertTrue(
+            all(decision.phonetic_tone_score == 0 for decision in plan.decisions if decision.material_path.name == "zhi1.wav")
+        )
+
     def test_orders_japanese_kana_and_romaji_filenames_by_phonetic_position(self) -> None:
         decisions = order_materials_for_reference(
             [VoiceSegment(0.0, 4.0, "\u3042\u3044\u3057\u3066")],
@@ -3513,10 +3679,56 @@ class ModelAssistTests(unittest.TestCase):
             ["ga", "ko"],
         )
         self.assertEqual(model_assist._phonetic_units("\u304d\u3087\u3046", language_hint="JP"), ["kyo"])
+        self.assertEqual(model_assist._phonetic_units("\u3044\u3063\u3057\u3087\u3046", language_hint="JP"), ["i", "sho"])
+        self.assertEqual(
+            model_assist._phonetic_units(
+                "\u3044\u3063\u3057\u3087\u3046\u3053\u306e\u307e\u307e"
+                "\u3057\u3063\u307d\u306e\u304b\u308f\u3044\u3061\u307e\u3044\u3067"
+                "\u3064\u306a\u304c\u308c\u305f\u3069\u308c\u3044\u304b\uff1f",
+                language_hint="JP",
+            )[:2],
+            ["i", "sho"],
+        )
         self.assertEqual(model_assist._phonetic_units("suupaa", language_hint="JP"), ["su", "pa"])
         self.assertEqual(model_assist._phonetic_units("gakkou", language_hint="JP"), ["ga", "ko"])
         self.assertEqual(model_assist._phonetic_units("aishite", language_hint="JP"), ["a", "i", "shi", "te"])
         self.assertEqual(model_assist._phonetic_units("PlasticLove", language_hint="JP"), ["plasticlove"])
+        self.assertEqual(
+            model_assist._phonetic_units("1000\u30bb\u30f3\u30cd\u30f3", language_hint="JP"),
+            ["se", "n", "ne", "n"],
+        )
+        self.assertEqual(
+            model_assist._phonetic_units("\u304d\u3087\u3046\u3075\u3063\u3066 \u304b\u3093\u3058\u3087\u3046\u306e", language_hint="JP"),
+            ["kyo", "fu", "te", "ka", "n", "jo", "no"],
+        )
+        self.assertEqual(
+            model_assist._phonetic_units("\u3042\u308b\u304b\u3044\uff1f", language_hint="JP"),
+            ["a", "ru", "ka", "i"],
+        )
+
+    def test_reference_alignment_text_drives_japanese_phonetic_ordering_units(self) -> None:
+        decisions = order_materials_for_reference(
+            [
+                VoiceSegment(
+                    0.0,
+                    1.0,
+                    "1000\u5e74",
+                    language_hint="JP",
+                    alignment_text="\u305b\u3093\u306d\u3093",
+                )
+            ],
+            [
+                MaterialAnalysis(Path("ne.wav"), transcript="", filename_text="ne", duration_seconds=1.0, language_hint="JP"),
+                MaterialAnalysis(Path("se.wav"), transcript="", filename_text="se", duration_seconds=1.0, language_hint="JP"),
+                MaterialAnalysis(Path("n.wav"), transcript="", filename_text="n", duration_seconds=1.0, language_hint="JP"),
+            ],
+        )
+
+        self.assertEqual(
+            [decision.material_path.name for decision in decisions],
+            ["se.wav", "n.wav", "ne.wav", "n.wav"],
+        )
+        self.assertEqual([decision.phonetic_position for decision in decisions], [0, 1, 2, 3])
 
     def test_orders_japanese_long_vowel_romaji_without_extra_clip_slots(self) -> None:
         decisions = order_materials_for_reference(
@@ -3643,6 +3855,62 @@ class ModelAssistTests(unittest.TestCase):
         ).decisions], ["wo-shi.wav", "shui.wav"])
         self.assertEqual(first.phonetic_span_units, 2)
         self.assertEqual(second.phonetic_span_units, 1)
+
+    def test_compact_phonetic_match_keeps_per_position_span_and_rejects_cross_unit_single_syllable(self) -> None:
+        self.assertEqual(
+            model_assist._phonetic_position_spans_for_units(
+                ["ni", "yin", "shi"],
+                ["in"],
+                allow_compact_match=True,
+            ),
+            ((1, 1),),
+        )
+        self.assertEqual(
+            model_assist._phonetic_position_spans_for_units(
+                ["zhen", "ai"],
+                ["na"],
+                allow_compact_match=True,
+            ),
+            (),
+        )
+
+    def test_cn_single_phonetic_material_does_not_expand_aligned_timing_lattice(self) -> None:
+        text = "\u662f\u4e2a\u672a\u77e5\u529b\u91cf\u7684\u7275\u5f15"
+        reference = VoiceSegment(
+            0.0,
+            9.0,
+            text,
+            unit_timings=tuple(
+                VoiceUnitTiming(index, unit, float(index), float(index + 1), timing_source="test_alignment")
+                for index, unit in enumerate(text)
+            ),
+            language_hint="CN",
+        )
+        plan = plan_material_ordering(
+            [reference],
+            [
+                MaterialAnalysis(
+                    Path("in1.wav"),
+                    filename_text="in1",
+                    duration_seconds=0.2,
+                    language_hint="CN",
+                )
+            ],
+        )
+
+        self.assertEqual(plan.decisions[0].phonetic_span_units, 1)
+        target_durations = model_runtime._target_durations_for_decisions(
+            [reference],
+            plan.decisions,
+            reference_duration=9.0,
+        )
+        summary = model_runtime._render_timeline_alignment_summary(
+            [reference],
+            plan.decisions,
+            target_durations,
+        )
+        self.assertEqual(summary["resampled_timing_lattice_count"], 0)
+        self.assertEqual(summary["decision_details"][0]["position_unit_span"], 1)
 
 
 class ModelRuntimeTests(unittest.TestCase):
@@ -5117,6 +5385,312 @@ class ModelRuntimeTests(unittest.TestCase):
 
         self.assertEqual([segment.text for segment in lyric_segments], ["\u611b\u3057\u3066", "\u611b\u3057\u3066", "\u611b\u3057\u3066"])
         self.assertEqual([segment.language_hint for segment in lyric_segments], ["JP", "JP", "JP"])
+        self.assertEqual([segment.alignment_text for segment in lyric_segments], ["\u3042\u3044\u3057\u3066", "", ""])
+
+    def test_japanese_lyrics_collapse_punctuated_romaji_annotation_line(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "song_JP.txt"
+            lyrics.write_text(
+                "\u306e\u3069\u3082\u3068\u306b\u304b\u307f\u3064\u304f"
+                "\u304d\u3070\u306f\u307e\u3060\u3042\u308b\u304b\u3044\uff1f\n"
+                "o do mo to ni ka mi tsu ku ki ba wa ma da a ru ka'i?\n",
+                encoding="utf-8",
+            )
+
+            with patch("audio_processor.model_assist._janome_tokenizer", return_value=ModelAssistTests._fake_janome_tokenizer()):
+                lyric_segments = model_runtime.parse_lyrics_file(lyrics)
+
+        self.assertEqual(
+            [segment.text for segment in lyric_segments],
+            ["\u306e\u3069\u3082\u3068\u306b\u304b\u307f\u3064\u304f\u304d\u3070\u306f\u307e\u3060\u3042\u308b\u304b\u3044\uff1f"],
+        )
+        self.assertEqual(
+            [segment.alignment_text for segment in lyric_segments],
+            ["o do mo to ni ka mi tsu ku ki ba wa ma da a ru ka'i?"],
+        )
+
+    def test_japanese_lyrics_alignment_text_preserves_multi_kanji_inline_readings(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lyrics = root / "song_JP.txt"
+            lyrics.write_text(
+                "\u6c7a\uff08\u304d\uff09\u307e\u3063\u305f\u8a00\u8449\uff08\u3053\u3068\u3070\uff09"
+                "\u5782\uff08\u305f\uff09\u308c\u3066\u307e\u305f\u30d2\u30e5\u30fc\u30de\u30f3\n",
+                encoding="utf-8",
+            )
+
+            with patch("audio_processor.model_assist._janome_tokenizer", return_value=ModelAssistTests._fake_janome_tokenizer()):
+                lyric_segments = model_runtime.parse_lyrics_file(lyrics)
+
+        self.assertEqual(
+            [segment.text for segment in lyric_segments],
+            ["\u6c7a\u307e\u3063\u305f\u8a00\u8449\u5782\u308c\u3066\u307e\u305f\u30d2\u30e5\u30fc\u30de\u30f3"],
+        )
+        self.assertEqual(
+            [segment.alignment_text for segment in lyric_segments],
+            ["\u304d\u307e\u3063\u305f\u3053\u3068\u3070\u305f\u308c\u3066\u307e\u305f\u30d2\u30e5\u30fc\u30de\u30f3"],
+        )
+
+    def test_force_align_lyrics_uses_alignment_text_and_retargets_original_units(self) -> None:
+        class FakeWhisperX:
+            def __init__(self) -> None:
+                self.target_segments: list[dict[str, object]] = []
+
+            def align(self, segments, *args, **kwargs):
+                self.target_segments = segments
+                return {
+                    "segments": [
+                        {
+                            "start": 0.0,
+                            "end": 2.0,
+                            "text": segments[0]["text"],
+                            "chars": [
+                                {"char": "\u3042", "start": 0.0, "end": 0.2, "score": 0.9},
+                                {"char": "\u3044", "start": 0.2, "end": 0.7, "score": 0.8},
+                                {"char": "\u3057", "start": 0.7, "end": 1.4, "score": 0.7},
+                                {"char": "\u3066", "start": 1.4, "end": 2.0, "score": 0.9},
+                            ],
+                        }
+                    ]
+                }
+
+        fake_whisperx = FakeWhisperX()
+
+        with patch("audio_processor.model_assist._janome_tokenizer", return_value=ModelAssistTests._fake_janome_tokenizer()):
+            segments = model_runtime._force_align_lyrics_with_whisperx(
+                [
+                    VoiceSegment(
+                        0.0,
+                        1.0,
+                        "\u611b\u3057\u3066",
+                        language_hint="JP",
+                        alignment_text="\u3042\u3044\u3057\u3066",
+                    )
+                ],
+                [VoiceSegment(0.0, 2.0, "ignored", language_hint="JP")],
+                audio=object(),
+                align_model=object(),
+                metadata={},
+                device="cpu",
+                whisperx=fake_whisperx,
+                language_hint="JP",
+            )
+
+        self.assertEqual(fake_whisperx.target_segments[0]["text"], "\u3042\u3044\u3057\u3066")
+        self.assertEqual(segments[0].text, "\u611b\u3057\u3066")
+        self.assertEqual(segments[0].alignment_text, "\u3042\u3044\u3057\u3066")
+        self.assertEqual(segments[0].timing_source, "whisperx_lyrics_char_alignment")
+        self.assertEqual([timing.unit for timing in segments[0].unit_timings], ["a", "i", "shi", "te"])
+        self.assertEqual([round(timing.duration_seconds, 6) for timing in segments[0].unit_timings], [0.2, 0.5, 0.7, 0.6])
+
+    def test_force_align_lyrics_prefers_kana_text_over_romaji_annotation(self) -> None:
+        class FakeWhisperX:
+            def __init__(self) -> None:
+                self.target_segments: list[dict[str, object]] = []
+
+            def align(self, segments, *args, **kwargs):
+                self.target_segments = segments
+                return {
+                    "segments": [
+                        {
+                            "start": 0.0,
+                            "end": 1.2,
+                            "text": segments[0]["text"],
+                            "chars": [
+                                {"char": "\u3042", "start": 0.0, "end": 0.2, "score": 0.9},
+                                {"char": "\u3063", "start": 0.2, "end": 0.25, "score": 0.8},
+                                {"char": "\u306f", "start": 0.25, "end": 0.7, "score": 0.8},
+                                {"char": "\u3063", "start": 0.7, "end": 0.75, "score": 0.8},
+                                {"char": "\u306f", "start": 0.75, "end": 1.2, "score": 0.8},
+                            ],
+                        }
+                    ]
+                }
+
+        fake_whisperx = FakeWhisperX()
+        segments = model_runtime._force_align_lyrics_with_whisperx(
+            [VoiceSegment(0.0, 1.0, "\u3042\u3063\u306f\u3063\u306f", language_hint="JP", alignment_text="a hha hha")],
+            [VoiceSegment(0.0, 1.2, "ignored", language_hint="JP")],
+            audio=object(),
+            align_model=object(),
+            metadata={},
+            device="cpu",
+            whisperx=fake_whisperx,
+            language_hint="JP",
+        )
+
+        self.assertEqual(fake_whisperx.target_segments[0]["text"], "\u3042\u3063\u306f\u3063\u306f")
+        self.assertEqual(segments[0].text, "\u3042\u3063\u306f\u3063\u306f")
+        self.assertEqual([timing.unit for timing in segments[0].unit_timings], ["a", "ha", "ha"])
+        self.assertEqual(segments[0].timing_source, "whisperx_lyrics_char_alignment")
+
+    def test_force_align_lyrics_reuses_coarse_exact_timings_when_chars_are_missing(self) -> None:
+        class FakeWhisperX:
+            def align(self, segments, *args, **kwargs):
+                return {
+                    "segments": [
+                        {
+                            "start": 9.0,
+                            "end": 9.02,
+                            "text": segments[0]["text"],
+                            "chars": [],
+                        }
+                    ]
+                }
+
+        segments = model_runtime._force_align_lyrics_with_whisperx(
+            [VoiceSegment(0.0, 1.0, "\u7231\u4eba\u540c\u5fd7", language_hint="CN")],
+            [
+                VoiceSegment(
+                    10.0,
+                    11.0,
+                    "\u7231\u4eba\u540c\u5fd7",
+                    language_hint="CN",
+                    unit_timings=(
+                        VoiceUnitTiming(0, "x0", 10.0, 10.2, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(1, "x1", 10.2, 10.5, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(2, "x2", 10.5, 10.8, timing_source="whisperx_char_alignment"),
+                        VoiceUnitTiming(3, "x3", 10.8, 11.0, timing_source="whisperx_char_alignment"),
+                    ),
+                )
+            ],
+            audio=object(),
+            align_model=object(),
+            metadata={},
+            device="cpu",
+            whisperx=FakeWhisperX(),
+            language_hint="CN",
+        )
+
+        self.assertEqual(segments[0].timing_source, "whisperx_lyrics_coarse_unit_alignment")
+        self.assertEqual([timing.unit for timing in segments[0].unit_timings], ["\u7231", "\u4eba", "\u540c", "\u5fd7"])
+        self.assertEqual([round(timing.duration_seconds, 6) for timing in segments[0].unit_timings], [0.2, 0.3, 0.3, 0.2])
+        self.assertAlmostEqual(segments[0].start_seconds, 10.0)
+        self.assertAlmostEqual(segments[0].end_seconds, 11.0)
+
+    def test_funasr_repair_fills_missing_cn_lyric_after_previous_line(self) -> None:
+        lyrics_segments = (
+            VoiceSegment(
+                213.0,
+                215.2,
+                "\u54e6\u8ba9\u6211\u76f8\u4fe1\u4f60\u7684\u5fe0\u8d1e",
+                language_hint="CN",
+                timing_source="whisperx_lyrics_char_alignment",
+                unit_timings=(
+                    VoiceUnitTiming(0, "\u54e6", 213.0, 213.2, timing_source="whisperx_lyrics_char_alignment"),
+                    VoiceUnitTiming(1, "\u8d1e", 214.92, 215.12, timing_source="whisperx_lyrics_char_alignment"),
+                ),
+            ),
+            VoiceSegment(
+                237.371,
+                237.392,
+                "\u7231\u4eba\u540c\u5fd7",
+                language_hint="CN",
+                timing_source="whisperx_lyrics_alignment",
+            ),
+        )
+        funasr_segments = (
+            model_runtime.TranscriptSegment(
+                40.0,
+                238.0,
+                "\u7231\u4eba\u540c\u5fd7\u7231\u4eba\u540c\u5fd7\u55ef",
+                timing_source="funasr_timestamp",
+                unit_timings=(
+                    VoiceUnitTiming(0, "\u7231", 40.0, 40.2, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(1, "\u4eba", 40.2, 40.4, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(2, "\u540c", 40.4, 40.6, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(3, "\u5fd7", 40.6, 40.8, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(4, "\u7231", 215.55, 215.75, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(5, "\u4eba", 215.75, 215.91, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(6, "\u540c", 215.91, 216.11, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(7, "\u5fd7", 216.11, 216.825, timing_source="funasr_timestamp"),
+                    VoiceUnitTiming(8, "\u55ef", 236.74, 237.01, timing_source="funasr_timestamp"),
+                ),
+            ),
+        )
+
+        repaired = model_runtime._repair_missing_lyric_unit_timings_with_funasr(
+            lyrics_segments,
+            funasr_segments,
+            language_hint="CN",
+        )
+
+        self.assertEqual(repaired[1].timing_source, "funasr_lyrics_unit_alignment")
+        self.assertEqual([timing.unit for timing in repaired[1].unit_timings], ["\u7231", "\u4eba", "\u540c", "\u5fd7"])
+        self.assertEqual({timing.timing_source for timing in repaired[1].unit_timings}, {"funasr_lyrics_unit_alignment"})
+        self.assertAlmostEqual(repaired[1].start_seconds, 215.55)
+        self.assertAlmostEqual(repaired[1].end_seconds, 216.825)
+
+    def test_timeline_alignment_uses_reference_alignment_text_units_without_resampling(self) -> None:
+        reference = VoiceSegment(
+            0.0,
+            1.0,
+            "1000\u5e74",
+            language_hint="JP",
+            alignment_text="\u305b\u3093\u306d\u3093",
+            unit_timings=(
+                VoiceUnitTiming(0, "se", 0.0, 0.2, timing_source="whisperx_char_alignment"),
+                VoiceUnitTiming(1, "n", 0.2, 0.4, timing_source="whisperx_char_alignment"),
+                VoiceUnitTiming(2, "ne", 0.4, 0.7, timing_source="whisperx_char_alignment"),
+                VoiceUnitTiming(3, "n", 0.7, 1.0, timing_source="whisperx_char_alignment"),
+            ),
+        )
+        decisions = [
+            MaterialOrderDecision(
+                rank=index + 1,
+                material_path=Path(f"{unit}.wav"),
+                score=1.0,
+                reference_text=reference.text,
+                material_text=unit,
+                reason="test",
+                reference_segment_index=0,
+                phonetic_position=index,
+                phonetic_position_count=1,
+                phonetic_span_units=1,
+                language_hint="JP",
+            )
+            for index, unit in enumerate(("se", "n", "ne", "n"))
+        ]
+
+        targets = model_runtime._positioned_target_durations([reference], decisions)
+        summary = model_runtime._render_timeline_alignment_summary([reference], decisions, targets)
+
+        self.assertEqual(summary["timed_target_duration_count"], 4)
+        self.assertEqual(summary["exact_timed_target_duration_count"], 4)
+        self.assertEqual(summary["resampled_timing_lattice_count"], 0)
+        self.assertEqual(summary["decision_details"][0]["reference_segment_text"], "1000\u5e74")
+        self.assertEqual(summary["decision_details"][0]["reference_text_units"], ["se", "n", "ne", "n"])
+
+    def test_timeline_alignment_clips_overlong_material_span_to_exact_reference_units(self) -> None:
+        reference = VoiceSegment(
+            0.0,
+            1.0,
+            "\u3055",
+            language_hint="JP",
+            unit_timings=(VoiceUnitTiming(0, "sa", 0.0, 1.0, timing_source="whisperx_char_alignment"),),
+        )
+        decision = MaterialOrderDecision(
+            rank=1,
+            material_path=Path("sai.wav"),
+            score=1.0,
+            reference_text=reference.text,
+            material_text="sai",
+            reason="test",
+            reference_segment_index=0,
+            phonetic_position=0,
+            phonetic_position_count=1,
+            phonetic_span_units=2,
+            language_hint="JP",
+        )
+
+        targets = model_runtime._positioned_target_durations([reference], [decision])
+        summary = model_runtime._render_timeline_alignment_summary([reference], [decision], targets)
+
+        self.assertEqual(summary["timed_target_duration_count"], 1)
+        self.assertEqual(summary["exact_timed_target_duration_count"], 1)
+        self.assertEqual(summary["resampled_timing_lattice_count"], 0)
+        self.assertEqual(summary["decision_details"][0]["position_unit_end"], 1)
 
     def test_japanese_lyric_text_retargets_original_aligned_unit_durations(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -5230,6 +5804,70 @@ class ModelRuntimeTests(unittest.TestCase):
             [(0.0, 1.0), (2.0, 3.0)],
         )
         self.assertTrue(any("skipped_acoustic_segments=1/3" in note for note in notes))
+
+    def test_lyrics_alignment_allows_long_acoustic_segment_to_cover_many_lyric_lines(self) -> None:
+        lyrics = [
+            VoiceSegment(0.0, 1.0, "\u6bcf\u4e00\u6b21\u95ed\u4e0a\u4e86\u773c\u5c31\u60f3\u5230\u4e86\u4f60", language_hint="CN"),
+            VoiceSegment(1.0, 2.0, "\u4f60\u50cf\u4e00\u53e5\u7f8e\u4e3d\u7684\u53e3\u53f7\u6325\u4e0d\u53bb", language_hint="CN"),
+            VoiceSegment(2.0, 3.0, "\u5728\u8fd9\u6279\u5224\u6597\u4e89\u7684\u4e16\u754c\u91cc", language_hint="CN"),
+            VoiceSegment(3.0, 4.0, "\u6bcf\u4e2a\u4eba\u90fd\u8981\u5b66\u4e60\u4fdd\u62a4\u81ea\u5df1", language_hint="CN"),
+            VoiceSegment(4.0, 5.0, "\u8ba9\u6211\u76f8\u4fe1\u4f60\u7684\u5fe0\u8d1e", language_hint="CN"),
+            VoiceSegment(5.0, 6.0, "\u7231\u4eba\u540c\u5fd7", language_hint="CN"),
+            VoiceSegment(6.0, 7.0, "\u54e6\u8ba9\u6211\u76f8\u4fe1\u4f60\u7684\u5fe0\u8d1e", language_hint="CN"),
+            VoiceSegment(7.0, 8.0, "\u7231\u4eba\u540c\u5fd7", language_hint="CN"),
+        ]
+        transcript_segments = [
+            model_runtime.TranscriptSegment(
+                10.0,
+                34.0,
+                (
+                    "\u6bcf\u4e00\u6b21\u6bd4\u8f83\u4eae\u773c\u5c31\u60f3\u5230\u4e86\u4f60"
+                    "\u4f60\u60f3\u4e00\u53e5\u7f8e\u4e3d\u7684\u53e3\u53f7"
+                    "\u5728\u8fd9\u6279\u5224\u6597\u4e89\u7684\u4e16\u754c\u91cc"
+                    "\u6bcf\u4e2a\u4eba\u90fd\u8981\u5b66\u4e60\u4fdd\u62a4\u81ea\u5df1"
+                    "\u8ba9\u6211\u76f8\u4fe1\u4f60\u7684\u91cd\u75c7\u7231\u4eba\u4ece\u4e4b"
+                ),
+                timing_source="whisperx_char_alignment",
+            ),
+            model_runtime.TranscriptSegment(34.0, 38.0, "\u54e6\u54e6\u54e6", timing_source="whisperx_char_alignment"),
+            model_runtime.TranscriptSegment(38.0, 38.2, "\u554a", timing_source="whisperx_char_alignment"),
+        ]
+
+        alignment = model_runtime._align_lyrics_to_transcript_segments(
+            lyrics,
+            transcript_segments,
+            language_hint="CN",
+        )
+
+        self.assertEqual(alignment.unmatched_lyric_count, 0)
+        self.assertEqual([segment.text for segment in alignment.segments], [segment.text for segment in lyrics])
+        self.assertEqual(alignment.segments[0].start_seconds, 10.0)
+        self.assertEqual(alignment.segments[5].end_seconds, 34.0)
+        self.assertEqual(alignment.segments[-1].timing_source, "lyrics_coarse_low_confidence_window")
+
+    def test_lyrics_alignment_spreads_low_confidence_windows_over_remaining_acoustic_segments(self) -> None:
+        lyrics = [
+            VoiceSegment(0.0, 1.0, f"line {index}", language_hint="JP")
+            for index in range(5)
+        ]
+        transcript_segments = [
+            model_runtime.TranscriptSegment(10.0, 20.0, "unrelated audio block"),
+            model_runtime.TranscriptSegment(30.0, 40.0, "another unrelated block"),
+        ]
+
+        alignment = model_runtime._align_lyrics_to_transcript_segments(
+            lyrics,
+            transcript_segments,
+            language_hint="JP",
+        )
+
+        self.assertEqual(alignment.unmatched_lyric_count, 0)
+        self.assertEqual(alignment.skipped_acoustic_count, 0)
+        self.assertEqual([segment.text for segment in alignment.segments], [segment.text for segment in lyrics])
+        self.assertTrue(all(segment.timing_source == "lyrics_coarse_low_confidence_window" for segment in alignment.segments))
+        self.assertTrue(all(not segment.unit_timings for segment in alignment.segments))
+        self.assertLess(alignment.segments[0].start_seconds, alignment.segments[2].start_seconds)
+        self.assertEqual(alignment.segments[-1].end_seconds, 40.0)
 
     def test_auto_asr_skips_uncached_accelerated_backends(self) -> None:
         with TemporaryDirectory() as temp_dir:

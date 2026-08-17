@@ -88,6 +88,12 @@ class AudioAnalysis:
 
 
 @dataclass(frozen=True)
+class _LyricTextEntry:
+    text: str
+    alignment_text: str = ""
+
+
+@dataclass(frozen=True)
 class ReferenceAnalysis:
     source_path: Path
     vocal_path: Path
@@ -723,6 +729,7 @@ def build_model_ordering(
     material_directory: Path,
     *,
     lyrics_file: Path | None = None,
+    enforce_exact_lyrics_timeline: bool = True,
     work_dir: Path | None = None,
     material_cache_dir: Path | None = None,
     compute_device: str = "auto",
@@ -929,7 +936,7 @@ def build_model_ordering(
         "backend_summary": backend_summary,
         "notes": notes,
     }
-    if lyrics_file is not None:
+    if lyrics_file is not None and enforce_exact_lyrics_timeline:
         _raise_for_untrusted_lyrics_timeline(report)
     _notify_progress(on_progress, 1.0, "Model-assisted ordering complete")
     return ModelOrderingResult(
@@ -1034,6 +1041,7 @@ def analyze_reference(
         compute_device=compute_device,
         should_cancel=should_cancel,
         language_hint=language_hint,
+        lyrics_file=lyrics_file,
     )
     notes.extend(str(note) for note in transcript_result.get("notes", []) if isinstance(note, str))
     _raise_if_cancelled(should_cancel)
@@ -1052,6 +1060,7 @@ def analyze_reference(
         transcript_result["segments"],
         lyrics_file=lyrics_file,
         language_hint=transcript_language_hint,
+        prealigned_lyrics=transcript_result.get("lyrics_segments"),
     )
     notes.extend(lyric_alignment_notes)
     if lyrics_file is not None and not segments:
@@ -1246,6 +1255,7 @@ def render_reference_analysis(reference: ReferenceAnalysis) -> dict[str, Any]:
                 "speaker_id": segment.speaker_id,
                 "timing_source": segment.timing_source,
                 "language_hint": segment.language_hint,
+                "alignment_text": segment.alignment_text,
                 "unit_timings": [
                     {
                         "position": timing.position,
@@ -1522,8 +1532,8 @@ def _lyrics_text_to_segments(text: str, *, suffix: str, language_hint: str = "")
                 for index, (start, line) in enumerate(timed_lines)
                 if line
             ]
-        lines = [
-            _normalize_lyric_annotation_text(_strip_lrc_timestamp(raw_line.strip()), language_hint=language_hint)
+        entries = [
+            _normalize_lyric_annotation_entry(_strip_lrc_timestamp(raw_line.strip()), language_hint=language_hint)
             for raw_line in text.splitlines()
             if _strip_lrc_timestamp(raw_line.strip())
             and not _is_non_vocal_lyric_line(_strip_lrc_timestamp(raw_line.strip()))
@@ -1532,27 +1542,31 @@ def _lyrics_text_to_segments(text: str, *, suffix: str, language_hint: str = "")
         timed_segments = _parse_srt_segments(text, language_hint=language_hint)
         if timed_segments:
             return timed_segments
-        lines = _srt_text_lines_without_timing(text)
+        entries = [
+            _normalize_lyric_annotation_entry(line, language_hint=language_hint)
+            for line in _srt_text_lines_without_timing(text)
+        ]
     else:
-        lines = [
-            _normalize_lyric_annotation_text(line.strip(), language_hint=language_hint)
+        entries = [
+            _normalize_lyric_annotation_entry(line.strip(), language_hint=language_hint)
             for line in text.splitlines()
             if line.strip() and not _is_non_vocal_lyric_line(line.strip())
         ]
 
-    lines = _collapse_lyric_annotation_lines(lines, language_hint=language_hint)
+    entries = _collapse_lyric_annotation_entries(entries, language_hint=language_hint)
 
     return [
         VoiceSegment(
             start_seconds=float(index),
             end_seconds=float(index + 1),
-            text=line,
+            text=entry.text,
             confidence=1.0,
             timing_source="lyrics_sequence",
             language_hint=language_hint,
+            alignment_text=entry.alignment_text,
         )
-        for index, line in enumerate(lines)
-        if line
+        for index, entry in enumerate(entries)
+        if entry.text
     ]
 
 
@@ -1612,6 +1626,52 @@ def _collapse_lyric_annotation_lines(lines: Sequence[str], *, language_hint: str
     return collapsed
 
 
+def _collapse_lyric_annotation_entries(
+    entries: Sequence[_LyricTextEntry],
+    *,
+    language_hint: str = "",
+) -> list[_LyricTextEntry]:
+    collapsed: list[_LyricTextEntry] = []
+    for entry in entries:
+        if not entry.text:
+            continue
+        if collapsed and _is_japanese_annotation_pair(collapsed[-1].text, entry.text, language_hint=language_hint):
+            collapsed[-1] = _merge_japanese_lyric_annotation_entries(
+                collapsed[-1],
+                entry,
+            )
+            continue
+        collapsed.append(entry)
+    return collapsed
+
+
+def _merge_japanese_lyric_annotation_entries(
+    left: _LyricTextEntry,
+    right: _LyricTextEntry,
+) -> _LyricTextEntry:
+    preferred_text = _preferred_japanese_lyric_text(left.text, right.text)
+    preferred = left if preferred_text == left.text else right
+    other = right if preferred is left else left
+    alignment_text = preferred.alignment_text
+    if not alignment_text and _is_japanese_annotation_like(other.text):
+        alignment_text = other.alignment_text or other.text
+    if not alignment_text:
+        alignment_text = other.alignment_text
+    if alignment_text == preferred_text:
+        alignment_text = ""
+    return _LyricTextEntry(preferred_text, alignment_text)
+
+
+def _normalize_lyric_annotation_entry(text: str, *, language_hint: str = "") -> _LyricTextEntry:
+    normalized_text = _normalize_lyric_annotation_text(text, language_hint=language_hint)
+    if not normalized_text:
+        return _LyricTextEntry("")
+    alignment_text = _japanese_lyric_alignment_text(text, normalized_text, language_hint=language_hint)
+    if alignment_text == normalized_text:
+        alignment_text = ""
+    return _LyricTextEntry(normalized_text, alignment_text)
+
+
 def _normalize_lyric_annotation_text(text: str, *, language_hint: str = "") -> str:
     stripped = _normalize_lyric_spaces(text)
     if not stripped or not _should_process_japanese_lyric_annotations(stripped, language_hint=language_hint):
@@ -1634,9 +1694,74 @@ def _should_process_japanese_lyric_annotations(text: str, *, language_hint: str 
     return has_kana or (has_cjk and has_latin)
 
 
+def _japanese_lyric_alignment_text(
+    text: str,
+    normalized_text: str,
+    *,
+    language_hint: str = "",
+) -> str:
+    stripped = _normalize_lyric_spaces(text)
+    if not stripped or not _should_process_japanese_lyric_annotations(stripped, language_hint=language_hint):
+        return ""
+
+    html_stripped = _strip_html_ruby_annotations(stripped)
+    parts = [_normalize_lyric_spaces(part) for part in re.split(r"\s*[\/／|｜]\s*", html_stripped) if part.strip()]
+    primary = parts[0] if parts else html_stripped
+    inline_alignment = _replace_inline_japanese_readings_with_readings(primary)
+    if inline_alignment and inline_alignment != primary:
+        return inline_alignment
+
+    for pattern in (
+        r"^(?P<main>.+?)[\(\uff08\[\u3010](?P<annotation>[A-Za-z][A-Za-z'\-\s?!\uff1f\uff01.,\u3002\u3001]+)[\)\uff09\]\u3011]$",
+        r"^(?P<main>.+?)[\(\uff08\[\u3010](?P<annotation>[\u3040-\u30ff\u31f0-\u31ff\s?!\uff1f\uff01.,\u3002\u3001]+)[\)\uff09\]\u3011]$",
+    ):
+        match = re.fullmatch(pattern, primary)
+        if not match:
+            continue
+        main = _normalize_lyric_annotation_text(match.group("main"), language_hint=language_hint)
+        annotation = _normalize_lyric_spaces(match.group("annotation"))
+        if main == normalized_text and _is_japanese_annotation_pair(main, annotation, language_hint=language_hint):
+            return annotation
+
+    for part in parts[1:]:
+        normalized_part = _normalize_lyric_annotation_text(part, language_hint=language_hint)
+        if _is_japanese_annotation_pair(normalized_text, normalized_part, language_hint=language_hint):
+            return normalized_part
+
+    for pattern in (
+        r"^(?P<main>.*[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff])\s+(?P<annotation>[A-Za-z][A-Za-z'\-\s?!\uff1f\uff01.,\u3002\u3001]+)$",
+        r"^(?P<main>.*[\u4e00-\u9fff].*)\s+(?P<annotation>[\u3040-\u30ff\u31f0-\u31ff\s?!\uff1f\uff01.,\u3002\u3001]+)$",
+    ):
+        match = re.fullmatch(pattern, html_stripped)
+        if not match:
+            continue
+        main = _normalize_lyric_annotation_text(match.group("main"), language_hint=language_hint)
+        annotation = _normalize_lyric_spaces(match.group("annotation"))
+        if main == normalized_text and _is_japanese_annotation_pair(main, annotation, language_hint=language_hint):
+            return annotation
+
+    return ""
+
+
 def _strip_html_ruby_annotations(text: str) -> str:
     without_rt = re.sub(r"<rt\b[^>]*>.*?</rt>", "", text, flags=re.IGNORECASE | re.DOTALL)
     return re.sub(r"</?(?:ruby|rb|rp)\b[^>]*>", "", without_rt, flags=re.IGNORECASE)
+
+
+def _replace_inline_japanese_readings_with_readings(text: str) -> str:
+    pattern = re.compile(
+        r"(?P<base>[\u4e00-\u9fff]+)"
+        r"\s*[\(\uff08\[\u3010]"
+        r"(?P<reading>[\u3040-\u30ff\u31f0-\u31ffA-Za-z0-9'\-\s]+)"
+        r"[\)\uff09\]\u3011]"
+    )
+    current = text
+    while True:
+        updated = pattern.sub(lambda match: match.group("reading"), current)
+        updated = _normalize_lyric_spaces(updated)
+        if updated == current:
+            return updated
+        current = updated
 
 
 def _strip_inline_japanese_readings(text: str) -> str:
@@ -1759,7 +1884,11 @@ def _is_japanese_annotation_like(text: str) -> bool:
         return False
     if _has_cjk(normalized):
         return False
-    return bool(re.fullmatch(r"[\u3040-\u30ff\u31f0-\u31ffA-Za-z0-9'\-\s]+", normalized))
+    comparable = re.sub(r"[?!\uff1f\uff01.,\u3002\u3001\u30fb\u2026:;\uff1a\uff1b]", "", normalized)
+    comparable = _normalize_lyric_spaces(comparable)
+    if not comparable:
+        return False
+    return bool(re.fullmatch(r"[\u3040-\u30ff\u31f0-\u31ffA-Za-z0-9'\-\s]+", comparable))
 
 
 def _has_japanese_script(text: str) -> bool:
@@ -2524,6 +2653,7 @@ def _transcribe_audio(
     compute_device: str = DEFAULT_DEVICE,
     should_cancel: CancelCallback | None = None,
     language_hint: str = "",
+    lyrics_file: Path | None = None,
 ) -> dict[str, Any]:
     _raise_if_cancelled(should_cancel)
     _prepare_text_output_encoding()
@@ -2641,11 +2771,106 @@ def _transcribe_audio(
                             ),
                         )
                     )
+                lyrics_segments: tuple[VoiceSegment, ...] = ()
+                lyrics_alignment_notes: tuple[str, ...] = ()
+                if lyrics_file is not None:
+                    lyric_segments = parse_lyrics_file(lyrics_file)
+                    coarse_alignment = _align_lyrics_to_transcript_segments(
+                        lyric_segments,
+                        tuple(segments),
+                        language_hint=align_language or language,
+                    )
+                    if (
+                        coarse_alignment.segments
+                        and coarse_alignment.unmatched_lyric_count == 0
+                        and len(coarse_alignment.segments) == len(lyric_segments)
+                    ):
+                        try:
+                            lyrics_segments = _force_align_lyrics_with_whisperx(
+                                lyric_segments,
+                                coarse_alignment.segments,
+                                audio=audio,
+                                align_model=align_model,
+                                metadata=metadata,
+                                device=device,
+                                whisperx=whisperx,
+                                language_hint=align_language or language,
+                            )
+                            exact_count = sum(
+                                1
+                                for segment in lyrics_segments
+                                if _lyric_segment_has_exact_unit_timings(
+                                    segment,
+                                    language_hint=align_language or language,
+                                )
+                            )
+                            if (
+                                exact_count < len(lyrics_segments)
+                                and _normalize_cn_jp_language(align_language or language) == "CN"
+                            ):
+                                try:
+                                    funasr_result = _transcribe_with_funasr(
+                                        path,
+                                        compute_device=device,
+                                        should_cancel=should_cancel,
+                                    )
+                                    repaired_segments = _repair_missing_lyric_unit_timings_with_funasr(
+                                        lyrics_segments,
+                                        tuple(funasr_result.get("segments", ())),
+                                        language_hint=align_language or language,
+                                    )
+                                    repaired_exact_count = sum(
+                                        1
+                                        for segment in repaired_segments
+                                        if _lyric_segment_has_exact_unit_timings(
+                                            segment,
+                                            language_hint=align_language or language,
+                                        )
+                                    )
+                                    if repaired_exact_count > exact_count:
+                                        lyrics_segments = repaired_segments
+                                        exact_count = repaired_exact_count
+                                        lyrics_alignment_notes = (
+                                            *lyrics_alignment_notes,
+                                            "lyrics_funasr_timing_repair: "
+                                            f"exact_unit_timing_lines={exact_count}/{len(lyrics_segments)}",
+                                        )
+                                except Exception as exc:
+                                    lyrics_alignment_notes = (
+                                        *lyrics_alignment_notes,
+                                        "lyrics_funasr_timing_repair_failed: "
+                                        f"{type(exc).__name__}: {exc}",
+                                    )
+                            lyrics_alignment_notes = (
+                                *lyrics_alignment_notes,
+                                "lyrics_forced_alignment_attempted: "
+                                f"coarse_lines={len(coarse_alignment.segments)}/{len(lyric_segments)}; "
+                                f"exact_unit_timing_lines={exact_count}/{len(lyrics_segments)}",
+                            )
+                        except Exception as exc:
+                            lyrics_alignment_notes = (
+                                "lyrics_forced_alignment_failed: "
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                    else:
+                        lyrics_alignment_notes = (
+                            "lyrics_forced_alignment_unavailable: "
+                            f"coarse_lines={len(coarse_alignment.segments)}/{len(lyric_segments)}; "
+                            f"unmatched_lyrics={coarse_alignment.unmatched_lyric_count}; "
+                            f"skipped_acoustic_segments={coarse_alignment.skipped_acoustic_count}/{len(segments)}",
+                        )
                 text = " ".join(segment.text for segment in segments).strip()
                 notes = [*fallback_notes, f"language={language}"] if language else fallback_notes
                 if align_language and align_language != language:
                     notes.append(f"alignment_language={align_language}")
-                return {"backend": "whisperx", "text": text, "segments": segments, "notes": notes}
+                notes.extend(lyrics_alignment_notes)
+                return {
+                    "backend": "whisperx",
+                    "text": text,
+                    "segments": segments,
+                    "lyrics_segments": lyrics_segments,
+                    "notes": notes,
+                }
             except _WhisperXAudioLoadFailed as exc:
                 if preferred_backend == "whisperx":
                     raise AudioProcessorError(str(exc)) from exc
@@ -3480,6 +3705,7 @@ def _reference_cache_path(
         "funasr_timestamp_mismatch_policy": "resample_to_reference_units_v1",
         "lyrics_acoustic_alignment_policy": "strict_no_sequential_or_asr_fallback_v1",
         "lyrics_exact_timeline_policy": "block_resampled_or_missing_unit_timing_v1",
+        "lyrics_funasr_exact_timing_repair_policy": "cn_exact_sequence_after_whisperx_v1",
         "whisperx_return_char_alignments": True,
         "speaker_model": SPEAKER_EMBEDDING_MODEL,
         "compute_device": compute_device,
@@ -3659,7 +3885,8 @@ def _align_lyrics_to_transcript_segments(
     lyric_index = 0
     while lyric_index < len(lyrics) and cursor < len(transcripts):
         best: tuple[float, int, int, int] | None = None
-        for lyric_count in range(1, min(3, len(lyrics) - lyric_index) + 1):
+        max_lyric_count = min(12, len(lyrics) - lyric_index)
+        for lyric_count in range(1, max_lyric_count + 1):
             lyric_text = " ".join(
                 lyrics[index].text
                 for index in range(lyric_index, lyric_index + lyric_count)
@@ -3683,6 +3910,22 @@ def _align_lyrics_to_transcript_segments(
                         best = candidate
 
         if best is None or best[0] < _lyric_transcript_match_threshold(language_hint):
+            if cursor < len(transcripts) and (len(lyrics) > 1 or len(transcripts) > 1):
+                fallback_transcript = transcripts[cursor]
+                lyric_count = _low_confidence_lyric_window_count(
+                    len(lyrics) - lyric_index,
+                    len(transcripts) - cursor,
+                )
+                fallback_segments = _split_low_confidence_transcript_segment_for_lyrics(
+                    fallback_transcript,
+                    lyrics[lyric_index : lyric_index + lyric_count],
+                    language_hint=language_hint,
+                )
+                aligned.extend(fallback_segments)
+                scores.extend(best[0] if best is not None else 0.0 for _ in fallback_segments)
+                lyric_index += len(fallback_segments)
+                cursor += 1
+                continue
             unmatched_lyric_count += 1
             lyric_index += 1
             continue
@@ -3713,6 +3956,414 @@ def _align_lyrics_to_transcript_segments(
     )
 
 
+def _force_align_lyrics_with_whisperx(
+    lyric_segments: Sequence[VoiceSegment],
+    coarse_segments: Sequence[VoiceSegment],
+    *,
+    audio: Any,
+    align_model: Any,
+    metadata: dict[str, Any],
+    device: str,
+    whisperx: Any,
+    language_hint: str = "",
+) -> tuple[VoiceSegment, ...]:
+    if not lyric_segments or len(lyric_segments) != len(coarse_segments):
+        return ()
+
+    target_segments = [
+        {
+            "start": float(coarse.start_seconds),
+            "end": float(coarse.end_seconds),
+            "text": _lyric_forced_alignment_text(lyric, language_hint=language_hint),
+        }
+        for lyric, coarse in zip(lyric_segments, coarse_segments)
+    ]
+    aligned = whisperx.align(
+        target_segments,
+        align_model,
+        metadata,
+        audio,
+        device,
+        return_char_alignments=True,
+    )
+    aligned_entries = aligned.get("segments", []) if isinstance(aligned, dict) else []
+    if not isinstance(aligned_entries, list):
+        aligned_entries = []
+
+    result: list[VoiceSegment] = []
+    for index, (lyric, coarse) in enumerate(zip(lyric_segments, coarse_segments)):
+        aligned_entry = (
+            aligned_entries[index]
+            if index < len(aligned_entries) and isinstance(aligned_entries[index], dict)
+            else {}
+        )
+        start_seconds = _optional_float(aligned_entry.get("start"))
+        end_seconds = _optional_float(aligned_entry.get("end"))
+        if start_seconds is None:
+            start_seconds = coarse.start_seconds
+        if end_seconds is None or end_seconds <= start_seconds:
+            end_seconds = coarse.end_seconds
+        effective_language = lyric.language_hint or language_hint
+        alignment_text = _lyric_forced_alignment_text(lyric, language_hint=effective_language)
+        aligned_entry = dict(aligned_entry)
+        aligned_entry.setdefault("text", alignment_text)
+        unit_timings = _lyric_unit_timings_from_alignment_text(
+            aligned_entry,
+            lyric,
+            language_hint=effective_language,
+            alignment_text=alignment_text,
+        )
+        timing_source = (
+            "whisperx_lyrics_char_alignment"
+            if unit_timings
+            else "whisperx_lyrics_alignment"
+        )
+        expected_unit_count = _lyric_expected_unit_count(
+            lyric,
+            language_hint=effective_language,
+            alignment_text=alignment_text,
+        )
+        if expected_unit_count > 0 and len(unit_timings) != expected_unit_count:
+            coarse_unit_timings = _coarse_unit_timings_for_lyric(
+                coarse,
+                lyric,
+                language_hint=effective_language,
+                alignment_text=alignment_text,
+            )
+            if coarse_unit_timings:
+                unit_timings = coarse_unit_timings
+                start_seconds = min(timing.start_seconds for timing in unit_timings)
+                end_seconds = max(timing.end_seconds for timing in unit_timings)
+                timing_source = "whisperx_lyrics_coarse_unit_alignment"
+        result.append(
+            VoiceSegment(
+                start_seconds=float(start_seconds),
+                end_seconds=float(max(end_seconds, start_seconds)),
+                text=lyric.text,
+                confidence=_segment_confidence(aligned_entry) or lyric.confidence,
+                speaker_id=lyric.speaker_id,
+                timing_source=timing_source,
+                unit_timings=unit_timings,
+                language_hint=effective_language,
+                alignment_text=lyric.alignment_text,
+            )
+        )
+    return tuple(result)
+
+
+def _lyric_forced_alignment_text(lyric: VoiceSegment, *, language_hint: str = "") -> str:
+    alignment_text = lyric.alignment_text.strip()
+    if not alignment_text:
+        return lyric.text
+    effective_language = lyric.language_hint or language_hint
+    if _normalize_cn_jp_language(effective_language) == "JP":
+        lyric_has_kana = bool(re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", lyric.text))
+        lyric_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", lyric.text))
+        alignment_is_latin = bool(re.search(r"[A-Za-z]", alignment_text)) and not re.search(
+            r"[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff]",
+            alignment_text,
+        )
+        if lyric_has_kana and not lyric_has_cjk and alignment_is_latin:
+            return lyric.text
+    return alignment_text
+
+
+def _lyric_unit_timings_from_alignment_text(
+    aligned_entry: dict[str, Any],
+    lyric: VoiceSegment,
+    *,
+    language_hint: str = "",
+    alignment_text: str = "",
+) -> tuple[VoiceUnitTiming, ...]:
+    effective_language = lyric.language_hint or language_hint
+    unit_timings = _unit_timings_from_aligned_chars(
+        aligned_entry,
+        language_hint=effective_language,
+    )
+    if not unit_timings:
+        return ()
+    for candidate in _lyric_timing_candidate_texts(lyric, alignment_text):
+        expected_units = _timeline_units(candidate, language_hint=effective_language)
+        if not expected_units or len(expected_units) != len(unit_timings):
+            continue
+        return tuple(
+            VoiceUnitTiming(
+                position=index,
+                unit=unit,
+                start_seconds=timing.start_seconds,
+                end_seconds=timing.end_seconds,
+                confidence=timing.confidence,
+                timing_source=timing.timing_source,
+            )
+            for index, (unit, timing) in enumerate(zip(expected_units, unit_timings))
+        )
+    return unit_timings
+
+
+def _lyric_expected_unit_count(
+    lyric: VoiceSegment,
+    *,
+    language_hint: str = "",
+    alignment_text: str = "",
+) -> int:
+    return len(
+        _lyric_expected_units(
+            lyric,
+            language_hint=language_hint,
+            alignment_text=alignment_text,
+        )
+    )
+
+
+def _lyric_expected_units(
+    lyric: VoiceSegment,
+    *,
+    language_hint: str = "",
+    alignment_text: str = "",
+) -> tuple[str, ...]:
+    effective_language = lyric.language_hint or language_hint
+    for candidate in _lyric_timing_candidate_texts(lyric, alignment_text):
+        units = _timeline_units(candidate, language_hint=effective_language)
+        if units:
+            return tuple(units)
+    return ()
+
+
+def _lyric_segment_has_exact_unit_timings(
+    segment: VoiceSegment,
+    *,
+    language_hint: str = "",
+) -> bool:
+    effective_language = segment.language_hint or language_hint
+    expected_units = _lyric_expected_units(
+        segment,
+        language_hint=effective_language,
+        alignment_text=_lyric_forced_alignment_text(segment, language_hint=effective_language),
+    )
+    if not expected_units or len(segment.unit_timings) != len(expected_units):
+        return False
+    return all(
+        timing.end_seconds > timing.start_seconds
+        and "resampled" not in (timing.timing_source or "").lower()
+        for timing in segment.unit_timings
+    )
+
+
+def _coarse_unit_timings_for_lyric(
+    coarse: VoiceSegment,
+    lyric: VoiceSegment,
+    *,
+    language_hint: str = "",
+    alignment_text: str = "",
+) -> tuple[VoiceUnitTiming, ...]:
+    if not coarse.unit_timings:
+        return ()
+    effective_language = lyric.language_hint or language_hint
+    for candidate in _lyric_timing_candidate_texts(lyric, alignment_text):
+        expected_units = _timeline_units(candidate, language_hint=effective_language)
+        if not expected_units or len(expected_units) != len(coarse.unit_timings):
+            continue
+        return tuple(
+            VoiceUnitTiming(
+                position=index,
+                unit=unit,
+                start_seconds=timing.start_seconds,
+                end_seconds=timing.end_seconds,
+                confidence=timing.confidence,
+                timing_source=(
+                    f"{timing.timing_source}_retargeted_to_lyrics"
+                    if timing.timing_source
+                    else "coarse_unit_timing_retargeted_to_lyrics"
+                ),
+            )
+            for index, (unit, timing) in enumerate(zip(expected_units, coarse.unit_timings))
+        )
+    return ()
+
+
+def _lyric_timing_candidate_texts(
+    lyric: VoiceSegment,
+    alignment_text: str = "",
+) -> tuple[str, ...]:
+    candidate_texts: list[str] = []
+    for candidate in (lyric.alignment_text, alignment_text, lyric.text):
+        normalized = str(candidate or "").strip()
+        if normalized and normalized not in candidate_texts:
+            candidate_texts.append(normalized)
+    return tuple(candidate_texts)
+
+
+def _repair_missing_lyric_unit_timings_with_funasr(
+    lyrics_segments: Sequence[VoiceSegment],
+    funasr_segments: Sequence[TranscriptSegment],
+    *,
+    language_hint: str = "",
+) -> tuple[VoiceSegment, ...]:
+    effective_language = _normalize_cn_jp_language(language_hint)
+    if effective_language != "CN" or not lyrics_segments or not funasr_segments:
+        return tuple(lyrics_segments)
+
+    flat_timings = _flatten_exact_funasr_unit_timings(funasr_segments)
+    if not flat_timings:
+        return tuple(lyrics_segments)
+    flat_units = tuple(
+        _normalise_lyric_unit_for_match(timing.unit, language_hint=effective_language)
+        for timing in flat_timings
+    )
+
+    repaired: list[VoiceSegment] = []
+    for index, segment in enumerate(lyrics_segments):
+        segment_language = segment.language_hint or effective_language
+        if _lyric_segment_has_exact_unit_timings(segment, language_hint=segment_language):
+            repaired.append(segment)
+            continue
+
+        expected_units = _lyric_expected_units(
+            segment,
+            language_hint=segment_language,
+            alignment_text=_lyric_forced_alignment_text(segment, language_hint=segment_language),
+        )
+        if not expected_units:
+            repaired.append(segment)
+            continue
+
+        lower_bound = _previous_lyric_timing_end(lyrics_segments, index)
+        upper_bound = _next_lyric_timing_start(lyrics_segments, index)
+        if lower_bound is not None and upper_bound is not None and upper_bound < lower_bound:
+            upper_bound = None
+        match = _find_funasr_lyric_timing_sequence(
+            flat_timings,
+            flat_units,
+            expected_units,
+            language_hint=segment_language,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            fallback_anchor=segment.start_seconds,
+        )
+        if match is None:
+            repaired.append(segment)
+            continue
+
+        repaired_timings = tuple(
+            VoiceUnitTiming(
+                position=position,
+                unit=unit,
+                start_seconds=timing.start_seconds,
+                end_seconds=timing.end_seconds,
+                confidence=timing.confidence,
+                timing_source="funasr_lyrics_unit_alignment",
+            )
+            for position, (unit, timing) in enumerate(zip(expected_units, match))
+        )
+        repaired.append(
+            VoiceSegment(
+                start_seconds=min(timing.start_seconds for timing in repaired_timings),
+                end_seconds=max(timing.end_seconds for timing in repaired_timings),
+                text=segment.text,
+                confidence=segment.confidence,
+                speaker_id=segment.speaker_id,
+                timing_source="funasr_lyrics_unit_alignment",
+                unit_timings=repaired_timings,
+                language_hint=segment.language_hint,
+                alignment_text=segment.alignment_text,
+            )
+        )
+    return tuple(repaired)
+
+
+def _flatten_exact_funasr_unit_timings(
+    funasr_segments: Sequence[TranscriptSegment],
+) -> tuple[VoiceUnitTiming, ...]:
+    timings: list[VoiceUnitTiming] = []
+    for segment in funasr_segments:
+        for timing in segment.unit_timings:
+            source = (timing.timing_source or "").lower()
+            if "funasr" not in source or "resampled" in source:
+                continue
+            if not timing.unit or timing.end_seconds <= timing.start_seconds:
+                continue
+            timings.append(timing)
+    timings.sort(key=lambda timing: (timing.start_seconds, timing.end_seconds))
+    return tuple(timings)
+
+
+def _previous_lyric_timing_end(
+    segments: Sequence[VoiceSegment],
+    index: int,
+) -> float | None:
+    for segment in reversed(segments[:index]):
+        if segment.unit_timings:
+            return max(timing.end_seconds for timing in segment.unit_timings)
+        if segment.end_seconds > segment.start_seconds:
+            return segment.end_seconds
+    return None
+
+
+def _next_lyric_timing_start(
+    segments: Sequence[VoiceSegment],
+    index: int,
+) -> float | None:
+    for segment in segments[index + 1 :]:
+        if segment.unit_timings:
+            return min(timing.start_seconds for timing in segment.unit_timings)
+        if segment.end_seconds > segment.start_seconds:
+            return segment.start_seconds
+    return None
+
+
+def _find_funasr_lyric_timing_sequence(
+    flat_timings: Sequence[VoiceUnitTiming],
+    flat_units: Sequence[str],
+    expected_units: Sequence[str],
+    *,
+    language_hint: str = "",
+    lower_bound: float | None = None,
+    upper_bound: float | None = None,
+    fallback_anchor: float = 0.0,
+) -> tuple[VoiceUnitTiming, ...] | None:
+    if not flat_timings or not expected_units or len(flat_timings) < len(expected_units):
+        return None
+
+    expected_match_units = tuple(
+        _normalise_lyric_unit_for_match(unit, language_hint=language_hint)
+        for unit in expected_units
+    )
+    if any(not unit for unit in expected_match_units):
+        return None
+
+    tolerance = 0.08
+    match_length = len(expected_match_units)
+    candidates: list[tuple[float, float, tuple[VoiceUnitTiming, ...]]] = []
+    for start_index in range(0, len(flat_timings) - match_length + 1):
+        if tuple(flat_units[start_index : start_index + match_length]) != expected_match_units:
+            continue
+        match = tuple(flat_timings[start_index : start_index + match_length])
+        start_seconds = min(timing.start_seconds for timing in match)
+        end_seconds = max(timing.end_seconds for timing in match)
+        if end_seconds <= start_seconds:
+            continue
+        if lower_bound is not None and start_seconds < lower_bound - tolerance:
+            continue
+        if upper_bound is not None and end_seconds > upper_bound + tolerance:
+            continue
+        anchor = lower_bound if lower_bound is not None else fallback_anchor
+        anchor_distance = abs(start_seconds - anchor)
+        duration = end_seconds - start_seconds
+        candidates.append((anchor_distance, duration, match))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+    return candidates[0][2]
+
+
+def _normalise_lyric_unit_for_match(unit: str, *, language_hint: str = "") -> str:
+    units = _timeline_units(unit, language_hint=language_hint)
+    if len(units) == 1:
+        return units[0].casefold()
+    return _compact_bridge_text(unit).casefold()
+
+
 def _lyric_transcript_similarity(left: str, right: str, *, language_hint: str = "") -> float:
     text_score = text_similarity(left, right)
     phonetic_score = phonetic_similarity(left, right, language_hint=language_hint)
@@ -3728,6 +4379,14 @@ def _lyric_transcript_similarity(left: str, right: str, *, language_hint: str = 
 
 def _lyric_transcript_match_threshold(language_hint: str) -> float:
     return 0.42 if _normalize_cn_jp_language(language_hint) in {"CN", "JP"} else 0.30
+
+
+def _low_confidence_lyric_window_count(remaining_lyrics: int, remaining_transcripts: int) -> int:
+    if remaining_lyrics <= 0:
+        return 0
+    if remaining_transcripts <= 0:
+        return 1
+    return max(1, math.ceil(remaining_lyrics / remaining_transcripts))
 
 
 def _merge_transcript_segments(segments: Sequence[TranscriptSegment]) -> TranscriptSegment:
@@ -3753,6 +4412,49 @@ def _merge_transcript_segments(segments: Sequence[TranscriptSegment]) -> Transcr
         ),
         unit_timings=tuple(merged_timings),
     )
+
+
+def _split_low_confidence_transcript_segment_for_lyrics(
+    transcript: TranscriptSegment,
+    lyrics: Sequence[VoiceSegment],
+    *,
+    language_hint: str = "",
+) -> tuple[VoiceSegment, ...]:
+    if not lyrics:
+        return ()
+    if len(lyrics) == 1:
+        lyric = lyrics[0]
+        return (
+            VoiceSegment(
+                start_seconds=transcript.start_seconds,
+                end_seconds=transcript.end_seconds,
+                text=lyric.text,
+                confidence=transcript.confidence,
+                speaker_id=transcript.speaker_id,
+                timing_source="lyrics_coarse_low_confidence_window",
+                language_hint=lyric.language_hint or language_hint,
+            ),
+        )
+
+    weights = [
+        max(len(_timeline_units(lyric.text, language_hint=lyric.language_hint or language_hint)), 1)
+        for lyric in lyrics
+    ]
+    boundaries = _weighted_boundaries(transcript.start_seconds, transcript.end_seconds, weights)
+    result: list[VoiceSegment] = []
+    for index, lyric in enumerate(lyrics):
+        result.append(
+            VoiceSegment(
+                start_seconds=boundaries[index],
+                end_seconds=boundaries[index + 1],
+                text=lyric.text,
+                confidence=transcript.confidence,
+                speaker_id=transcript.speaker_id,
+                timing_source="lyrics_coarse_low_confidence_window",
+                language_hint=lyric.language_hint or language_hint,
+            )
+        )
+    return tuple(result)
 
 
 def _split_transcript_segment_for_lyrics(
@@ -3840,10 +4542,30 @@ def _segments_from_transcript_with_notes(
     *,
     lyrics_file: Path | None = None,
     language_hint: str = "",
+    prealigned_lyrics: Sequence[VoiceSegment] | None = None,
 ) -> tuple[tuple[VoiceSegment, ...], tuple[str, ...]]:
     if lyrics_file is not None:
         lyric_segments = parse_lyrics_file(lyrics_file)
         if lyric_segments:
+            if prealigned_lyrics:
+                prealigned = tuple(prealigned_lyrics)
+                if len(prealigned) == len(lyric_segments):
+                    exact_count = sum(
+                        1
+                        for segment in prealigned
+                        if len(segment.unit_timings)
+                        == len(
+                            _timeline_units(
+                                segment.text,
+                                language_hint=segment.language_hint or language_hint,
+                            )
+                        )
+                    )
+                    return prealigned, (
+                        "lyrics_forced_alignment: "
+                        f"aligned_lyrics={len(prealigned)}/{len(lyric_segments)}; "
+                        f"exact_unit_timing_lines={exact_count}/{len(prealigned)}",
+                    )
             if segments:
                 alignment = _align_lyrics_to_transcript_segments(
                     lyric_segments,
@@ -4551,6 +5273,7 @@ def _render_timeline_alignment_details(
                 end_unit = unit_count
             else:
                 end_unit = start_unit + material_units
+            end_unit = min(max(end_unit, start_unit + 1), unit_count)
 
             span_units = max(min(end_unit, unit_count) - start_unit, 1)
             timed_span = _timed_unit_span(
@@ -4584,8 +5307,9 @@ def _render_timeline_alignment_details(
                 )
             )
             language_hint = decision.language_hint or segment.language_hint
-            reference_text_units = list(_timeline_units(segment.text, language_hint=language_hint))
-            reference_phonetic_units = list(_phonetic_units(segment.text, language_hint=language_hint))
+            reference_timeline_text = _segment_timeline_text(segment)
+            reference_text_units = list(_timeline_units(reference_timeline_text, language_hint=language_hint))
+            reference_phonetic_units = list(_phonetic_units(reference_timeline_text, language_hint=language_hint))
             material_text = decision.material_text or decision_path.stem
             material_text_units = list(_timeline_units(material_text, language_hint=language_hint))
             material_phonetic_units = list(_phonetic_units(material_text, language_hint=language_hint))
@@ -4595,6 +5319,7 @@ def _render_timeline_alignment_details(
                 "source_filename": decision_path.name,
                 "reference_segment_index": segment_index,
                 "reference_segment_text": segment.text,
+                "reference_alignment_text": segment.alignment_text,
                 "reference_text_units": reference_text_units,
                 "reference_phonetic_units": reference_phonetic_units,
                 "source_filename_units": list(_timeline_units(decision_path.stem, language_hint=language_hint)),
@@ -4655,14 +5380,16 @@ def _render_timeline_alignment_details(
         )
         material_text = decision.material_text or decision_path.stem
         language_hint = decision.language_hint or (segment.language_hint if segment is not None else "")
+        reference_timeline_text = _segment_timeline_text(segment) if segment is not None else ""
         details[decision_index] = {
             "rank": decision.rank,
             "source_path": str(decision_path),
             "source_filename": decision_path.name,
             "reference_segment_index": decision.reference_segment_index,
             "reference_segment_text": segment.text if segment is not None else "",
-            "reference_text_units": list(_timeline_units(segment.text, language_hint=language_hint)) if segment is not None else [],
-            "reference_phonetic_units": list(_phonetic_units(segment.text, language_hint=language_hint)) if segment is not None else [],
+            "reference_alignment_text": segment.alignment_text if segment is not None else "",
+            "reference_text_units": list(_timeline_units(reference_timeline_text, language_hint=language_hint)) if segment is not None else [],
+            "reference_phonetic_units": list(_phonetic_units(reference_timeline_text, language_hint=language_hint)) if segment is not None else [],
             "source_filename_units": list(_timeline_units(decision_path.stem, language_hint=language_hint)),
             "source_filename_phonetic_units": list(_phonetic_units(decision_path.stem, language_hint=language_hint)),
             "material_text": decision.material_text,
@@ -4675,7 +5402,7 @@ def _render_timeline_alignment_details(
             "phonetic_tone_position": decision.phonetic_tone_position,
             "phonetic_tone_position_count": decision.phonetic_tone_position_count,
             "phonetic_span_units": decision.phonetic_span_units,
-            "reference_segment_unit_count": len(_timeline_units(segment.text, language_hint=language_hint)) if segment is not None else 0,
+            "reference_segment_unit_count": len(_timeline_units(reference_timeline_text, language_hint=language_hint)) if segment is not None else 0,
             "position_unit_start": None,
             "position_unit_end": None,
             "position_unit_span": None,
@@ -4793,6 +5520,7 @@ def _positioned_target_durations(
                 end_unit = unit_count
             else:
                 end_unit = start_unit + material_units
+            end_unit = min(max(end_unit, start_unit + 1), unit_count)
 
             span_units = max(min(end_unit, unit_count) - start_unit, 1)
             timed_span = _timed_unit_span(
@@ -4961,7 +5689,14 @@ def _positioned_group_unit_count(
         if position is None:
             continue
         max_end = max(max_end, max(int(position), 0) + _decision_timeline_unit_count(decision))
-    return max(len(_timeline_units(segment.text, language_hint=segment.language_hint)), max_end, 1)
+    timeline_unit_count = len(_timeline_units(_segment_timeline_text(segment), language_hint=segment.language_hint))
+    if segment.unit_timings:
+        return max(timeline_unit_count, 1)
+    return max(timeline_unit_count, max_end, 1)
+
+
+def _segment_timeline_text(segment: VoiceSegment) -> str:
+    return segment.alignment_text.strip() or segment.text
 
 
 def _positioned_group_covers_segment(
