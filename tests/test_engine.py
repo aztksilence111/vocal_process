@@ -769,6 +769,33 @@ class MaterialAssemblyTests(unittest.TestCase):
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["quality_warning"], "moderate_stretch_ratio")
 
+    def test_utau_oto_tiny_target_keeps_faded_direct_trim_without_boundary_warning(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "shi.wav"
+            _write_test_wave(reference, duration_seconds=0.02)
+            _write_test_wave(material, duration_seconds=0.35)
+            (root / "oto.ini").write_text(
+                "shi.wav=,0,220,0,132,46\n",
+                encoding="utf-8",
+            )
+
+            clips = plan_material_stretch_clips(
+                reference,
+                [material],
+                target_durations=[0.02],
+                material_text_hints=["shi"],
+            )
+
+        self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
+        self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.039, places=5)
+        self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 1.95, places=5)
+        self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
+        self.assertEqual(clips[0].stretch_backend, "rubberband")
+        self.assertEqual(clips[0].quality_warning, "")
+        self.assertEqual(clips[0].continuity_warning, "")
+
     def test_utau_oto_mid_short_target_window_avoids_extreme_compression_warning(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

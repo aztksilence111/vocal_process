@@ -133,6 +133,7 @@ MATERIAL_RENDER_TINY_FADE_SECONDS = 0.004
 MATERIAL_RENDER_TINY_FADE_TARGET_FRACTION = 0.18
 MATERIAL_RENDER_TINY_MIN_FADE_TARGET_SECONDS = 0.006
 MATERIAL_RENDER_TINY_TARGET_SECONDS = 0.035
+MATERIAL_RENDER_DIRECT_TRIM_BOUNDARY_SAFE_TARGET_SECONDS = 0.015
 MATERIAL_RENDER_TINY_SOURCE_SECONDS = 0.035
 MATERIAL_RENDER_SHORT_REGION_DIRECT_TRIM_SECONDS = 0.035
 MATERIAL_RENDER_SHORT_REGION_FALLBACK_SECONDS = 0.150
@@ -1540,7 +1541,14 @@ def plan_material_stretch_clips(
                     }
                     and stretch_backend == "rubberband",
                 ),
-                continuity_warning=_stretch_continuity_warning(render_requested_tempo, text_hint),
+                continuity_warning=_stretch_continuity_warning(
+                    render_requested_tempo,
+                    text_hint,
+                    stretch_strategy=strategy,
+                    source_window_duration=source_window_duration,
+                    target_duration=audible_target_duration,
+                    fade_seconds=_material_clip_fade_seconds(audible_target_duration),
+                ),
                 phoneme_regions=phoneme_regions,
                 stretch_backend=stretch_backend,
                 rubberband_profile=rubberband_profile,
@@ -3020,9 +3028,31 @@ def _stretch_naturalness_score_with_fill_mode(
     return max(min(score, 1.0), 0.0)
 
 
-def _stretch_continuity_warning(requested_tempo: float, text_hint: str = "") -> str:
+def _stretch_continuity_warning(
+    requested_tempo: float,
+    text_hint: str = "",
+    *,
+    stretch_strategy: str = "",
+    source_window_duration: float | None = None,
+    target_duration: float | None = None,
+    fade_seconds: float = 0.0,
+) -> str:
     if requested_tempo <= 0:
         return "invalid_stretch_ratio"
+    if (
+        stretch_strategy == "tiny_target_direct_trim"
+        and _is_short_material_text(text_hint)
+        and source_window_duration is not None
+        and source_window_duration > 0
+        and target_duration is not None
+        and target_duration > MATERIAL_RENDER_DIRECT_TRIM_BOUNDARY_SAFE_TARGET_SECONDS
+        and source_window_duration
+        <= target_duration * MATERIAL_SHORT_TEXT_COMPRESSED_SOURCE_WINDOW_MAX_RATIO
+        and fade_seconds >= MATERIAL_RENDER_MIN_FADE_SECONDS
+    ):
+        # A bounded UTAU source window plus edge fades avoids the stretch
+        # discontinuity this warning is intended to identify.
+        return ""
     ratio = max(requested_tempo, 1.0 / requested_tempo)
     if _is_short_material_text(text_hint) and ratio >= 2.0:
         return "single_syllable_boundary_risk"

@@ -1819,3 +1819,23 @@ Residual risk:
 
 1. Both fresh renders still have non-blocking moderate stretch and boundary warnings. CN has `65` moderate stretch and `111` moderate boundary warnings; JP has `314` moderate stretch and `320` moderate boundary warnings plus `12` single-syllable boundary warnings.
 2. The strict automated gate now confirms ordering/timing/render integrity, but manual listening is still required for consonant preservation, boundary smoothness, and perceived pronunciation quality.
+
+### 2026-08-18: Short Direct-Trim Boundary Warning Refinement
+
+1. Tested replacing 15-35 ms UTAU-window direct trims with short-material `atempo`. The replay changed 68 CN clips and 61 JP clips, but did not produce a consistent audio improvement; the experiment is rejected.
+2. The final code keeps the proven direct-trim audio path and refines only `_stretch_continuity_warning`. The planner now passes the selected strategy, source-window duration, audible target duration, and fade duration into the warning decision.
+3. A `tiny_target_direct_trim` clip avoids the boundary-risk warning only when it is short vocal material, has a bounded source window no longer than `1.95x` the audible target, has the minimum edge fade, and the target is above the 15 ms extreme-trim floor. No-source-window, over-wide-window, and sub-15 ms clips retain their warnings.
+4. Added a regression using a real `oto.ini` source window. It confirms the clip remains direct-trimmed, keeps the quality warning empty, and no longer reports a false boundary warning. The existing no-source-window tone-number test remains conservative.
+
+Verification:
+
+1. Full `.venv311\Scripts\python.exe -m unittest discover -s tests` passed with `226` tests; the focused material suite passed with `36` tests.
+2. `.venv311\Scripts\python.exe -m compileall -q audio_processor tests` passed.
+3. `.venv311\Scripts\python.exe -m audio_processor check` passed with FFmpeg, Signalsmith, WhisperX, FunASR, Janome, and local model caches available.
+4. Replanning the accepted v14 CN/JP ordering and exact timings with the final warning policy produced `43` CN continuity warnings (`18` moderate plus `25` single-syllable) and `271` JP continuity warnings (`259` moderate plus `12` single-syllable). Exact timing inputs and audio rendering behavior remain unchanged.
+5. A fresh full CN v15 real-eval attempt was blocked by WhisperX alignment model access: `tests_real\output\cn-jp-topology-fix-20260817\cn-render-v15\reports\real-eval-20260818-125954\summary.json` records `asr_model_download_failed` from repeated Hugging Face HTTP 502 responses and an incomplete local processor snapshot. It is infrastructure evidence, not acceptance evidence.
+6. The v14 strict render reports remain the accepted CN/JP audio evidence. The v15 replay folders contain the rejected atempo experiment and should not replace v14 for manual acceptance.
+
+Remaining architecture priority:
+
+Implement a source-aware, sample-level boundary smoother only if it can be evaluated against exact clip-boundary measurements without changing the authoritative timeline or phonetic ordering.

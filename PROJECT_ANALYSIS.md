@@ -2181,3 +2181,25 @@ Evidence:
 Next architecture priority:
 
 Continue improving source-window and boundary planning for very short CN/JP units while preserving the current ordering invariant: local phonetic identity is authoritative, exact original-vocal unit timing is authoritative for the time axis, and stretch quality is reported separately rather than hidden inside match confidence.
+
+### Short Direct-Trim Boundary Warning Refinement (2026-08-18)
+
+The short-target review separated audio behavior from warning classification. Replacing direct trims with `atempo` for 15-35 ms UTAU windows was tested by replaying the accepted CN and JP ordering/timing metadata. It changed 68 CN clips and 61 JP clips, but the output-level jump metrics were effectively unchanged and several clip-boundary samples worsened. That replacement is rejected.
+
+The retained policy is conservative:
+
+1. Keep `tiny_target_direct_trim` for the existing short-target path. This preserves the v14 audio behavior and exact target durations.
+2. Pass render strategy and boundary-conditioning metadata into `_stretch_continuity_warning`.
+3. Suppress the warning only for short vocal material with a source window bounded to `1.95x` the audible target, a minimum edge fade, and an audible target above `0.015 s`.
+4. Preserve warnings for unbounded direct trims, source windows wider than the compressed-window policy, and targets at or below `0.015 s`.
+
+This is a reporting correction, not a claim that all tiny clips are perceptually safe. It reduces conservative false positives after the source window and fades have already conditioned the clip, while keeping the strict timing gate and audio path unchanged.
+
+Evidence:
+
+1. Replanning the accepted CN v14 ordering produced `43` continuity warnings: `18` moderate and `25` single-syllable. The prior v14 report had `111` continuity warnings.
+2. Replanning the accepted JP v14 ordering produced `271` continuity warnings: `259` moderate and `12` single-syllable. The prior v14 report had `320` continuity warnings.
+3. Full tests pass with `226` tests, the focused material suite passes with `36`, compileall passes, and `audio_processor check` passes.
+4. The attempted full CN v15 real-eval was blocked by WhisperX/Hugging Face alignment-model access and is not used as algorithm acceptance. The accepted v14 render reports remain authoritative for CN/JP audio and strict timing.
+
+Next work should measure actual adjacent-clip boundary samples and only then introduce a sample-level smoothing operation. Do not weaken exact unit timing, local phonetic identity, or strict render blockers to reduce warning counts.
