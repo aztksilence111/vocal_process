@@ -83,6 +83,9 @@ class MaterialStretchClip:
     source_window_start_seconds: float = 0.0
     source_window_duration_seconds: float | None = None
     source_window_source: str = ""
+    source_window_repair: str = ""
+    source_window_repair_shift_seconds: float = 0.0
+    source_window_voiced_overlap_ratio: float = 0.0
     quality_warning: str = ""
     requested_tempo: float | None = None
     stretch_strategy: str = "rubberband_full_clip"
@@ -104,6 +107,16 @@ class _UtauOtoEntry:
     cutoff_ms: float
     preutterance_ms: float
     overlap_ms: float
+
+
+@dataclass(frozen=True)
+class _SourceWindowPlan:
+    start_seconds: float
+    duration_seconds: float | None
+    source: str
+    repair: str = ""
+    repair_shift_seconds: float = 0.0
+    voiced_overlap_ratio: float = 0.0
 
 
 SUPPORTED_AUDIO_EXTENSIONS = {
@@ -172,7 +185,7 @@ MATERIAL_SOURCE_WINDOW_ANALYSIS_RELATIVE_DB = 32.0
 MATERIAL_SOURCE_WINDOW_ANALYSIS_ABSOLUTE_FLOOR = 0.003
 MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS = 0.025
 MATERIAL_RENDER_COHERENT_MONO_FILTER = "aformat=channel_layouts=mono"
-MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_mono_atempo_chain_utau_oto_vowel_core_v1"
+MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_mono_atempo_chain_utau_oto_vowel_core_v2"
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -1442,12 +1455,15 @@ def plan_material_stretch_clips(
             text_hint,
         )
         post_silence_seconds = max(target_duration - pre_silence - audible_target_duration, 0.0)
-        source_window_start, source_window_duration, source_window_source = _source_window_for_render(
+        source_window = _source_window_for_render(
             path,
             source_duration,
             audible_target_duration,
             text_hint,
         )
+        source_window_start = source_window.start_seconds
+        source_window_duration = source_window.duration_seconds
+        source_window_source = source_window.source
         render_source_duration = source_window_duration or source_duration
         render_requested_tempo = render_source_duration / audible_target_duration
         tempo, strategy = _resolve_stretch_strategy(
@@ -1522,6 +1538,9 @@ def plan_material_stretch_clips(
                 source_window_start_seconds=source_window_start,
                 source_window_duration_seconds=source_window_duration,
                 source_window_source=source_window_source,
+                source_window_repair=source_window.repair,
+                source_window_repair_shift_seconds=source_window.repair_shift_seconds,
+                source_window_voiced_overlap_ratio=source_window.voiced_overlap_ratio,
                 quality_warning=(
                     ""
                     if strategy == "tiny_target_direct_trim"
@@ -1574,6 +1593,9 @@ def render_material_stretch_plan(clips: Sequence[MaterialStretchClip]) -> list[d
             "source_window_start_seconds": clip.source_window_start_seconds,
             "source_window_duration_seconds": clip.source_window_duration_seconds,
             "source_window_source": clip.source_window_source,
+            "source_window_repair": clip.source_window_repair,
+            "source_window_repair_shift_seconds": clip.source_window_repair_shift_seconds,
+            "source_window_voiced_overlap_ratio": clip.source_window_voiced_overlap_ratio,
             "rubberband_tempo": clip.tempo,
             "requested_rubberband_tempo": clip.requested_tempo if clip.requested_tempo is not None else clip.tempo,
             "timeline_requested_tempo": (
@@ -1633,6 +1655,8 @@ def _stretch_boundary_conditioning(clip: MaterialStretchClip) -> str:
     extras = []
     if source_window:
         extras.append("source_window_trim")
+    if clip.source_window_repair:
+        extras.append(clip.source_window_repair)
     if padding:
         extras.append("tempo_safe_silence_pad")
     if clip.stretch_strategy == "syllable_vowel_core_stretch":
@@ -2711,10 +2735,19 @@ def _source_window_for_render(
     source_duration: float,
     target_duration: float,
     text_hint: str,
-) -> tuple[float, float | None, str]:
+) -> _SourceWindowPlan:
     oto_window = _utau_oto_source_window(path, source_duration, target_duration, text_hint)
     if oto_window is not None:
-        return oto_window
+        start, duration, source = oto_window
+        return _refine_short_material_source_window(
+            path,
+            source_duration,
+            target_duration,
+            text_hint,
+            start,
+            duration,
+            source,
+        )
 
     if (
         source_duration <= 0
@@ -2723,12 +2756,20 @@ def _source_window_for_render(
         or target_duration < MATERIAL_RENDER_MIN_CONSONANT_SAFE_TARGET_SECONDS
         or source_duration / target_duration < MATERIAL_SHORT_TEXT_SOURCE_WINDOW_TRIM_RATIO
     ):
-        return 0.0, None, ""
+        return _SourceWindowPlan(0.0, None, "")
 
     active_start, active_end = _detect_active_audio_window(path, source_duration)
     active_duration = max(active_end - active_start, 0.0)
     if active_duration <= target_duration + 0.0005:
-        return active_start, active_duration if active_start > 0.0005 else None, "active_rms"
+        return _refine_short_material_source_window(
+            path,
+            source_duration,
+            target_duration,
+            text_hint,
+            active_start,
+            active_duration if active_start > 0.0005 else None,
+            "active_rms",
+        )
 
     short_window_limit = _short_text_compression_source_window_limit(target_duration, text_hint)
     minimum_window = MATERIAL_SHORT_TEXT_SOURCE_WINDOW_MIN_SECONDS
@@ -2746,8 +2787,16 @@ def _source_window_for_render(
     if short_window_limit is not None:
         window_duration = min(window_duration, short_window_limit)
     if window_duration >= source_duration - 0.0005 and active_start <= 0.0005:
-        return 0.0, None, ""
-    return active_start, window_duration, "active_rms"
+        return _SourceWindowPlan(0.0, None, "")
+    return _refine_short_material_source_window(
+        path,
+        source_duration,
+        target_duration,
+        text_hint,
+        active_start,
+        window_duration,
+        "active_rms",
+    )
 
 
 def _utau_oto_source_window(
@@ -2799,6 +2848,112 @@ def _utau_oto_source_window(
     if start <= 0.0005 and duration >= source_duration - 0.0005:
         return None
     return start, duration, "utau_oto_ini"
+
+
+def _refine_short_material_source_window(
+    path: Path,
+    source_duration: float,
+    target_duration: float,
+    text_hint: str,
+    start_seconds: float,
+    duration_seconds: float | None,
+    source: str,
+) -> _SourceWindowPlan:
+    start_seconds = max(float(start_seconds or 0.0), 0.0)
+    duration_seconds = None if duration_seconds is None else max(float(duration_seconds), 0.0)
+    if (
+        duration_seconds is None
+        or duration_seconds <= MIN_MATERIAL_TARGET_DURATION_SECONDS
+        or source_duration <= 0
+        or target_duration <= MIN_MATERIAL_TARGET_DURATION_SECONDS
+        or not _is_short_material_text(text_hint)
+        or source not in {"utau_oto_ini", "active_rms"}
+    ):
+        return _SourceWindowPlan(start_seconds, duration_seconds, source)
+
+    try:
+        profile = analyze_vowel_consonant_profile(
+            path,
+            duration_seconds=source_duration,
+            text_hint=text_hint,
+        )
+    except Exception:
+        return _SourceWindowPlan(start_seconds, duration_seconds, source)
+
+    if profile.confidence < 0.35:
+        return _SourceWindowPlan(start_seconds, duration_seconds, source)
+
+    voiced_start = max(float(profile.vowel_start_seconds), 0.0)
+    voiced_end = min(max(float(profile.vowel_end_seconds), voiced_start), source_duration)
+    voiced_duration = max(voiced_end - voiced_start, 0.0)
+    if voiced_duration <= MIN_MATERIAL_TARGET_DURATION_SECONDS:
+        return _SourceWindowPlan(start_seconds, duration_seconds, source)
+
+    attack_duration = voiced_start
+    coda_duration = max(source_duration - voiced_end, 0.0)
+    if max(attack_duration, coda_duration) <= 0.004:
+        return _SourceWindowPlan(start_seconds, duration_seconds, source)
+
+    current_end = min(start_seconds + duration_seconds, source_duration)
+    if current_end <= start_seconds:
+        return _SourceWindowPlan(start_seconds, duration_seconds, source)
+
+    profile_start = max(voiced_start - MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS, 0.0)
+    profile_end = min(voiced_end + MATERIAL_SOURCE_WINDOW_MARGIN_SECONDS, source_duration)
+    profile_duration = max(profile_end - profile_start, 0.0)
+    if profile_duration <= MIN_MATERIAL_TARGET_DURATION_SECONDS:
+        return _SourceWindowPlan(start_seconds, duration_seconds, source)
+
+    current_overlap = max(min(current_end, profile_end) - max(start_seconds, profile_start), 0.0)
+    current_coverage = current_overlap / profile_duration
+    current_voiced_overlap = max(
+        min(current_end, voiced_end) - max(start_seconds, voiced_start),
+        0.0,
+    ) / voiced_duration
+    if current_coverage >= 0.92:
+        return _SourceWindowPlan(
+            start_seconds,
+            duration_seconds,
+            source,
+            voiced_overlap_ratio=current_voiced_overlap,
+        )
+
+    desired_center = ((voiced_start + voiced_end) / 2.0) - (duration_seconds / 2.0)
+    if voiced_duration <= duration_seconds * 1.20:
+        desired_start = desired_center
+    else:
+        # When the voiced core is much longer than the bounded short window,
+        # keep a small onset anchor instead of centering on a vowel-only slice.
+        desired_start = voiced_start - duration_seconds * 0.25
+    desired_start = min(
+        max(desired_start, 0.0),
+        max(source_duration - duration_seconds, 0.0),
+    )
+    desired_end = min(desired_start + duration_seconds, source_duration)
+    desired_overlap = max(min(desired_end, profile_end) - max(desired_start, profile_start), 0.0)
+    desired_coverage = desired_overlap / profile_duration
+    desired_voiced_overlap = max(
+        min(desired_end, voiced_end) - max(desired_start, voiced_start),
+        0.0,
+    ) / voiced_duration
+    shift_seconds = desired_start - start_seconds
+    if desired_coverage <= current_coverage + 0.02 or abs(shift_seconds) < 0.002:
+        return _SourceWindowPlan(
+            start_seconds,
+            duration_seconds,
+            source,
+            voiced_overlap_ratio=current_voiced_overlap,
+        )
+
+    repair = "voiced_core_repair"
+    return _SourceWindowPlan(
+        desired_start,
+        duration_seconds,
+        source,
+        repair=repair,
+        repair_shift_seconds=shift_seconds,
+        voiced_overlap_ratio=desired_voiced_overlap,
+    )
 
 
 def _utau_oto_entry_for_path(path: Path, text_hint: str = "") -> _UtauOtoEntry | None:

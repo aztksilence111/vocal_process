@@ -1839,3 +1839,33 @@ Verification:
 Remaining architecture priority:
 
 Implement a source-aware, sample-level boundary smoother only if it can be evaluated against exact clip-boundary measurements without changing the authoritative timeline or phonetic ordering.
+
+### 2026-08-18: Manual Listening Feedback And Shutdown Checkpoint
+
+The user manually listened to the latest real output and reported that roughly 60-70% of ordering/character selection is correct, but missing characters, wrong characters, and overly short pronunciations remain.
+
+This continuation confirmed a concrete missing-character mechanism in JP/MGRoid: `sai.wav` (`sa+i`) could start at the last `sa` unit of one lyric segment, cross the global lattice boundary, and later be clipped to one local unit by timeline reporting. The selector now rejects compound candidates and fallback materials whose phonetic span crosses a lyric segment boundary, while preserving same-segment multi-unit phrases.
+
+Focused verification passed:
+
+- 3 targeted unittest cases, including the new JP boundary regression and the existing same-segment compound/timeline clipping regressions.
+- Targeted `compileall`.
+- `git diff --check` with only existing line-ending warnings.
+
+No background Python, FFmpeg, or Rubber Band processes remained running. The short-pronunciation investigation is intentionally not finished: the live JP report shows segments 29-36 with `11-16` mora units compressed into `0.350-0.583 s`, producing many `0.023-0.040 s` exact active targets. The next implementation must measure source-window and adjacent-boundary preservation without changing the authoritative timeline or phonetic identity rules.
+
+### 2026-08-19: Source-Aware Short-Window Repair And Segment Boundary Guard
+
+Implemented the next bounded repair for short vocal material. UTAU `oto.ini` and active-RMS source windows are now optionally refined using a confident acoustic voiced-core profile. The repair can shift the source window while preserving its duration and the authoritative reference timeline; it records `voiced_core_repair`, the shift amount, and the voiced-core overlap ratio instead of silently changing timing. The render cache identity was bumped to `..._v2` because source-window starts are part of the rendered result.
+
+The phonetic ordering layer also now rejects compound material and fallback candidates whose unit span crosses a lyric segment boundary. Same-segment compound phrases remain allowed, while a cross-segment `sai` candidate is replaced by `sa` and `i` when both are available.
+
+Validation passed:
+
+- Full `.venv311\Scripts\python.exe -m unittest discover -s tests`: `228` tests.
+- `compileall`, `audio_processor check`, focused material/model/timeline tests, and `git diff --check`.
+- Real MGRoid short-window smoke: exact `0.045011 s` mono output with bounded `utau_oto_ini` source selection and `voiced_core_repair` diagnostics.
+- Fresh CN real evaluation `cn-render-v15-source-window`: strict pass `1/1`, exact target duration ratio `1.0`, resampled timing ratio `0.0`, match ordering `0.899127`, rendered alignment `0.963056`.
+- Fresh JP/MGRoid real evaluation `jp-render-v15-source-window`: strict pass `1/1`, exact target duration ratio `1.0`, resampled timing ratio `0.0`, match ordering `0.836873`, rendered alignment `0.930594`, continuity warning ratio `0.517110`.
+
+The fresh JP result improves reported continuity risk versus v14 but does not prove that all short pronunciations sound natural; manual listening remains required. The real-eval `summary.md` is readable, while the generated `summary.json` still contains malformed mojibake/quoting in some entries and is not reliable for machine parsing. This is retained as a report-serialization follow-up, not treated as an algorithm acceptance failure.

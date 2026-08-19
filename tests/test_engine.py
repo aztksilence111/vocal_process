@@ -696,10 +696,13 @@ class MaterialAssemblyTests(unittest.TestCase):
 
             self.assertAlmostEqual(clips[0].source_window_start_seconds, 0.0)
             self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.24, places=2)
+            self.assertEqual(clips[0].source_window_repair, "")
+            self.assertAlmostEqual(clips[0].source_window_voiced_overlap_ratio, 0.0)
             self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 1.2, places=2)
             self.assertEqual(clips[0].quality_warning, "")
             rendered = render_material_stretch_plan(clips)
             self.assertAlmostEqual(rendered[0]["source_window_duration_seconds"] or 0.0, 0.24, places=2)
+            self.assertEqual(rendered[0]["source_window_repair"], "")
 
             args = build_material_clip_args(
                 material,
@@ -739,8 +742,10 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
         self.assertAlmostEqual(clips[0].source_window_start_seconds, 0.001, places=3)
         self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.231, places=3)
+        self.assertEqual(clips[0].source_window_repair, "")
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["source_window_source"], "utau_oto_ini")
+        self.assertEqual(rendered[0]["source_window_repair"], "")
 
     def test_utau_oto_short_target_window_avoids_extreme_compression_warning(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -763,11 +768,55 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
         self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.08775, places=5)
+        self.assertEqual(clips[0].source_window_repair, "")
         self.assertLess(clips[0].requested_tempo or 0.0, 2.0)
         self.assertEqual(clips[0].quality_warning, "moderate_stretch_ratio")
         self.assertEqual(clips[0].continuity_warning, "moderate_boundary_risk")
         rendered = render_material_stretch_plan(clips)
         self.assertEqual(rendered[0]["quality_warning"], "moderate_stretch_ratio")
+        self.assertEqual(rendered[0]["source_window_repair"], "")
+
+    def test_utau_oto_short_window_recenters_on_voiced_core_when_metadata_starts_too_early(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material = root / "shi.wav"
+            _write_test_wave(reference, duration_seconds=0.045)
+            _write_windowed_tone_wave(
+                material,
+                leading_silence_seconds=0.18,
+                tone_seconds=0.09,
+                trailing_silence_seconds=0.08,
+            )
+            (root / "oto.ini").write_text(
+                "shi.wav=,0,220,0,132,46\n",
+                encoding="utf-8",
+            )
+            profile = VowelConsonantProfile(
+                vowel_start_seconds=0.18,
+                vowel_end_seconds=0.27,
+                detection_source="librosa_voiced_f0",
+                confidence=0.9,
+                voiced_ratio=0.7,
+            )
+            with patch("audio_processor.engine.analyze_vowel_consonant_profile", return_value=profile):
+                clips = plan_material_stretch_clips(
+                    reference,
+                    [material],
+                    target_durations=[0.045],
+                    material_text_hints=["shi"],
+                )
+
+        self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
+        self.assertEqual(clips[0].source_window_repair, "voiced_core_repair")
+        self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.08775, places=5)
+        self.assertGreater(clips[0].source_window_start_seconds, 0.15)
+        self.assertGreater(clips[0].source_window_repair_shift_seconds, 0.15)
+        self.assertGreater(clips[0].source_window_voiced_overlap_ratio, 0.85)
+        rendered = render_material_stretch_plan(clips)
+        self.assertEqual(rendered[0]["source_window_source"], "utau_oto_ini")
+        self.assertEqual(rendered[0]["source_window_repair"], "voiced_core_repair")
+        self.assertIn("voiced_core_repair", rendered[0]["boundary_conditioning"])
 
     def test_utau_oto_tiny_target_keeps_faded_direct_trim_without_boundary_warning(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -790,6 +839,7 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
         self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.039, places=5)
+        self.assertEqual(clips[0].source_window_repair, "")
         self.assertAlmostEqual(clips[0].requested_tempo or 0.0, 1.95, places=5)
         self.assertEqual(clips[0].stretch_strategy, "tiny_target_direct_trim")
         self.assertEqual(clips[0].stretch_backend, "rubberband")
@@ -817,6 +867,7 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertEqual(clips[0].source_window_source, "utau_oto_ini")
         self.assertAlmostEqual(clips[0].source_window_duration_seconds or 0.0, 0.39, places=5)
+        self.assertEqual(clips[0].source_window_repair, "")
         self.assertLess(clips[0].requested_tempo or 0.0, 2.0)
         self.assertEqual(clips[0].quality_warning, "moderate_stretch_ratio")
 
@@ -861,6 +912,7 @@ class MaterialAssemblyTests(unittest.TestCase):
 
         self.assertGreater(clips[0].source_window_start_seconds, 0.0)
         self.assertIsNotNone(clips[0].source_window_duration_seconds)
+        self.assertEqual(clips[0].source_window_repair, "")
         self.assertEqual(clips[0].stretch_strategy, "rubberband_full_clip")
         self.assertEqual(clips[0].stretch_backend, "atempo")
         self.assertEqual(clips[0].phoneme_regions, ())
@@ -3883,6 +3935,24 @@ class ModelAssistTests(unittest.TestCase):
         self.assertEqual(first.phonetic_span_units, 2)
         self.assertEqual(second.phonetic_span_units, 1)
 
+    def test_reference_sequence_does_not_cross_japanese_segment_boundary_with_compound_material(self) -> None:
+        plan = plan_material_ordering(
+            [
+                VoiceSegment(0.0, 0.5, "\u3055", language_hint="JP"),
+                VoiceSegment(0.5, 1.0, "\u3044", language_hint="JP"),
+            ],
+            [
+                MaterialAnalysis(Path("sai.wav"), transcript="", filename_text="sai", duration_seconds=0.4, language_hint="JP"),
+                MaterialAnalysis(Path("sa.wav"), transcript="", filename_text="sa", duration_seconds=0.2, language_hint="JP"),
+                MaterialAnalysis(Path("i.wav"), transcript="", filename_text="i", duration_seconds=0.2, language_hint="JP"),
+            ],
+        )
+
+        self.assertEqual([decision.material_path.name for decision in plan.decisions], ["sa.wav", "i.wav"])
+        self.assertEqual([decision.reference_segment_index for decision in plan.decisions], [0, 1])
+        self.assertEqual([decision.phonetic_position for decision in plan.decisions], [0, 0])
+        self.assertNotIn("sai.wav", [decision.material_path.name for decision in plan.decisions])
+
     def test_compact_phonetic_match_keeps_per_position_span_and_rejects_cross_unit_single_syllable(self) -> None:
         self.assertEqual(
             model_assist._phonetic_position_spans_for_units(
@@ -4942,6 +5012,8 @@ class ModelRuntimeTests(unittest.TestCase):
         self.assertEqual(report["summary"]["continuity_warning_count"], 1)
         self.assertEqual(report["summary"]["fade_applied_clip_count"], 1)
         self.assertAlmostEqual(report["summary"]["stretch_naturalness_score_mean"] or 0.0, 0.48)
+        self.assertEqual(report["optimization"]["render_continuity"]["source_window_repair_count"], 0)
+        self.assertAlmostEqual(report["optimization"]["render_continuity"]["source_window_voiced_overlap_ratio_mean"] or 0.0, 0.0)
         self.assertAlmostEqual(report["stretch_plan"][0]["timeline_requested_tempo"], 0.25)
         self.assertAlmostEqual(report["stretch_plan"][0]["requested_rubberband_tempo"], 0.5)
         self.assertEqual(report["stretch_plan"][0]["continuity_warning"], "single_syllable_boundary_risk")
@@ -4949,6 +5021,7 @@ class ModelRuntimeTests(unittest.TestCase):
             report["stretch_plan"][0]["boundary_conditioning"],
             "vowel_core_stretch+fade_in_out+tempo_safe_silence_pad",
         )
+        self.assertEqual(report["stretch_plan"][0]["source_window_repair"], "")
         self.assertEqual(
             report["optimization"]["render_continuity"]["boundary_conditioning"],
             "vowel_core_stretch+per_clip_fade_in_out+tempo_safe_silence_pad",

@@ -2203,3 +2203,25 @@ Evidence:
 4. The attempted full CN v15 real-eval was blocked by WhisperX/Hugging Face alignment-model access and is not used as algorithm acceptance. The accepted v14 render reports remain authoritative for CN/JP audio and strict timing.
 
 Next work should measure actual adjacent-clip boundary samples and only then introduce a sample-level smoothing operation. Do not weaken exact unit timing, local phonetic identity, or strict render blockers to reduce warning counts.
+
+### Short-Unit Boundary Checkpoint (2026-08-18)
+
+A real JP report exposed a selector/timeline interaction that can cause an audible missing mora even when the strict timing report passes. The global reference phonetic lattice allowed a multi-unit `sai` material to begin at the final `sa` position of a lyric segment. `_localize_lattice_decision` retained only the local segment position, and `_render_timeline_alignment_details` clipped the material span to that segment's unit count. The next segment's `i` was therefore not represented by the selected compound material.
+
+The ordering layer now builds an exclusive end position for every reference segment and filters both normal candidates and fallback candidates against that end. This is deliberately narrower than globally banning multi-unit assets: phrases such as `wo-shi.wav` inside a single segment continue to use their two-unit span.
+
+The same report shows a separate short-unit risk: segments 29-36 have durations from `0.350` to `0.583` seconds while containing `11` to `16` mora units. Exact unit targets are commonly `0.023-0.040` seconds, and the engine then uses a minimum renderable audible target around `0.045` seconds plus bounded UTAU source windows. This means the remaining perceived shortness is likely at the source-window/clip-boundary level, not a missing timing record. A future repair must be source-aware and bounded by adjacent waveform measurements; indiscriminate duration inflation would break exact original-vocal timing.
+
+### Source-Aware Short-Window Repair (2026-08-19)
+
+The first bounded implementation is now in place. For short text hints with a valid UTAU OTO or active-RMS window, the engine runs the existing vowel/consonant profile only when confidence is sufficient. If the metadata window does not cover the voiced core, it shifts the window within the source bounds while keeping its duration unchanged. A core near the window length is centered; a longer core keeps a small onset anchor instead of selecting an arbitrary late vowel slice. The repair is exposed in the stretch plan and preflight continuity report through `source_window_repair`, shift seconds, and voiced overlap ratio.
+
+This preserves the strict reference timeline and avoids pretending that a source-window move solved a long voiced-core mismatch. For example, the real `MGRoid/shi.wav` window was moved to the bounded voiced region but its measurable voiced overlap is only about `0.343`, so the remaining short-pronunciation risk is explicit and still open.
+
+The phonetic selector now computes the exclusive end of each reference lyric segment and rejects compound spans that cross that boundary. This fixes the concrete `sai`-at-final-`sa` case without banning valid compounds inside one segment.
+
+Real-eval evidence:
+
+1. Fresh CN v15 passed strict rendering with exact timing ratio `1.0`, no resampled timing, ordering `0.899127`, and rendered alignment `0.963056`. Continuity warning count was `44` versus `43` in accepted v14, so this is a conservative no-regression result rather than a claimed broad quality gain.
+2. Fresh JP/MGRoid v15 passed strict rendering with exact timing ratio `1.0`, no resampled timing, ordering `0.836873`, and rendered alignment `0.930594`. The continuity warning ratio improved from `0.632381` in v14 to `0.517110`, with moderate boundary warnings dropping from `320` to `261`; manual listening is still needed.
+3. The report Markdown is usable, but the generated JSON has existing-looking mojibake/quoting corruption in some serialized strings. Until fixed, machine comparisons should use the Markdown summary or case analysis files carefully.

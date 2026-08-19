@@ -705,6 +705,7 @@ def _order_materials_by_reference_unit_sequence(
     reference_units = [slot.unit for slot in reference_lattice]
     if not reference_units:
         return []
+    reference_segment_end_positions = _reference_segment_end_positions(reference_lattice)
     reference_text = _reference_text_from_lattice(reference_lattice)
     if not _should_use_phonetic_unit_sequence(original_reference_text, scored_by_material, language_hint=language_hint):
         return []
@@ -737,6 +738,7 @@ def _order_materials_by_reference_unit_sequence(
             usage_counts,
             position_candidates_by_path,
             material_units_by_path,
+            reference_segment_end_positions,
         )
         if candidate is None:
             position += 1
@@ -778,13 +780,21 @@ def _best_material_for_reference_position(
     usage_counts: dict[Path, int],
     position_candidates_by_path: dict[Path, tuple[_PositionCandidate, ...]],
     material_units_by_path: dict[Path, tuple[str, ...]],
+    reference_segment_end_positions: Sequence[int],
 ) -> tuple[MaterialAnalysis, MaterialScoreBreakdown, _PositionCandidate, float] | None:
     candidates: list[
         tuple[float, float, float, int, int, str, MaterialAnalysis, MaterialScoreBreakdown, _PositionCandidate]
     ] = []
+    segment_end_position = (
+        reference_segment_end_positions[position]
+        if 0 <= position < len(reference_segment_end_positions)
+        else len(reference_units)
+    )
     for material, score in scored_by_material:
         for position_candidate in position_candidates_by_path.get(material.path, ()):
             if position_candidate.position != position:
+                continue
+            if position + max(position_candidate.span_units, 1) > segment_end_position:
                 continue
             material_units = material_units_by_path.get(material.path, ())
             unit_match_score = _position_candidate_unit_match_score(
@@ -825,6 +835,7 @@ def _best_material_for_reference_position(
             (material, score)
             for material, score in scored_by_material
             if not _has_future_position_candidate(position_candidates_by_path.get(material.path, ()), position)
+            and position + max(len(material_units_by_path.get(material.path, ())), 1) <= segment_end_position
         ]
         if not fallback_pool:
             return None
@@ -859,6 +870,18 @@ def _best_material_for_reference_position(
 
 def _has_future_position_candidate(candidates: Sequence[_PositionCandidate], position: int) -> bool:
     return any(candidate.position > position for candidate in candidates)
+
+
+def _reference_segment_end_positions(lattice: Sequence[_ReferenceUnitSlot]) -> tuple[int, ...]:
+    if not lattice:
+        return ()
+    ends = [len(lattice)] * len(lattice)
+    segment_end = len(lattice)
+    for index in range(len(lattice) - 1, -1, -1):
+        if index == len(lattice) - 1 or lattice[index + 1].segment_index != lattice[index].segment_index:
+            segment_end = index + 1
+        ends[index] = segment_end
+    return tuple(ends)
 
 
 def _reference_phonetic_unit_lattice(

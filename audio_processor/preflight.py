@@ -352,8 +352,16 @@ def _optimization_report(
             "boundary_conditioning": _render_boundary_conditioning(stretch_plan),
             "fade_applied_clip_count": sum(1 for clip in stretch_plan if clip.fade_seconds > 0),
             "continuity_warning_count": sum(1 for clip in stretch_plan if clip.continuity_warning),
+            "source_window_repair_count": sum(1 for clip in stretch_plan if clip.source_window_repair),
             "stretch_naturalness_score_mean": _mean(
                 [clip.stretch_naturalness_score for clip in stretch_plan]
+            ),
+            "source_window_voiced_overlap_ratio_mean": _mean(
+                [
+                    clip.source_window_voiced_overlap_ratio
+                    for clip in stretch_plan
+                    if clip.source_window_voiced_overlap_ratio > 0
+                ]
             ),
             "continuity_warning_groups": continuity_warning_groups,
         },
@@ -420,9 +428,12 @@ def _render_boundary_conditioning(stretch_plan: Sequence[MaterialStretchClip]) -
         or clip.source_window_duration_seconds is not None
         for clip in stretch_plan
     )
+    has_source_window_repair = any(clip.source_window_repair for clip in stretch_plan)
     suffix_parts = []
     if has_source_window_trim:
         suffix_parts.append("source_window_trim")
+    if has_source_window_repair:
+        suffix_parts.append("voiced_core_repair")
     if has_tempo_safe_padding:
         suffix_parts.append("tempo_safe_silence_pad")
     suffix = f"+{'+'.join(suffix_parts)}" if suffix_parts else ""
