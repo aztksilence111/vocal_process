@@ -1,5 +1,14 @@
 # Conversation Log
 
+## Latest Update - 2026-08-20 Real Output Boundary Metrics Closeout
+
+1. Resumed the autonomous boundary-metrics branch on `codex/render-boundary-metrics`, then verified the latest direct one-cycle session `20260820-225718-real-output-boundary-metrics` completed cleanly.
+2. The run produced an actual JP render at `tests_real\output\real-output-boundary-metrics\audio\1000nenyikiteru_JP\MGRoid\1000nenyikiteru_JP.wav` and a corresponding report at `tests_real\output\real-output-boundary-metrics\reports\real-eval-20260820-225720\summary.md`.
+3. The human report recorded 1 / 1 completed case, status `rendered`, strict pass `true`, exact timing ratio `1.0`, resampled timing ratio `0.0`, rendered alignment `0.930594`, match ordering `0.836873`, and render duration delta ratio `0.000145`.
+4. Boundary diagnostics for the render reported `525/525` joins measured, mean jump `0.00715834`, p95 `0.02406347`, and max `0.04916835`.
+5. The earlier generic background session `20260820-184102-real-output-boundary-metrics` remained a stopped warmup run and is not used as closure evidence.
+6. No code changes were made in the direct output session; the workspace is clean and ready to close.
+
 ## Latest Update - 2026-08-20 Fresh CN/JP Boundary Metrics Render
 
 1. Resumed the autonomous boundary-metrics task on `codex/render-boundary-metrics` after reading `.tmp\codex-admin-resume.md`, `PROJECT_RULES.md`, `CONVERSATION_LOG.md`, `PROJECT_ANALYSIS.md`, the autonomous session state, and current branch status.

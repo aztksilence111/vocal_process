@@ -1,5 +1,11 @@
 # Project Analysis
 
+## Latest Update - 2026-08-20 Real Output Closeout
+
+The direct real-output run now has an actual WAV and a complete human report, so the diagnostics are no longer theoretical. The JP `1000nenyikiteru_JP__MGRoid` case rendered successfully with strict pass `true`, exact timing ratio `1.0`, resampled timing ratio `0.0`, rendered alignment `0.930594`, match ordering `0.836873`, stretch quality `0.646014`, naturalness `0.644739`, continuity warning ratio `0.51711`, and render duration delta ratio `0.000145`.
+
+The join metrics remain bounded: `525/525` joins measured, mean jump `0.00715834`, p95 `0.02406347`, max `0.04916835`. That is still diagnosis-grade evidence, not a reason to add smoothing yet. The next algorithmic move would still be source-window coverage or short-unit material selection, not an audio-changing boundary filter.
+
 ## Latest Update - 2026-08-20 Fresh Boundary Metrics Decision
 
 A fresh content-valid CN/JP render pass exercised the new final-output clip-boundary measurement on accepted verified-lyrics cases. The result does not justify an audio-changing boundary smoother yet.
