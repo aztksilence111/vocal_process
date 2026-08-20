@@ -1916,3 +1916,9 @@ Validation passed:
 - `.venv311\Scripts\python.exe -m compileall -q audio_processor tests`
 
 No audio-changing boundary smoothing was introduced. The current fresh CN/JP boundary metrics still do not justify altering exact vocal timing or local phonetic identity.
+
+### 2026-08-20: Real-Eval JSON Validation
+
+Re-ran the fresh CN and JP single-case real-eval reports after the boundary-context update. The new CN report at `tests_real\\output\\cn-jp-boundary-metrics-20260820-cn-rerun\\reports\\real-eval-20260820-213217\\summary.json` and the new JP report at `tests_real\\output\\cn-jp-boundary-metrics-20260820-jp-rerun2\\reports\\real-eval-20260820-214454\\summary.json` both round-trip through `ConvertFrom-Json`.
+
+The earlier malformed `summary.json` files in the `20260820-184524` and `20260820-192328` report directories are stale outputs from prior runs, not the current report writer behavior. The remaining JP rerun blocker is Hugging Face model availability, not suite serialization.

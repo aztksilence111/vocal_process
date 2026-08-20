@@ -2273,3 +2273,9 @@ Real-eval evidence:
 Rendered clip boundary measurements now carry clip context, output time, and worst-join extraction so manual review can line up the loudest join with the listening notes directly. This is a reporting improvement only; no audio path smoothing was introduced because the current measured joins still sit far below the previously rejected click-like artifacts.
 
 The next useful work remains source-aware boundary planning and short-window diagnosis under the same invariant set: preserve exact original-vocal timing, preserve local phonetic identity, and keep audio-changing changes justified by measured evidence rather than warning reduction alone.
+
+### Real-Eval JSON Validation (2026-08-20)
+
+Fresh reruns of the updated CN and JP single-case reports round-trip through JSON parsing, including the new boundary-context fields. That means the current suite output contract is still valid; the earlier malformed `summary.json` files were stale artifacts from older runs, not evidence that the present writer is broken.
+
+The remaining operational risk is external model availability for JP reruns, which can block new report generation even when the serialization path is correct. That is an infrastructure concern, not an algorithm or report-format regression.
