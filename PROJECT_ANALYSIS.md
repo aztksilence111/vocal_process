@@ -1,5 +1,11 @@
 # Project Analysis
 
+## Latest Update - Closeout Publishing Status
+
+The implementation and real-output evidence are complete locally. `main` now contains the boundary-diagnostics work and the closeout log commit `86aa37d`; the local backup `archive/main-before-real-output-closeout` preserves the previous main tip. The repository is clean.
+
+Remote publication could not complete because GitHub HTTPS connectivity failed twice (`connection reset` / `could not connect to github.com:443`). The local Git workspace doctor passed all repository, index, identity, and process checks, so this is an external network state rather than a code or repository integrity issue. Retry remote push before treating the remote branch as synchronized.
+
 ## Latest Update - 2026-08-20 Real Output Closeout
 
 The direct real-output run now has an actual WAV and a complete human report, so the diagnostics are no longer theoretical. The JP `1000nenyikiteru_JP__MGRoid` case rendered successfully with strict pass `true`, exact timing ratio `1.0`, resampled timing ratio `0.0`, rendered alignment `0.930594`, match ordering `0.836873`, stretch quality `0.646014`, naturalness `0.644739`, continuity warning ratio `0.51711`, and render duration delta ratio `0.000145`.
