@@ -42,6 +42,7 @@ from audio_processor.handoff import (
 )
 from audio_processor.engine import (
     AudioProcessorError,
+    MaterialStretchClip,
     ProcessOptions,
     _build_duration_correction_args,
     _build_material_filter_graph,
@@ -1113,8 +1114,30 @@ class MaterialAssemblyTests(unittest.TestCase):
             _write_pcm16_wave(first, [20_000] * 8)
             _write_pcm16_wave(second, [-20_000] * 8)
             _write_pcm16_wave(output, [20_000] * 8 + [-20_000] * 8)
+            clip_context = [
+                MaterialStretchClip(
+                    index=1,
+                    source_path=first,
+                    source_duration_seconds=1.0,
+                    target_duration_seconds=1.0,
+                    tempo=1.0,
+                    text_hint="first",
+                ),
+                MaterialStretchClip(
+                    index=2,
+                    source_path=second,
+                    source_duration_seconds=1.0,
+                    target_duration_seconds=1.0,
+                    tempo=1.0,
+                    text_hint="second",
+                ),
+            ]
 
-            measurement = _measure_rendered_clip_boundary_jumps(output, [first, second])
+            measurement = _measure_rendered_clip_boundary_jumps(
+                output,
+                [first, second],
+                clip_context=clip_context,
+            )
 
         expected_jump = 40_000 / 32_768
         self.assertEqual(measurement["status"], "ok")
@@ -1124,6 +1147,9 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertAlmostEqual(measurement["mean_sample_jump"], expected_jump, places=6)
         self.assertEqual(measurement["top_boundaries"][0]["boundary_index"], 1)
         self.assertEqual(measurement["top_boundaries"][0]["output_frame_index"], 8)
+        self.assertAlmostEqual(measurement["top_boundaries"][0]["output_time_seconds"], 0.001, places=6)
+        self.assertEqual(measurement["top_boundaries"][0]["before_clip"]["index"], 1)
+        self.assertEqual(measurement["top_boundaries"][0]["after_clip"]["text_hint"], "second")
 
     def test_flat_wav_assembly_regenerates_wrong_duration_render_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -2298,9 +2324,31 @@ class RealEvalTests(unittest.TestCase):
                     measurement={
                         "format": "vocal_process_rendered_clip_boundary_measurement_v1",
                         "status": "ok",
+                        "output_path": str(items[0].output_path),
+                        "output_sample_rate": 8000,
+                        "output_channels": 1,
+                        "output_frame_count": 32160,
                         "boundary_count": 1,
                         "measured_boundary_count": 1,
                         "max_sample_jump": 0.125,
+                        "top_boundaries": [
+                            {
+                                "boundary_index": 1,
+                                "output_frame_index": 1234,
+                                "output_time_seconds": 0.15425,
+                                "sample_jump": 0.125,
+                                "before_clip": {
+                                    "index": 1,
+                                    "source_path": str(reference_path),
+                                    "text_hint": "wo",
+                                },
+                                "after_clip": {
+                                    "index": 2,
+                                    "source_path": str(material_root / "wo.wav"),
+                                    "text_hint": "wo",
+                                },
+                            }
+                        ],
                     },
                 )
                 _write_test_wave(items[0].output_path, duration_seconds=4.02)
@@ -2330,6 +2378,10 @@ class RealEvalTests(unittest.TestCase):
         self.assertEqual(case_summary["render_validation"]["status"], "ok")
         self.assertEqual(case_summary["render_validation"]["render_boundary_measured_count"], 1)
         self.assertAlmostEqual(case_summary["render_validation"]["render_boundary_max_sample_jump"], 0.125)
+        self.assertEqual(
+            case_summary["render_validation"]["render_boundary_worst_join"]["output_frame_index"],
+            1234,
+        )
         self.assertTrue(case_summary["strict_render_pass"])
         self.assertAlmostEqual(case_summary["match_score_mean"], 0.86)
         self.assertGreater(case_summary["planning_alignment_score"], 0.9)
@@ -2347,6 +2399,7 @@ class RealEvalTests(unittest.TestCase):
         self.assertIn("Render Score", markdown)
         self.assertIn("Stretch Quality", markdown)
         self.assertIn("Boundary Risks", markdown)
+        self.assertIn("0.125 @ 1234 (0.15425s)", markdown)
         self.assertIn("Timed", markdown)
         self.assertIn("Strict Pass", markdown)
 

@@ -2267,3 +2267,9 @@ Real-eval evidence:
 1. Fresh CN v15 passed strict rendering with exact timing ratio `1.0`, no resampled timing, ordering `0.899127`, and rendered alignment `0.963056`. Continuity warning count was `44` versus `43` in accepted v14, so this is a conservative no-regression result rather than a claimed broad quality gain.
 2. Fresh JP/MGRoid v15 passed strict rendering with exact timing ratio `1.0`, no resampled timing, ordering `0.836873`, and rendered alignment `0.930594`. The continuity warning ratio improved from `0.632381` in v14 to `0.517110`, with moderate boundary warnings dropping from `320` to `261`; manual listening is still needed.
 3. The report Markdown is usable, but the generated JSON has existing-looking mojibake/quoting corruption in some serialized strings. Until fixed, machine comparisons should use the Markdown summary or case analysis files carefully.
+
+### Boundary Context Reporting (2026-08-20)
+
+Rendered clip boundary measurements now carry clip context, output time, and worst-join extraction so manual review can line up the loudest join with the listening notes directly. This is a reporting improvement only; no audio path smoothing was introduced because the current measured joins still sit far below the previously rejected click-like artifacts.
+
+The next useful work remains source-aware boundary planning and short-window diagnosis under the same invariant set: preserve exact original-vocal timing, preserve local phonetic identity, and keep audio-changing changes justified by measured evidence rather than warning reduction alone.

@@ -1375,7 +1375,11 @@ def _assemble_material_clips_with_render_cache(
     if on_render_boundary_measurement is not None:
         try:
             on_render_boundary_measurement(
-                _measure_rendered_clip_boundary_jumps(output_path, rendered_paths)
+                _measure_rendered_clip_boundary_jumps(
+                    output_path,
+                    rendered_paths,
+                    clip_context=clips,
+                )
             )
         except Exception:
             # Diagnostics must not invalidate an otherwise successful render.
@@ -1387,10 +1391,14 @@ def _measure_rendered_clip_boundary_jumps(
     clip_paths: Sequence[Path],
     *,
     detail_limit: int = 20,
+    clip_context: Sequence[MaterialStretchClip] | None = None,
 ) -> dict[str, Any]:
     """Measure final-output sample jumps at the rendered clip join frames."""
     normalized_output = output_path.expanduser()
     normalized_clips = [path.expanduser() for path in clip_paths]
+    normalized_context = None
+    if clip_context is not None and len(clip_context) == len(normalized_clips):
+        normalized_context = list(clip_context)
     result: dict[str, Any] = {
         "format": "vocal_process_rendered_clip_boundary_measurement_v1",
         "output_path": str(normalized_output),
@@ -1449,14 +1457,23 @@ def _measure_rendered_clip_boundary_jumps(
                 if not before or not after or len(before) != len(after):
                     continue
                 jump = max(abs(after_value - before_value) for before_value, after_value in zip(before, after))
+                measurement: dict[str, Any] = {
+                    "boundary_index": boundary_index,
+                    "output_frame_index": frame_index,
+                    "output_time_seconds": round(frame_index / output_rate, 8),
+                    "before_clip_path": str(normalized_clips[boundary_index - 1]),
+                    "after_clip_path": str(normalized_clips[boundary_index]),
+                    "sample_jump": round(jump, 8),
+                }
+                if normalized_context is not None:
+                    measurement["before_clip"] = _render_boundary_clip_context(
+                        normalized_context[boundary_index - 1]
+                    )
+                    measurement["after_clip"] = _render_boundary_clip_context(
+                        normalized_context[boundary_index]
+                    )
                 measurements.append(
-                    {
-                        "boundary_index": boundary_index,
-                        "output_frame_index": frame_index,
-                        "before_clip_path": str(normalized_clips[boundary_index - 1]),
-                        "after_clip_path": str(normalized_clips[boundary_index]),
-                        "sample_jump": round(jump, 8),
-                    }
+                    measurement
                 )
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         result.update({"status": "measurement_failed", "error": str(exc)})
@@ -1482,6 +1499,34 @@ def _measure_rendered_clip_boundary_jumps(
         }
     )
     return result
+
+
+def _render_boundary_clip_context(clip: MaterialStretchClip) -> dict[str, Any]:
+    return {
+        "index": clip.index,
+        "source_path": str(clip.source_path.expanduser()),
+        "target_duration_seconds": round(clip.target_duration_seconds, 8),
+        "audible_target_duration_seconds": round(
+            clip.audible_target_duration_seconds
+            if clip.audible_target_duration_seconds is not None
+            else clip.target_duration_seconds,
+            8,
+        ),
+        "tempo": round(clip.tempo, 8),
+        "stretch_strategy": clip.stretch_strategy,
+        "stretch_backend": clip.stretch_backend,
+        "text_hint": clip.text_hint,
+        "source_window_start_seconds": round(clip.source_window_start_seconds, 8),
+        "source_window_duration_seconds": (
+            round(clip.source_window_duration_seconds, 8)
+            if clip.source_window_duration_seconds is not None
+            else None
+        ),
+        "source_window_source": clip.source_window_source,
+        "source_window_repair": clip.source_window_repair,
+        "source_window_voiced_overlap_ratio": round(clip.source_window_voiced_overlap_ratio, 8),
+        "boundary_conditioning": _stretch_boundary_conditioning(clip),
+    }
 
 
 def _load_soundfile_for_boundary_measurement() -> Any:

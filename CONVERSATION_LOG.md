@@ -1905,3 +1905,14 @@ Validation passed:
 - Fresh JP/MGRoid real evaluation `jp-render-v15-source-window`: strict pass `1/1`, exact target duration ratio `1.0`, resampled timing ratio `0.0`, match ordering `0.836873`, rendered alignment `0.930594`, continuity warning ratio `0.517110`.
 
 The fresh JP result improves reported continuity risk versus v14 but does not prove that all short pronunciations sound natural; manual listening remains required. The real-eval `summary.md` is readable, while the generated `summary.json` still contains malformed mojibake/quoting in some entries and is not reliable for machine parsing. This is retained as a report-serialization follow-up, not treated as an algorithm acceptance failure.
+
+### 2026-08-20: Boundary Diagnostic Context Upgrade
+
+Added clip-context payloads to rendered boundary measurements in `audio_processor.engine`, including output time and before/after clip context for each measured join. `audio_processor.real_eval` now extracts the worst measured join and surfaces it in the case `Boundary Risks` field so manual review can compare the loudest join directly against listening notes without changing the audio path.
+
+Validation passed:
+
+- `.venv311\Scripts\python.exe -m unittest tests.test_engine.MaterialAssemblyTests.test_rendered_clip_boundary_measurement_reports_final_output_jump tests.test_engine.DiagnosticsTests.test_batch_records_render_boundary_measurement_diagnostics tests.test_engine.RealEvalTests.test_rendered_real_eval_scores_output_duration_and_matching`
+- `.venv311\Scripts\python.exe -m compileall -q audio_processor tests`
+
+No audio-changing boundary smoothing was introduced. The current fresh CN/JP boundary metrics still do not justify altering exact vocal timing or local phonetic identity.

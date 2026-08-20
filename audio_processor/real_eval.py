@@ -1613,6 +1613,7 @@ def _render_validation(
         "render_boundary_measurements": boundary_measurements,
         "render_boundary_measured_count": _render_boundary_measured_count(boundary_measurements),
         "render_boundary_max_sample_jump": _round_float(_render_boundary_max_sample_jump(boundary_measurements)),
+        "render_boundary_worst_join": _render_boundary_worst_join(boundary_measurements),
     }
 
 
@@ -1681,6 +1682,45 @@ def _render_boundary_max_sample_jump(measurements: Sequence[dict[str, Any]]) -> 
     ]
     values = [value for value in values if value is not None]
     return max(values) if values else None
+
+
+def _render_boundary_worst_join(measurements: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    worst_measurement: dict[str, Any] | None = None
+    worst_sample_jump: float | None = None
+    for measurement in measurements:
+        if not isinstance(measurement, dict):
+            continue
+        sample_jump = _safe_float(measurement.get("max_sample_jump"))
+        if sample_jump is None:
+            continue
+        current_best = worst_sample_jump if worst_sample_jump is not None else float("-inf")
+        if worst_measurement is None or sample_jump > current_best:
+            worst_measurement = measurement
+            worst_sample_jump = sample_jump
+            continue
+        if sample_jump == worst_sample_jump:
+            current_boundary_count = _positive_int(measurement.get("boundary_count"))
+            worst_boundary_count = _positive_int(worst_measurement.get("boundary_count"))
+            if current_boundary_count > worst_boundary_count:
+                worst_measurement = measurement
+                worst_sample_jump = sample_jump
+    if worst_measurement is None:
+        return None
+    top_boundaries = worst_measurement.get("top_boundaries")
+    if not isinstance(top_boundaries, list):
+        return None
+    worst_boundary = next((boundary for boundary in top_boundaries if isinstance(boundary, dict)), None)
+    if worst_boundary is None:
+        return None
+    result = dict(worst_boundary)
+    result["output_path"] = str(worst_measurement.get("output_path") or "")
+    result["output_sample_rate"] = _positive_int(worst_measurement.get("output_sample_rate"))
+    result["output_channels"] = _positive_int(worst_measurement.get("output_channels"))
+    result["output_frame_count"] = _positive_int(worst_measurement.get("output_frame_count"))
+    result["boundary_count"] = _positive_int(worst_measurement.get("boundary_count"))
+    result["measured_boundary_count"] = _positive_int(worst_measurement.get("measured_boundary_count"))
+    result["max_sample_jump"] = _round_float(_safe_float(worst_measurement.get("max_sample_jump")))
+    return result
 
 
 def _channel_output_validation(
@@ -2070,6 +2110,7 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         stretch_quality = case_summary.get("stretch_quality_score", "")
         stretch_naturalness = case_summary.get("stretch_naturalness_score", "")
         continuity_warnings = case_summary.get("continuity_warning_count", "")
+        worst_join = render_validation.get("render_boundary_worst_join", {}) if isinstance(render_validation, dict) else {}
         positioned_ratio = case_summary.get("positioned_decision_ratio", "")
         timed_ratio = case_summary.get("timed_target_duration_ratio", "")
         target_delta = scorecard.get("target_duration_delta_seconds", "") if isinstance(scorecard, dict) else ""
@@ -2077,11 +2118,12 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
             render_validation.get("duration_delta_seconds", "") if isinstance(render_validation, dict) else ""
         )
         review_count = case_summary.get("review_required_match_count", "")
+        boundary_risks_value = _render_boundary_risk_markdown_value(continuity_warnings, worst_join)
         lines.append(
             f"| {result.case.name} | {result.case.split} | {result.case.language or 'unknown'} | "
             f"{result.status} | {_markdown_value(plan_score)} | {_markdown_value(render_score)} | "
             f"{_markdown_value(stretch_quality)} | {_markdown_value(stretch_naturalness)} | "
-            f"{_markdown_value(continuity_warnings)} | "
+            f"{_markdown_value(boundary_risks_value)} | "
             f"{_markdown_value(min_score)} | {_markdown_value(mean_score)} | {_markdown_value(positioned_ratio)} | "
             f"{_markdown_value(timed_ratio)} | {_markdown_value(target_delta)} | {_markdown_value(render_delta)} | "
             f"{case_summary.get('strict_render_pass', False)} | {review_count} | "
@@ -2172,6 +2214,31 @@ def _markdown_value(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.6g}"
     return str(value)
+
+
+def _render_boundary_risk_markdown_value(continuity_warnings: Any, worst_join: Any) -> str:
+    worst_join_value = _render_boundary_join_markdown_value(worst_join)
+    warnings_value = _markdown_value(continuity_warnings)
+    warnings_count = _safe_float(continuity_warnings)
+    if worst_join_value:
+        if warnings_count is not None and warnings_count > 0:
+            return " / ".join([warnings_value, worst_join_value])
+        return worst_join_value
+    return warnings_value
+
+
+def _render_boundary_join_markdown_value(worst_join: Any) -> str:
+    if not isinstance(worst_join, dict):
+        return ""
+    sample_jump = _markdown_value(worst_join.get("sample_jump"))
+    output_frame_index = _markdown_value(worst_join.get("output_frame_index"))
+    output_time_seconds = _markdown_value(worst_join.get("output_time_seconds"))
+    if not sample_jump and not output_frame_index:
+        return ""
+    value = f"{sample_jump} @ {output_frame_index}".strip()
+    if output_time_seconds:
+        value += f" ({output_time_seconds}s)"
+    return value
 
 
 if __name__ == "__main__":
