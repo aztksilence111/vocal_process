@@ -47,6 +47,7 @@ from audio_processor.engine import (
     _build_material_filter_graph,
     _build_rendered_clip_concat_args,
     _ensure_audio_duration,
+    _measure_rendered_clip_boundary_jumps,
     _write_rendered_clip_concat_list,
     assemble_material_to_reference_with_progress,
     build_material_assembly_args,
@@ -120,6 +121,15 @@ def _write_tone_wave(path: Path, *, duration_seconds: float = 1.0, sample_rate: 
         handle.setsampwidth(2)
         handle.setframerate(sample_rate)
         handle.writeframes(bytes(frames))
+
+
+def _write_pcm16_wave(path: Path, samples: list[int], *, sample_rate: int = 8000) -> None:
+    frames = b"".join(int(value).to_bytes(2, byteorder="little", signed=True) for value in samples)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(frames)
 
 
 def _write_duplicate_stereo_tone_wave(
@@ -1094,6 +1104,27 @@ class MaterialAssemblyTests(unittest.TestCase):
         self.assertEqual(render_mock.call_count, 1)
         concat_mock.assert_called_once()
 
+    def test_rendered_clip_boundary_measurement_reports_final_output_jump(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.wav"
+            second = root / "second.wav"
+            output = root / "output.wav"
+            _write_pcm16_wave(first, [20_000] * 8)
+            _write_pcm16_wave(second, [-20_000] * 8)
+            _write_pcm16_wave(output, [20_000] * 8 + [-20_000] * 8)
+
+            measurement = _measure_rendered_clip_boundary_jumps(output, [first, second])
+
+        expected_jump = 40_000 / 32_768
+        self.assertEqual(measurement["status"], "ok")
+        self.assertEqual(measurement["boundary_count"], 1)
+        self.assertEqual(measurement["measured_boundary_count"], 1)
+        self.assertAlmostEqual(measurement["max_sample_jump"], expected_jump, places=6)
+        self.assertAlmostEqual(measurement["mean_sample_jump"], expected_jump, places=6)
+        self.assertEqual(measurement["top_boundaries"][0]["boundary_index"], 1)
+        self.assertEqual(measurement["top_boundaries"][0]["output_frame_index"], 8)
+
     def test_flat_wav_assembly_regenerates_wrong_duration_render_cache(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1970,6 +2001,88 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(materials_record["fields"]["metadata_failure_count"], 1)
         self.assertIn("batch.item.failed", [record["stage"] for record in records])
 
+    def test_batch_records_render_boundary_measurement_diagnostics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            _write_test_wave(reference, duration_seconds=2.0)
+            _write_test_wave(material_dir / "wo.wav", duration_seconds=1.0)
+            settings = ProcessingSettings(
+                material_directory=str(material_dir),
+                output_directory=str(root / "out"),
+                overwrite=True,
+            )
+            item = create_queue([reference], settings)[0]
+
+            ordering = model_runtime.ModelOrderingResult(
+                reference=model_runtime.ReferenceAnalysis(
+                    source_path=reference,
+                    vocal_path=reference,
+                    transcript="wo",
+                    segments=(VoiceSegment(0.0, 2.0, "wo"),),
+                    speaker_embedding=None,
+                    backend="test",
+                ),
+                library=model_runtime.MaterialLibraryAnalysis(
+                    material_directory=material_dir,
+                    materials=(),
+                    backend_summary={},
+                ),
+                ordered_paths=(material_dir / "wo.wav",),
+                target_durations=(2.0,),
+                target_audible_durations=(2.0,),
+                target_pre_silences=(0.0,),
+                decisions=(
+                    model_runtime.OrderingDecision(
+                        rank=1,
+                        source_path=material_dir / "wo.wav",
+                        score=0.9,
+                        transcript_score=0.0,
+                        filename_score=0.9,
+                        duration_score=0.8,
+                        speaker_score=0.0,
+                        vad_score=1.0,
+                        phonetic_score=0.9,
+                        evidence_count=2,
+                        confidence_label="high",
+                        reference_text="wo",
+                        material_text="wo",
+                        reason="test",
+                        target_duration_seconds=2.0,
+                    ),
+                ),
+                analysis_report={"backend_summary": {}},
+            )
+
+            def fake_assemble(*args: object, **kwargs: object) -> None:
+                callback = kwargs.get("on_render_boundary_measurement")
+                if callback is not None:
+                    callback(
+                        {
+                            "format": "vocal_process_rendered_clip_boundary_measurement_v1",
+                            "status": "ok",
+                            "boundary_count": 1,
+                            "max_sample_jump": 0.25,
+                        }
+                    )
+                _write_test_wave(item.output_path, duration_seconds=2.0)
+
+            with patch("audio_processor.batch.build_model_ordering", return_value=ordering):
+                with patch("audio_processor.batch.assemble_material_to_reference_with_progress", side_effect=fake_assemble):
+                    summary = run_batch_queue([item], settings)
+
+            records = [
+                json.loads(line)
+                for line in diagnostic_log_path(item.output_path).read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(summary.completed, 1)
+        event = next(record for record in records if record["stage"] == "render.boundaries.measured")
+        self.assertEqual(event["fields"]["measurement"]["status"], "ok")
+        self.assertAlmostEqual(event["fields"]["measurement"]["max_sample_jump"], 0.25)
+
     def test_batch_ignores_stored_lyrics_file_when_manual_lyrics_disabled(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2176,6 +2289,20 @@ class RealEvalTests(unittest.TestCase):
             ) -> BatchSummary:
                 self.assertIn("should_cancel", kwargs)
                 self.assertEqual(len(items), 1)
+                diagnostics = DiagnosticLogger(
+                    diagnostic_log_path(items[0].output_path, Path(settings.diagnostics_directory))
+                )
+                diagnostics.event(
+                    "render.boundaries.measured",
+                    "Measured actual adjacent rendered clip boundary sample jumps",
+                    measurement={
+                        "format": "vocal_process_rendered_clip_boundary_measurement_v1",
+                        "status": "ok",
+                        "boundary_count": 1,
+                        "measured_boundary_count": 1,
+                        "max_sample_jump": 0.125,
+                    },
+                )
                 _write_test_wave(items[0].output_path, duration_seconds=4.02)
                 return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
 
@@ -2201,6 +2328,8 @@ class RealEvalTests(unittest.TestCase):
 
         self.assertEqual(result.cases[0].status, "rendered")
         self.assertEqual(case_summary["render_validation"]["status"], "ok")
+        self.assertEqual(case_summary["render_validation"]["render_boundary_measured_count"], 1)
+        self.assertAlmostEqual(case_summary["render_validation"]["render_boundary_max_sample_jump"], 0.125)
         self.assertTrue(case_summary["strict_render_pass"])
         self.assertAlmostEqual(case_summary["match_score_mean"], 0.86)
         self.assertGreater(case_summary["planning_alignment_score"], 0.9)

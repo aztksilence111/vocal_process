@@ -485,6 +485,10 @@ def run_real_suite(
                     render_summary = {
                         "batch_summary": summary.__dict__,
                         "channel_output_paths": [str(path) for path in expected_output_paths],
+                        "render_boundary_measurements": _read_render_boundary_measurements(
+                            case_report_directory / "render",
+                            expected_output_paths,
+                        ),
                     }
                 except Exception as exc:
                     status = "cancelled" if _is_cancellation_exception(exc) else "render_failed"
@@ -1546,6 +1550,7 @@ def _render_validation(
     render_failed = _render_summary_failed(render_summary)
     render_blocked = bool(render_summary.get("blocked")) if isinstance(render_summary, dict) else False
     channel_output_paths = _render_summary_channel_output_paths(render_summary)
+    boundary_measurements = _render_summary_boundary_measurements(render_summary)
     validation_paths = channel_output_paths or ([output_path] if output_path else [])
     channel_outputs = [
         _channel_output_validation(path, reference_duration_seconds, render_failed)
@@ -1605,6 +1610,9 @@ def _render_validation(
         "duration_delta_seconds": _round_float(delta_seconds),
         "duration_delta_ratio": _round_float(delta_ratio),
         "duration_alignment_score": _round_float(duration_alignment_score),
+        "render_boundary_measurements": boundary_measurements,
+        "render_boundary_measured_count": _render_boundary_measured_count(boundary_measurements),
+        "render_boundary_max_sample_jump": _round_float(_render_boundary_max_sample_jump(boundary_measurements)),
     }
 
 
@@ -1615,6 +1623,64 @@ def _render_summary_channel_output_paths(render_summary: dict[str, Any]) -> list
     if not isinstance(raw_paths, list):
         return []
     return [Path(str(path)) for path in raw_paths if str(path or "").strip()]
+
+
+def _read_render_boundary_measurements(
+    diagnostics_directory: Path,
+    output_paths: Sequence[Path],
+) -> list[dict[str, Any]]:
+    measurements: list[dict[str, Any]] = []
+    for output_path in output_paths:
+        log_path = diagnostic_log_path(output_path, diagnostics_directory)
+        if not log_path.exists():
+            continue
+        try:
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or record.get("stage") != "render.boundaries.measured":
+                continue
+            fields = record.get("fields")
+            measurement = fields.get("measurement") if isinstance(fields, dict) else None
+            if isinstance(measurement, dict):
+                measurements.append(measurement)
+    return measurements
+
+
+def _render_summary_boundary_measurements(render_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(render_summary, dict):
+        return []
+    raw_measurements = render_summary.get("render_boundary_measurements")
+    if not isinstance(raw_measurements, list):
+        return []
+    return [measurement for measurement in raw_measurements if isinstance(measurement, dict)]
+
+
+def _render_boundary_measured_count(measurements: Sequence[dict[str, Any]]) -> int:
+    total = 0
+    for measurement in measurements:
+        count = _positive_int(measurement.get("measured_boundary_count"))
+        if count:
+            total += count
+            continue
+        if measurement.get("status") == "ok":
+            total += _positive_int(measurement.get("boundary_count"))
+    return total
+
+
+def _render_boundary_max_sample_jump(measurements: Sequence[dict[str, Any]]) -> float | None:
+    values = [
+        _safe_float(measurement.get("max_sample_jump"))
+        for measurement in measurements
+        if isinstance(measurement, dict)
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
 
 
 def _channel_output_validation(

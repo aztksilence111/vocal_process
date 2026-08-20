@@ -189,6 +189,7 @@ MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_mono_atempo_chain_utau_o
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
+RenderBoundaryMeasurementCallback = Callable[[dict[str, Any]], None]
 
 
 def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -1162,6 +1163,7 @@ def assemble_material_to_reference_with_progress(
     render_cache_directory: Path | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
+    on_render_boundary_measurement: RenderBoundaryMeasurementCallback | None = None,
 ) -> None:
     normalized_reference = reference_path.expanduser()
     if not normalized_reference.exists():
@@ -1193,6 +1195,7 @@ def assemble_material_to_reference_with_progress(
             reference_duration=reference_duration,
             on_progress=on_progress,
             should_cancel=should_cancel,
+            on_render_boundary_measurement=on_render_boundary_measurement,
         )
         return
 
@@ -1251,6 +1254,7 @@ def _assemble_material_clips_with_render_cache(
     reference_duration: float,
     on_progress: ProgressCallback | None,
     should_cancel: CancelCallback | None,
+    on_render_boundary_measurement: RenderBoundaryMeasurementCallback | None,
 ) -> None:
     if output_path.exists() and not options.overwrite:
         raise AudioProcessorError(f"Output file already exists: {output_path}")
@@ -1368,6 +1372,132 @@ def _assemble_material_clips_with_render_cache(
         progress_message="Correcting concatenated material audio duration",
         fade=False,
     )
+    if on_render_boundary_measurement is not None:
+        try:
+            on_render_boundary_measurement(
+                _measure_rendered_clip_boundary_jumps(output_path, rendered_paths)
+            )
+        except Exception:
+            # Diagnostics must not invalidate an otherwise successful render.
+            pass
+
+
+def _measure_rendered_clip_boundary_jumps(
+    output_path: Path,
+    clip_paths: Sequence[Path],
+    *,
+    detail_limit: int = 20,
+) -> dict[str, Any]:
+    """Measure final-output sample jumps at the rendered clip join frames."""
+    normalized_output = output_path.expanduser()
+    normalized_clips = [path.expanduser() for path in clip_paths]
+    result: dict[str, Any] = {
+        "format": "vocal_process_rendered_clip_boundary_measurement_v1",
+        "output_path": str(normalized_output),
+        "clip_count": len(normalized_clips),
+        "boundary_count": max(len(normalized_clips) - 1, 0),
+        "measured_boundary_count": 0,
+        "status": "not_applicable" if len(normalized_clips) < 2 else "pending",
+        "top_boundaries": [],
+    }
+    if len(normalized_clips) < 2:
+        return result
+
+    try:
+        soundfile = _load_soundfile_for_boundary_measurement()
+        with soundfile.SoundFile(str(normalized_output)) as output_handle:
+            output_rate = int(output_handle.samplerate)
+            output_channels = int(output_handle.channels)
+            output_frames = int(len(output_handle))
+            result.update(
+                {
+                    "output_sample_rate": output_rate,
+                    "output_channels": output_channels,
+                    "output_frame_count": output_frames,
+                }
+            )
+            if output_rate <= 0 or output_channels <= 0 or output_frames <= 1:
+                result["status"] = "empty_output"
+                return result
+
+            boundary_frames: list[int] = []
+            cumulative_frames = 0
+            for clip_path in normalized_clips[:-1]:
+                with soundfile.SoundFile(str(clip_path)) as clip_handle:
+                    if (
+                        int(clip_handle.samplerate) != output_rate
+                        or int(clip_handle.channels) != output_channels
+                    ):
+                        result.update(
+                            {
+                                "status": "sample_format_mismatch",
+                                "mismatch_path": str(clip_path),
+                                "mismatch_sample_rate": int(clip_handle.samplerate),
+                                "mismatch_channels": int(clip_handle.channels),
+                            }
+                        )
+                        return result
+                    cumulative_frames += int(len(clip_handle))
+                    boundary_frames.append(cumulative_frames)
+
+            measurements: list[dict[str, Any]] = []
+            for boundary_index, frame_index in enumerate(boundary_frames, start=1):
+                if frame_index <= 0 or frame_index >= output_frames:
+                    continue
+                before = _soundfile_frame_samples(output_handle, frame_index - 1)
+                after = _soundfile_frame_samples(output_handle, frame_index)
+                if not before or not after or len(before) != len(after):
+                    continue
+                jump = max(abs(after_value - before_value) for before_value, after_value in zip(before, after))
+                measurements.append(
+                    {
+                        "boundary_index": boundary_index,
+                        "output_frame_index": frame_index,
+                        "before_clip_path": str(normalized_clips[boundary_index - 1]),
+                        "after_clip_path": str(normalized_clips[boundary_index]),
+                        "sample_jump": round(jump, 8),
+                    }
+                )
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        result.update({"status": "measurement_failed", "error": str(exc)})
+        return result
+
+    if not measurements:
+        result["status"] = "no_measurable_boundaries"
+        return result
+
+    jumps = sorted(float(item["sample_jump"]) for item in measurements)
+    percentile_index = min(max(math.ceil(len(jumps) * 0.95) - 1, 0), len(jumps) - 1)
+    result.update(
+        {
+            "status": "ok",
+            "measured_boundary_count": len(measurements),
+            "mean_sample_jump": round(sum(jumps) / len(jumps), 8),
+            "p95_sample_jump": round(jumps[percentile_index], 8),
+            "max_sample_jump": round(jumps[-1], 8),
+            "top_boundaries": sorted(
+                measurements,
+                key=lambda item: (-float(item["sample_jump"]), int(item["boundary_index"])),
+            )[: max(int(detail_limit), 0)],
+        }
+    )
+    return result
+
+
+def _load_soundfile_for_boundary_measurement() -> Any:
+    import soundfile  # type: ignore
+
+    return soundfile
+
+
+def _soundfile_frame_samples(handle: Any, frame_index: int) -> tuple[float, ...]:
+    if frame_index < 0 or frame_index >= int(len(handle)):
+        return ()
+    handle.seek(frame_index)
+    data = handle.read(1, dtype="float64", always_2d=True)
+    if getattr(data, "size", 0) <= 0:
+        return ()
+    return tuple(float(value) for value in data[0])
 
 
 def _write_rendered_clip_concat_list(

@@ -238,6 +238,13 @@ def run_batch_queue(
                         should_cancel=should_cancel,
                     )
                 else:
+                    def render_boundary_measurement(measurement: dict[str, Any]) -> None:
+                        diagnostics.event(
+                            "render.boundaries.measured",
+                            "Measured actual adjacent rendered clip boundary sample jumps",
+                            measurement=measurement,
+                        )
+
                     assemble_material_to_reference_with_progress(
                         item.input_path,
                         Path(settings.material_directory),
@@ -255,6 +262,7 @@ def run_batch_queue(
                         ),
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
+                        on_render_boundary_measurement=render_boundary_measurement,
                     )
             else:
                 process_audio_with_progress(

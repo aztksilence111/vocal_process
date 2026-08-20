@@ -1,5 +1,25 @@
 # Conversation Log
 
+## Latest Update - 2026-08-20 Rendered Clip Boundary Diagnostics
+
+1. Continued from the 2026-08-19 source-aware short-window repair checkpoint after reading the project recovery context, project rules, project analysis, conversation log, and the relevant long-term project memory.
+2. Added a read-only sample-level boundary measurement after rendered material clips are concatenated. It measures the actual final-output sample jump at each rendered clip join and records the count, mean, p95, maximum, and worst boundary details.
+3. The measurement uses the project's `soundfile` dependency rather than Python `wave`, because the real `pcm_s24le` WAV outputs use WAVE_FORMAT_EXTENSIBLE and Python 3.11's `wave` reader rejects those files with `unknown format: 65534`.
+4. Batch diagnostics now write `render.boundaries.measured` to the existing per-output JSONL diagnostics log. Real-eval summaries also expose `render_boundary_measurements`, `render_boundary_measured_count`, and `render_boundary_max_sample_jump` under `render_validation`.
+5. Boundary measurement is deliberately diagnostic-only. It does not change clip durations, phonetic ordering, exact original-vocal timing, strict render blockers, or the existing concat safety filter. No sample-level smoothing has been enabled yet.
+6. Added regressions for synthetic hard joins, batch diagnostic emission, and real-eval summary extraction.
+7. Verification passed:
+   - `.venv311\Scripts\python.exe -m unittest discover -s tests`: `230` tests.
+   - `.venv311\Scripts\python.exe -m compileall -q audio_processor tests packaging`.
+   - `.venv311\Scripts\python.exe -m audio_processor check`.
+   - `git diff --check`, with only the existing LF/CRLF conversion warnings.
+
+Next work:
+
+1. Use the new metrics on a fresh content-valid CN/JP render, not the rejected 2026-08-16 replay folders.
+2. Compare worst join measurements against manual listening before introducing any bounded sample-level smoothing.
+3. Preserve local phonetic identity and exact original-vocal unit timing as authoritative.
+
 ## Latest Update - 2026-08-15 GUI Manual Lyrics Mode
 
 1. User pointed out that making lyrics mandatory would violate the original product requirement: when no lyrics file is available, the system should still sort and align by the original/reference vocal.

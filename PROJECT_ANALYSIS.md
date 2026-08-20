@@ -1,5 +1,28 @@
 # Project Analysis
 
+## Latest Update - 2026-08-20 Rendered Boundary Measurement
+
+The next DSP decision is now instrumented instead of inferred from warning counts. The renderer already creates each material clip separately and then concatenates those final clips, so the actual join frames can be measured without changing the authoritative timeline.
+
+Architecture decision:
+
+1. `audio_processor.engine._measure_rendered_clip_boundary_jumps()` reads the final rendered output and the rendered clip cache paths, maps each clip join to an output frame, and measures the absolute per-channel sample jump across that frame.
+2. The helper uses `soundfile`, not `wave`. Real project outputs are `pcm_s24le` WAVE_FORMAT_EXTENSIBLE files; Python 3.11's `wave` module rejects those files even though FFmpeg and soundfile can read them.
+3. `assemble_material_to_reference_with_progress()` accepts an optional measurement callback. Batch rendering supplies a callback that writes the result to the existing JSONL diagnostics stream as `render.boundaries.measured`.
+4. Real-eval reads those diagnostic events after rendering and exposes the measurements through `render_validation`. Missing or failed diagnostics remain non-fatal and do not change render status.
+5. The measurement is intentionally not a smoothing operation. It does not alter clip audio, durations, ordering, timing lattice, strict blockers, or the existing low-pass/declick/limiter concat safety filter.
+
+Interpretation:
+
+1. A high measured join jump identifies a concrete boundary candidate for later manual review or bounded smoothing.
+2. The metric only measures the exact clip join frame. It is not yet a perceptual click detector and should not be used as a standalone acceptance threshold.
+3. The next valid experiment is a fresh verified-lyrics CN/JP render followed by comparison of the worst boundary measurements with listening notes. Rejected old replay folders remain invalid evidence.
+
+Validation:
+
+1. Full unit suite passed with `230` tests.
+2. `compileall`, `audio_processor check`, and `git diff --check` passed.
+
 ## Latest Update - 2026-08-15 Manual Lyrics Mode Boundary
 
 The user clarified a product-level boundary: no-lyrics operation is not an experimental side path. It is one of the original core workflows. The system must be able to sort and align from the original/reference vocal when no lyrics file exists, while still reporting that this mode depends on ASR recognition quality.
