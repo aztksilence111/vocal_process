@@ -1,5 +1,24 @@
 # Project Analysis
 
+## Latest Update - 2026-08-20 Fresh Boundary Metrics Decision
+
+A fresh content-valid CN/JP render pass exercised the new final-output clip-boundary measurement on accepted verified-lyrics cases. The result does not justify an audio-changing boundary smoother yet.
+
+Evidence:
+
+1. CN `AiRenTongZhi_CN__chickenOTTO` rendered at `tests_real\output\cn-jp-boundary-metrics-20260820-cn` with verified lyrics, strict pass `true`, exact timing ratio `1.0`, resampled timing ratio `0.0`, and rendered alignment `0.963056`.
+2. CN measured `350/350` joins: mean sample jump `0.00946536`, p95 `0.04506361`, max `0.13905966`. The worst join was boundary `300` at `196.380091 s`, `de2 -> kou`.
+3. JP `1000nenyikiteru_JP__MGRoid` rendered at `tests_real\output\cn-jp-boundary-metrics-20260820-jp` with verified lyrics, strict pass `true`, exact timing ratio `1.0`, resampled timing ratio `0.0`, and rendered alignment `0.930594`.
+4. JP measured `525/525` joins: mean sample jump `0.00715834`, p95 `0.02406347`, max `0.04916835`. The worst join was boundary `408` at `132.174444 s`, `no -> ki`.
+5. These measured joins are much smaller than the rejected click/plosive evidence from earlier bad outputs, where jumps reached about `0.87` and earlier click-focused diagnostics saw maximum-range discontinuity behavior.
+
+Decision:
+
+1. Do not add sample-level crossfade/smoothing from this evidence alone. The fresh measurements indicate moderate, bounded joins rather than the hard electric-click class previously rejected.
+2. The remaining manual-listening risk still aligns better with short pronunciation, material selection, and timbre/formant drift. JP has many short exact-timing units and `272` continuity warnings, but its measured final join max is below `0.05`.
+3. Preserve the current invariants: exact original-vocal unit timing controls the timeline, local phonetic identity controls material selection, and audio-changing DSP must be justified by measured artifacts that correspond to manual listening failures.
+4. Next useful work should improve perceptual diagnostics around short units, source-window coverage, material inventory/selection, and formant/F0 drift rather than applying a broad boundary smoother.
+
 ## Latest Update - 2026-08-20 Rendered Boundary Measurement
 
 The next DSP decision is now instrumented instead of inferred from warning counts. The renderer already creates each material clip separately and then concatenates those final clips, so the actual join frames can be measured without changing the authoritative timeline.

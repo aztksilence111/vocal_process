@@ -1,5 +1,21 @@
 # Conversation Log
 
+## Latest Update - 2026-08-20 Fresh CN/JP Boundary Metrics Render
+
+1. Resumed the autonomous boundary-metrics task on `codex/render-boundary-metrics` after reading `.tmp\codex-admin-resume.md`, `PROJECT_RULES.md`, `CONVERSATION_LOG.md`, `PROJECT_ANALYSIS.md`, the autonomous session state, and current branch status.
+2. Used fresh, content-valid verified-lyrics renders only. No rejected 2026-08-16 or `*-replay` folders were used as evidence.
+3. Fresh CN case: `AiRenTongZhi_CN__chickenOTTO`, output root `tests_real\output\cn-jp-boundary-metrics-20260820-cn`, report `tests_real\output\cn-jp-boundary-metrics-20260820-cn\reports\real-eval-20260820-184524\summary.json`.
+   - Strict render pass: `true`; exact timing ratio `1.0`; resampled timing ratio `0.0`; rendered alignment `0.963056`.
+   - Boundary measurement: `350/350` joins measured; mean jump `0.00946536`; p95 `0.04506361`; max `0.13905966`.
+   - Worst CN join: boundary `300`, frame `8660362`, time `196.380091 s`, joining `de2 -> kou`. The next worst jumps were `0.09800601`, `0.06622386`, `0.06333339`, and `0.06308162`.
+4. Fresh JP case: `1000nenyikiteru_JP__MGRoid`, output root `tests_real\output\cn-jp-boundary-metrics-20260820-jp`, report `tests_real\output\cn-jp-boundary-metrics-20260820-jp\reports\real-eval-20260820-192328\summary.json`.
+   - Strict render pass: `true`; exact timing ratio `1.0`; resampled timing ratio `0.0`; rendered alignment `0.930594`.
+   - Boundary measurement: `525/525` joins measured; mean jump `0.00715834`; p95 `0.02406347`; max `0.04916835`.
+   - Worst JP join: boundary `408`, frame `5828893`, time `132.174444 s`, joining `no -> ki`. The next worst jumps were `0.04741514`, `0.04665685`, `0.04481304`, and `0.04019964`.
+5. Compared against logged manual-listening notes. The old rejected click/plosive evidence had much larger discontinuities: prior rejected outputs recorded large jumps up to about `0.87`, and earlier click-focused diagnostics recorded maximum-range `jump999` behavior. The fresh JP user-facing risk remains short pronunciation, material/order quality, and timbre/formant drift, not raw sample-join discontinuity.
+6. No audio-changing boundary smoothing was introduced. The new measurements do not justify changing sample audio: JP worst joins are below `0.05`, and CN has one isolated `0.139` join with low aggregate p95. Any next DSP change should target source-window/material/phonetic coverage or perceptual diagnostics, while preserving exact original-vocal timing and local phonetic identity.
+7. No code changes were made. Generated real-eval outputs are under ignored `tests_real\output` roots.
+
 ## Latest Update - 2026-08-20 Rendered Clip Boundary Diagnostics
 
 1. Continued from the 2026-08-19 source-aware short-window repair checkpoint after reading the project recovery context, project rules, project analysis, conversation log, and the relevant long-term project memory.
