@@ -13,6 +13,13 @@
 
 ## 更新日志
 
+### 2026-08-21: Rendered boundary diagnostics and real-output closeout
+
+1. Final rendered clip joins now have read-only sample-jump diagnostics, including mean, p95, maximum, output time, and adjacent clip context. Real-eval reports expose the worst measured boundary for manual review.
+2. Verified CN and JP real renders completed with exact original-vocal unit timing, zero resampled timing, and strict render passes. The closeout evidence is stored under `tests_real\output\real-output-boundary-metrics`.
+3. No new release asset was added; the existing `VocalProcess-portable.zip` release workflow remains unchanged.
+4. Manual testing should review the generated WAV together with `summary.md` and the boundary context before considering any future audio-changing smoothing work.
+
 ### 2026-08-04: Signalsmith vowel-core stretch and main promotion
 
 1. Short filename-labeled material with a detected vowel core now uses a Signalsmith Stretch backend through `python-stretch`, while Rubber Band remains the fallback for unsupported or failed renders.
