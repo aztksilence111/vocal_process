@@ -2301,3 +2301,17 @@ The next useful work remains source-aware boundary planning and short-window dia
 Fresh reruns of the updated CN and JP single-case reports round-trip through JSON parsing, including the new boundary-context fields. That means the current suite output contract is still valid; the earlier malformed `summary.json` files were stale artifacts from older runs, not evidence that the present writer is broken.
 
 The remaining operational risk is external model availability for JP reruns, which can block new report generation even when the serialization path is correct. That is an infrastructure concern, not an algorithm or report-format regression.
+
+### Acoustic Drift Diagnostic Boundary (2026-08-21)
+
+The renderer now has a bounded, read-only perceptual diagnostic for the current short-unit risk. It compares the exact source window selected by the existing material planner with the exact rendered cache clip that enters final concatenation. The diagnostic records F0 in cents plus spectral-centroid and spectral-bandwidth ratio deltas. It does not infer a repair, alter target duration, alter the phonetic sequence, resample the timing lattice, or weaken strict acceptance.
+
+The F0 signal is deliberately evidence-gated: both source and rendered segments need at least three autocorrelation estimates, at least `0.06 s` active audio, a usable F0, and a bounded frequency ratio. F0 values from shorter or otherwise weak clips remain visible with a reliability reason but contribute zero to `acoustic_drift_score`. This prevents the many `20-45 ms` JP units from turning unstable pitch guesses into false formant/timbre conclusions.
+
+Fresh verified-lyrics evidence:
+
+1. CN `AiRenTongZhi_CN__chickenOTTO` rendered with exact timing `1.0`, resampled timing `0.0`, match ordering `0.899127`, rendered alignment `0.963056`, and `324/351` measurable clips. Reliable F0 coverage was `207` clips. The largest spectral-centroid delta was `+1.77649878` on `fu2`; this is a local diagnostic candidate, not evidence for global smoothing.
+2. JP `1000nenyikiteru_JP__MGRoid` rendered with exact timing `1.0`, resampled timing `0.0`, match ordering `0.836873`, rendered alignment `0.930594`, and `497/526` measurable clips. Reliable F0 coverage was `168` clips, with maximum reliable F0 drift `51.234772` cents. The largest spectral-centroid delta was `+1.98642379` on `ba`.
+3. Both cases remained strict passes and kept the existing boundary metrics unchanged. The evidence supports continuing with local source-window/material investigation and perceptual review; it does not support changing the authoritative time axis or adding broad sample-level smoothing.
+
+The complete unittest suite passed with `233` tests, alongside `compileall`, `audio_processor check`, focused diagnostic tests, and `git diff --check`. The current report JSON is strict-parseable with Python's standard library. PowerShell 5 `ConvertFrom-Json` fails on the large nested report payload even though the report writer's JSON parses successfully; future report tooling should use a standards-compliant parser or add a deliberately bounded machine-summary artifact rather than weakening the report data.

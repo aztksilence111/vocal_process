@@ -190,6 +190,7 @@ MATERIAL_RENDER_FILTER_FORMAT = "material_render_filter_mono_atempo_chain_utau_o
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
 RenderBoundaryMeasurementCallback = Callable[[dict[str, Any]], None]
+RenderAcousticDriftMeasurementCallback = Callable[[dict[str, Any]], None]
 
 
 def run_command(args: Sequence[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -1164,6 +1165,7 @@ def assemble_material_to_reference_with_progress(
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
     on_render_boundary_measurement: RenderBoundaryMeasurementCallback | None = None,
+    on_render_acoustic_drift_measurement: RenderAcousticDriftMeasurementCallback | None = None,
 ) -> None:
     normalized_reference = reference_path.expanduser()
     if not normalized_reference.exists():
@@ -1196,6 +1198,7 @@ def assemble_material_to_reference_with_progress(
             on_progress=on_progress,
             should_cancel=should_cancel,
             on_render_boundary_measurement=on_render_boundary_measurement,
+            on_render_acoustic_drift_measurement=on_render_acoustic_drift_measurement,
         )
         return
 
@@ -1255,6 +1258,7 @@ def _assemble_material_clips_with_render_cache(
     on_progress: ProgressCallback | None,
     should_cancel: CancelCallback | None,
     on_render_boundary_measurement: RenderBoundaryMeasurementCallback | None,
+    on_render_acoustic_drift_measurement: RenderAcousticDriftMeasurementCallback | None,
 ) -> None:
     if output_path.exists() and not options.overwrite:
         raise AudioProcessorError(f"Output file already exists: {output_path}")
@@ -1376,6 +1380,18 @@ def _assemble_material_clips_with_render_cache(
         try:
             on_render_boundary_measurement(
                 _measure_rendered_clip_boundary_jumps(
+                    output_path,
+                    rendered_paths,
+                    clip_context=clips,
+                )
+            )
+        except Exception:
+            # Diagnostics must not invalidate an otherwise successful render.
+            pass
+    if on_render_acoustic_drift_measurement is not None:
+        try:
+            on_render_acoustic_drift_measurement(
+                _measure_rendered_clip_acoustic_drift(
                     output_path,
                     rendered_paths,
                     clip_context=clips,
@@ -1533,6 +1549,438 @@ def _load_soundfile_for_boundary_measurement() -> Any:
     import soundfile  # type: ignore
 
     return soundfile
+
+
+def _measure_rendered_clip_acoustic_drift(
+    output_path: Path,
+    clip_paths: Sequence[Path],
+    *,
+    detail_limit: int = 20,
+    clip_context: Sequence[MaterialStretchClip] | None = None,
+) -> dict[str, Any]:
+    """Compare each source window with its rendered clip for pitch/timbre drift."""
+    normalized_output = output_path.expanduser()
+    normalized_clips = [path.expanduser() for path in clip_paths]
+    normalized_context = None
+    if clip_context is not None and len(clip_context) == len(normalized_clips):
+        normalized_context = list(clip_context)
+    result: dict[str, Any] = {
+        "format": "vocal_process_rendered_clip_acoustic_drift_v1",
+        "output_path": str(normalized_output),
+        "clip_count": len(normalized_clips),
+        "measured_clip_count": 0,
+        "status": "not_applicable" if not normalized_clips or normalized_context is None else "pending",
+        "top_clips": [],
+    }
+    if not normalized_clips or normalized_context is None:
+        return result
+
+    measurements: list[dict[str, Any]] = []
+    failure_count = 0
+    for rendered_path, clip in zip(normalized_clips, normalized_context):
+        source_features = _audio_segment_acoustic_features(
+            clip.source_path,
+            start_seconds=clip.source_window_start_seconds,
+            duration_seconds=clip.source_window_duration_seconds,
+        )
+        rendered_features = _audio_segment_acoustic_features(
+            rendered_path,
+            start_seconds=clip.pre_silence_seconds,
+            duration_seconds=(
+                clip.audible_target_duration_seconds
+                if clip.audible_target_duration_seconds is not None
+                else clip.target_duration_seconds
+            ),
+        )
+        comparison = _compare_acoustic_features(source_features, rendered_features)
+        if comparison.get("status") != "ok":
+            failure_count += 1
+            continue
+        measurements.append(
+            {
+                "index": clip.index,
+                "source_path": str(clip.source_path.expanduser()),
+                "rendered_clip_path": str(rendered_path),
+                "text_hint": clip.text_hint,
+                "target_duration_seconds": round(clip.target_duration_seconds, 8),
+                "audible_target_duration_seconds": round(
+                    clip.audible_target_duration_seconds
+                    if clip.audible_target_duration_seconds is not None
+                    else clip.target_duration_seconds,
+                    8,
+                ),
+                "source_window_start_seconds": round(clip.source_window_start_seconds, 8),
+                "source_window_duration_seconds": (
+                    round(clip.source_window_duration_seconds, 8)
+                    if clip.source_window_duration_seconds is not None
+                    else None
+                ),
+                "source_window_source": clip.source_window_source,
+                "source_window_repair": clip.source_window_repair,
+                "stretch_strategy": clip.stretch_strategy,
+                "stretch_backend": clip.stretch_backend,
+                "rubberband_profile": clip.rubberband_profile,
+                "source_features": source_features,
+                "rendered_features": rendered_features,
+                **comparison,
+            }
+        )
+
+    if not measurements:
+        result.update(
+            {
+                "status": "no_measurable_clips",
+                "unmeasured_clip_count": failure_count,
+            }
+        )
+        return result
+
+    f0_values = [
+        abs(float(item["f0_cents_drift"]))
+        for item in measurements
+        if item.get("f0_cents_drift") is not None
+    ]
+    reliable_f0_values = [
+        abs(float(item["f0_cents_drift"]))
+        for item in measurements
+        if item.get("f0_cents_drift") is not None and item.get("f0_drift_reliable") is True
+    ]
+    centroid_values = [
+        abs(float(item["spectral_centroid_ratio_delta"]))
+        for item in measurements
+        if item.get("spectral_centroid_ratio_delta") is not None
+    ]
+    bandwidth_values = [
+        abs(float(item["spectral_bandwidth_ratio_delta"]))
+        for item in measurements
+        if item.get("spectral_bandwidth_ratio_delta") is not None
+    ]
+    result.update(
+        {
+            "status": "ok",
+            "measured_clip_count": len(measurements),
+            "unmeasured_clip_count": failure_count,
+            "f0_measured_clip_count": len(f0_values),
+            "f0_reliable_clip_count": len(reliable_f0_values),
+            "f0_unreliable_clip_count": max(len(f0_values) - len(reliable_f0_values), 0),
+            "f0_reliability_ratio": _round_optional(
+                len(reliable_f0_values) / len(f0_values) if f0_values else None
+            ),
+            "mean_abs_f0_cents_drift": _round_optional(_mean_float(f0_values)),
+            "max_abs_f0_cents_drift": _round_optional(max(f0_values) if f0_values else None),
+            "mean_abs_reliable_f0_cents_drift": _round_optional(_mean_float(reliable_f0_values)),
+            "max_abs_reliable_f0_cents_drift": _round_optional(
+                max(reliable_f0_values) if reliable_f0_values else None
+            ),
+            "mean_abs_spectral_centroid_ratio_delta": _round_optional(_mean_float(centroid_values)),
+            "max_abs_spectral_centroid_ratio_delta": _round_optional(max(centroid_values) if centroid_values else None),
+            "mean_abs_spectral_bandwidth_ratio_delta": _round_optional(_mean_float(bandwidth_values)),
+            "max_abs_spectral_bandwidth_ratio_delta": _round_optional(max(bandwidth_values) if bandwidth_values else None),
+            "top_clips": sorted(
+                measurements,
+                key=lambda item: (
+                    -float(item.get("acoustic_drift_score") or 0.0),
+                    int(item["index"]),
+                ),
+            )[: max(int(detail_limit), 0)],
+        }
+    )
+    return result
+
+
+def _compare_acoustic_features(
+    source_features: dict[str, Any],
+    rendered_features: dict[str, Any],
+) -> dict[str, Any]:
+    if source_features.get("status") != "ok" or rendered_features.get("status") != "ok":
+        return {
+            "status": "unmeasurable_features",
+            "source_status": source_features.get("status", ""),
+            "rendered_status": rendered_features.get("status", ""),
+        }
+
+    source_f0 = _positive_float_or_none(source_features.get("f0_median_hz"))
+    rendered_f0 = _positive_float_or_none(rendered_features.get("f0_median_hz"))
+    f0_cents = None
+    if source_f0 is not None and rendered_f0 is not None:
+        f0_cents = 1200.0 * math.log(rendered_f0 / source_f0, 2)
+    f0_drift_reliable, f0_drift_reliability_reason = _acoustic_f0_reliability(
+        source_features,
+        rendered_features,
+        source_f0=source_f0,
+        rendered_f0=rendered_f0,
+    )
+
+    centroid_delta = _ratio_delta(
+        rendered_features.get("spectral_centroid_hz"),
+        source_features.get("spectral_centroid_hz"),
+    )
+    bandwidth_delta = _ratio_delta(
+        rendered_features.get("spectral_bandwidth_hz"),
+        source_features.get("spectral_bandwidth_hz"),
+    )
+    drift_score = max(
+        abs(float(f0_cents or 0.0)) / 1200.0 if f0_drift_reliable else 0.0,
+        abs(float(centroid_delta or 0.0)),
+        abs(float(bandwidth_delta or 0.0)) * 0.5,
+    )
+    return {
+        "status": "ok",
+        "f0_cents_drift": _round_optional(f0_cents),
+        "f0_drift_reliable": f0_drift_reliable,
+        "f0_drift_reliability_reason": f0_drift_reliability_reason,
+        "spectral_centroid_ratio_delta": _round_optional(centroid_delta),
+        "spectral_bandwidth_ratio_delta": _round_optional(bandwidth_delta),
+        "acoustic_drift_score": round(drift_score, 8),
+    }
+
+
+def _acoustic_f0_reliability(
+    source_features: dict[str, Any],
+    rendered_features: dict[str, Any],
+    *,
+    source_f0: float | None,
+    rendered_f0: float | None,
+) -> tuple[bool, str]:
+    reasons: list[str] = []
+    for label, features in (("source", source_features), ("rendered", rendered_features)):
+        estimate_count = _positive_int_or_none(features.get("f0_estimate_count")) or 0
+        if estimate_count < 3:
+            reasons.append(f"{label}_estimate_count<3")
+        active_duration = _positive_float_or_none(features.get("active_duration_seconds"))
+        if active_duration is None or active_duration < 0.06:
+            reasons.append(f"{label}_active_duration<0.06s")
+        if _positive_float_or_none(features.get("f0_median_hz")) is None:
+            reasons.append(f"{label}_f0_missing")
+    if source_f0 is not None and rendered_f0 is not None:
+        ratio = rendered_f0 / source_f0
+        if ratio < 0.75 or ratio > 1.3333333333:
+            reasons.append("f0_ratio_outside_0.75_to_1.333")
+    return not reasons, ";".join(reasons) if reasons else "sufficient_estimates_duration_and_ratio"
+
+
+def _audio_segment_acoustic_features(
+    path: Path,
+    *,
+    start_seconds: float = 0.0,
+    duration_seconds: float | None = None,
+) -> dict[str, Any]:
+    expanded = path.expanduser()
+    try:
+        stat = expanded.stat()
+    except OSError as exc:
+        return {
+            "format": "vocal_process_audio_segment_acoustic_features_v1",
+            "status": "read_failed",
+            "error": str(exc),
+        }
+    return _audio_segment_acoustic_features_cached(
+        str(expanded.resolve()),
+        stat.st_size,
+        stat.st_mtime_ns,
+        round(max(float(start_seconds or 0.0), 0.0), 6),
+        None if duration_seconds is None else round(max(float(duration_seconds), 0.0), 6),
+    )
+
+
+@lru_cache(maxsize=4096)
+def _audio_segment_acoustic_features_cached(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    start_seconds: float,
+    duration_seconds: float | None,
+) -> dict[str, Any]:
+    del size, mtime_ns
+    result: dict[str, Any] = {
+        "format": "vocal_process_audio_segment_acoustic_features_v1",
+        "status": "pending",
+        "path": path,
+        "segment_start_seconds": start_seconds,
+        "segment_duration_seconds": duration_seconds,
+    }
+    try:
+        soundfile = _load_soundfile_for_boundary_measurement()
+        import numpy as np  # type: ignore
+
+        with soundfile.SoundFile(path) as handle:
+            sample_rate = int(handle.samplerate)
+            total_frames = int(len(handle))
+            start_frame = min(max(int(round(start_seconds * sample_rate)), 0), total_frames)
+            if duration_seconds is None:
+                frame_count = total_frames - start_frame
+            else:
+                frame_count = min(
+                    max(int(round(duration_seconds * sample_rate)), 0),
+                    max(total_frames - start_frame, 0),
+                )
+            if sample_rate <= 0 or frame_count <= 0:
+                result.update({"status": "empty_segment", "sample_rate": sample_rate})
+                return result
+            handle.seek(start_frame)
+            data = handle.read(frame_count, dtype="float64", always_2d=True)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        result.update({"status": "read_failed", "error": str(exc)})
+        return result
+
+    if getattr(data, "size", 0) <= 0:
+        result.update({"status": "empty_segment"})
+        return result
+
+    mono = np.asarray(data, dtype=np.float64).mean(axis=1)
+    active = _active_audio_samples(mono, sample_rate)
+    if active.size < max(64, int(sample_rate * 0.015)):
+        result.update(
+            {
+                "status": "insufficient_active_audio",
+                "sample_rate": sample_rate,
+                "analyzed_duration_seconds": round(float(mono.size) / sample_rate, 8),
+            }
+        )
+        return result
+
+    rms = float(np.sqrt(np.mean(np.square(active)))) if active.size else 0.0
+    centroid, bandwidth = _spectral_centroid_and_bandwidth(active, sample_rate, np)
+    f0_median, f0_count = _autocorrelation_f0_median(active, sample_rate, np)
+    result.update(
+        {
+            "status": "ok",
+            "sample_rate": sample_rate,
+            "analyzed_duration_seconds": round(float(mono.size) / sample_rate, 8),
+            "active_duration_seconds": round(float(active.size) / sample_rate, 8),
+            "rms": round(rms, 8),
+            "f0_median_hz": _round_optional(f0_median),
+            "f0_estimate_count": f0_count,
+            "spectral_centroid_hz": _round_optional(centroid),
+            "spectral_bandwidth_hz": _round_optional(bandwidth),
+        }
+    )
+    return result
+
+
+def _active_audio_samples(samples: Any, sample_rate: int) -> Any:
+    import numpy as np  # type: ignore
+
+    mono = np.asarray(samples, dtype=np.float64)
+    if mono.size == 0 or sample_rate <= 0:
+        return mono
+    frame_size = max(int(round(sample_rate * 0.020)), 64)
+    hop_size = max(int(round(sample_rate * 0.010)), 1)
+    if mono.size <= frame_size:
+        return mono
+    rms_values = []
+    starts = []
+    for start in range(0, mono.size - frame_size + 1, hop_size):
+        frame = mono[start : start + frame_size]
+        rms_values.append(float(np.sqrt(np.mean(np.square(frame)))))
+        starts.append(start)
+    if not rms_values:
+        return mono
+    peak = max(rms_values)
+    if peak <= 0:
+        return mono[:0]
+    threshold = max(peak * 0.03, 1e-5)
+    active_indices = [index for index, value in enumerate(rms_values) if value >= threshold]
+    if not active_indices:
+        return mono[:0]
+    start_sample = starts[active_indices[0]]
+    end_sample = min(starts[active_indices[-1]] + frame_size, mono.size)
+    return mono[start_sample:end_sample]
+
+
+def _spectral_centroid_and_bandwidth(samples: Any, sample_rate: int, np: Any) -> tuple[float | None, float | None]:
+    if sample_rate <= 0 or samples.size < 64:
+        return None, None
+    frame_length = min(max(int(round(sample_rate * 0.046)), 128), int(samples.size))
+    if frame_length < 64:
+        return None, None
+    hop = max(frame_length // 2, 1)
+    n_fft = 1 << max(frame_length - 1, 1).bit_length()
+    window = np.hanning(frame_length)
+    centroids: list[float] = []
+    bandwidths: list[float] = []
+    weights: list[float] = []
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sample_rate)
+    for start in range(0, int(samples.size) - frame_length + 1, hop):
+        frame = samples[start : start + frame_length]
+        frame = frame - float(np.mean(frame))
+        magnitude = np.abs(np.fft.rfft(frame * window, n=n_fft))
+        total = float(np.sum(magnitude))
+        if total <= 1e-12:
+            continue
+        centroid = float(np.sum(freqs * magnitude) / total)
+        bandwidth = float(np.sqrt(np.sum(((freqs - centroid) ** 2) * magnitude) / total))
+        weight = float(np.sqrt(np.mean(np.square(frame))))
+        centroids.append(centroid)
+        bandwidths.append(bandwidth)
+        weights.append(max(weight, 1e-9))
+    if not centroids:
+        return None, None
+    weights_array = np.asarray(weights, dtype=np.float64)
+    return (
+        float(np.average(np.asarray(centroids), weights=weights_array)),
+        float(np.average(np.asarray(bandwidths), weights=weights_array)),
+    )
+
+
+def _autocorrelation_f0_median(samples: Any, sample_rate: int, np: Any) -> tuple[float | None, int]:
+    if sample_rate <= 0 or samples.size < 128:
+        return None, 0
+    min_lag = max(int(sample_rate / 500.0), 1)
+    max_lag = max(int(sample_rate / 65.0), min_lag + 1)
+    frame_length = min(max(max_lag * 3, int(round(sample_rate * 0.060))), int(samples.size))
+    if frame_length <= max_lag + 2:
+        max_lag = max(frame_length - 2, min_lag + 1)
+    if frame_length <= min_lag + 2 or max_lag <= min_lag:
+        return None, 0
+    hop = max(frame_length // 2, 1)
+    estimates: list[float] = []
+    for start in range(0, int(samples.size) - frame_length + 1, hop):
+        frame = samples[start : start + frame_length]
+        frame = frame - float(np.mean(frame))
+        energy = float(np.dot(frame, frame))
+        if energy <= 1e-9:
+            continue
+        correlation = np.correlate(frame, frame, mode="full")[frame_length - 1 :]
+        search = correlation[min_lag : max_lag + 1]
+        if search.size <= 0:
+            continue
+        lag = int(np.argmax(search)) + min_lag
+        confidence = float(correlation[lag] / max(correlation[0], 1e-9))
+        if confidence < 0.30:
+            continue
+        estimates.append(float(sample_rate / lag))
+    if not estimates:
+        return None, 0
+    return float(np.median(np.asarray(estimates))), len(estimates)
+
+
+def _ratio_delta(value: Any, baseline: Any) -> float | None:
+    parsed_value = _positive_float_or_none(value)
+    parsed_baseline = _positive_float_or_none(baseline)
+    if parsed_value is None or parsed_baseline is None:
+        return None
+    return (parsed_value / parsed_baseline) - 1.0
+
+
+def _positive_float_or_none(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 and math.isfinite(parsed) else None
+
+
+def _mean_float(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    return sum(float(value) for value in values) / len(values)
+
+
+def _round_optional(value: float | None, *, digits: int = 8) -> float | None:
+    if value is None or not math.isfinite(float(value)):
+        return None
+    return round(float(value), digits)
 
 
 def _soundfile_frame_samples(handle: Any, frame_index: int) -> tuple[float, ...]:

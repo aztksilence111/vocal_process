@@ -489,6 +489,10 @@ def run_real_suite(
                             case_report_directory / "render",
                             expected_output_paths,
                         ),
+                        "render_acoustic_drift_measurements": _read_render_acoustic_drift_measurements(
+                            case_report_directory / "render",
+                            expected_output_paths,
+                        ),
                     }
                 except Exception as exc:
                     status = "cancelled" if _is_cancellation_exception(exc) else "render_failed"
@@ -1551,6 +1555,7 @@ def _render_validation(
     render_blocked = bool(render_summary.get("blocked")) if isinstance(render_summary, dict) else False
     channel_output_paths = _render_summary_channel_output_paths(render_summary)
     boundary_measurements = _render_summary_boundary_measurements(render_summary)
+    acoustic_drift_measurements = _render_summary_acoustic_drift_measurements(render_summary)
     validation_paths = channel_output_paths or ([output_path] if output_path else [])
     channel_outputs = [
         _channel_output_validation(path, reference_duration_seconds, render_failed)
@@ -1614,6 +1619,24 @@ def _render_validation(
         "render_boundary_measured_count": _render_boundary_measured_count(boundary_measurements),
         "render_boundary_max_sample_jump": _round_float(_render_boundary_max_sample_jump(boundary_measurements)),
         "render_boundary_worst_join": _render_boundary_worst_join(boundary_measurements),
+        "render_acoustic_drift_measurements": acoustic_drift_measurements,
+        "render_acoustic_drift_measured_count": _render_acoustic_drift_measured_count(acoustic_drift_measurements),
+        "render_acoustic_drift_reliable_f0_count": _render_acoustic_drift_reliable_f0_count(
+            acoustic_drift_measurements
+        ),
+        "render_acoustic_drift_unreliable_f0_count": _render_acoustic_drift_unreliable_f0_count(
+            acoustic_drift_measurements
+        ),
+        "render_acoustic_drift_max_abs_f0_cents": _round_float(
+            _render_acoustic_drift_max(acoustic_drift_measurements, "max_abs_f0_cents_drift")
+        ),
+        "render_acoustic_drift_max_abs_reliable_f0_cents": _round_float(
+            _render_acoustic_drift_max(acoustic_drift_measurements, "max_abs_reliable_f0_cents_drift")
+        ),
+        "render_acoustic_drift_max_abs_spectral_centroid_ratio_delta": _round_float(
+            _render_acoustic_drift_max(acoustic_drift_measurements, "max_abs_spectral_centroid_ratio_delta")
+        ),
+        "render_acoustic_drift_worst_clip": _render_acoustic_drift_worst_clip(acoustic_drift_measurements),
     }
 
 
@@ -1630,6 +1653,30 @@ def _read_render_boundary_measurements(
     diagnostics_directory: Path,
     output_paths: Sequence[Path],
 ) -> list[dict[str, Any]]:
+    return _read_render_diagnostic_measurements(
+        diagnostics_directory,
+        output_paths,
+        stage="render.boundaries.measured",
+    )
+
+
+def _read_render_acoustic_drift_measurements(
+    diagnostics_directory: Path,
+    output_paths: Sequence[Path],
+) -> list[dict[str, Any]]:
+    return _read_render_diagnostic_measurements(
+        diagnostics_directory,
+        output_paths,
+        stage="render.acoustic_drift.measured",
+    )
+
+
+def _read_render_diagnostic_measurements(
+    diagnostics_directory: Path,
+    output_paths: Sequence[Path],
+    *,
+    stage: str,
+) -> list[dict[str, Any]]:
     measurements: list[dict[str, Any]] = []
     for output_path in output_paths:
         log_path = diagnostic_log_path(output_path, diagnostics_directory)
@@ -1644,7 +1691,7 @@ def _read_render_boundary_measurements(
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(record, dict) or record.get("stage") != "render.boundaries.measured":
+            if not isinstance(record, dict) or record.get("stage") != stage:
                 continue
             fields = record.get("fields")
             measurement = fields.get("measurement") if isinstance(fields, dict) else None
@@ -1657,6 +1704,15 @@ def _render_summary_boundary_measurements(render_summary: dict[str, Any]) -> lis
     if not isinstance(render_summary, dict):
         return []
     raw_measurements = render_summary.get("render_boundary_measurements")
+    if not isinstance(raw_measurements, list):
+        return []
+    return [measurement for measurement in raw_measurements if isinstance(measurement, dict)]
+
+
+def _render_summary_acoustic_drift_measurements(render_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(render_summary, dict):
+        return []
+    raw_measurements = render_summary.get("render_acoustic_drift_measurements")
     if not isinstance(raw_measurements, list):
         return []
     return [measurement for measurement in raw_measurements if isinstance(measurement, dict)]
@@ -1720,6 +1776,82 @@ def _render_boundary_worst_join(measurements: Sequence[dict[str, Any]]) -> dict[
     result["boundary_count"] = _positive_int(worst_measurement.get("boundary_count"))
     result["measured_boundary_count"] = _positive_int(worst_measurement.get("measured_boundary_count"))
     result["max_sample_jump"] = _round_float(_safe_float(worst_measurement.get("max_sample_jump")))
+    return result
+
+
+def _render_acoustic_drift_measured_count(measurements: Sequence[dict[str, Any]]) -> int:
+    total = 0
+    for measurement in measurements:
+        total += _positive_int(measurement.get("measured_clip_count"))
+    return total
+
+
+def _render_acoustic_drift_reliable_f0_count(measurements: Sequence[dict[str, Any]]) -> int:
+    total = 0
+    for measurement in measurements:
+        total += _positive_int(measurement.get("f0_reliable_clip_count"))
+    return total
+
+
+def _render_acoustic_drift_unreliable_f0_count(measurements: Sequence[dict[str, Any]]) -> int:
+    total = 0
+    for measurement in measurements:
+        explicit = measurement.get("f0_unreliable_clip_count")
+        if explicit is not None:
+            total += _positive_int(explicit)
+            continue
+        total += max(
+            _positive_int(measurement.get("f0_measured_clip_count"))
+            - _positive_int(measurement.get("f0_reliable_clip_count")),
+            0,
+        )
+    return total
+
+
+def _render_acoustic_drift_max(measurements: Sequence[dict[str, Any]], key: str) -> float | None:
+    values = [
+        _safe_float(measurement.get(key))
+        for measurement in measurements
+        if isinstance(measurement, dict)
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _render_acoustic_drift_worst_clip(measurements: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    worst_measurement: dict[str, Any] | None = None
+    worst_clip: dict[str, Any] | None = None
+    worst_score = -1.0
+    for measurement in measurements:
+        if not isinstance(measurement, dict):
+            continue
+        top_clips = measurement.get("top_clips")
+        if not isinstance(top_clips, list):
+            continue
+        for clip in top_clips:
+            if not isinstance(clip, dict):
+                continue
+            score = _safe_float(clip.get("acoustic_drift_score"))
+            if score is None:
+                score = max(
+                    (
+                        abs(_safe_float(clip.get("f0_cents_drift")) or 0.0) / 1200.0
+                        if clip.get("f0_drift_reliable", True)
+                        else 0.0
+                    ),
+                    abs(_safe_float(clip.get("spectral_centroid_ratio_delta")) or 0.0),
+                    abs(_safe_float(clip.get("spectral_bandwidth_ratio_delta")) or 0.0) * 0.5,
+                )
+            if score > worst_score:
+                worst_score = score
+                worst_clip = clip
+                worst_measurement = measurement
+    if worst_clip is None:
+        return None
+    result = dict(worst_clip)
+    if worst_measurement is not None:
+        result["clip_count"] = _positive_int(worst_measurement.get("clip_count"))
+        result["measured_clip_count"] = _positive_int(worst_measurement.get("measured_clip_count"))
     return result
 
 
@@ -2093,11 +2225,12 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         (
             "| 用例 Case | Split | Language | Status | 规划分 Plan Score | 渲染分 Render Score | "
             "拉伸质量 Stretch Quality | 拉伸自然度 Stretch Naturalness | 边界风险 Boundary Risks | "
+            "声学漂移 Acoustic Drift | "
             "最低匹配 Min Match | 平均匹配 Mean Match | 定位率 Positioned | 计时率 Timed | "
             "目标时长差 Target Delta | 渲染时长差 Render Delta | 严格通过 Strict Pass | "
             "需复查 Review Needed | 输出音频 Output Audio |"
         ),
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for result in results:
         case_summary = result.summary
@@ -2111,6 +2244,11 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         stretch_naturalness = case_summary.get("stretch_naturalness_score", "")
         continuity_warnings = case_summary.get("continuity_warning_count", "")
         worst_join = render_validation.get("render_boundary_worst_join", {}) if isinstance(render_validation, dict) else {}
+        worst_acoustic_drift = (
+            render_validation.get("render_acoustic_drift_worst_clip", {})
+            if isinstance(render_validation, dict)
+            else {}
+        )
         positioned_ratio = case_summary.get("positioned_decision_ratio", "")
         timed_ratio = case_summary.get("timed_target_duration_ratio", "")
         target_delta = scorecard.get("target_duration_delta_seconds", "") if isinstance(scorecard, dict) else ""
@@ -2119,11 +2257,12 @@ def _render_markdown_report(summary: dict[str, Any], results: Sequence[RealCaseR
         )
         review_count = case_summary.get("review_required_match_count", "")
         boundary_risks_value = _render_boundary_risk_markdown_value(continuity_warnings, worst_join)
+        acoustic_drift_value = _render_acoustic_drift_markdown_value(worst_acoustic_drift)
         lines.append(
             f"| {result.case.name} | {result.case.split} | {result.case.language or 'unknown'} | "
             f"{result.status} | {_markdown_value(plan_score)} | {_markdown_value(render_score)} | "
             f"{_markdown_value(stretch_quality)} | {_markdown_value(stretch_naturalness)} | "
-            f"{_markdown_value(boundary_risks_value)} | "
+            f"{_markdown_value(boundary_risks_value)} | {_markdown_value(acoustic_drift_value)} | "
             f"{_markdown_value(min_score)} | {_markdown_value(mean_score)} | {_markdown_value(positioned_ratio)} | "
             f"{_markdown_value(timed_ratio)} | {_markdown_value(target_delta)} | {_markdown_value(render_delta)} | "
             f"{case_summary.get('strict_render_pass', False)} | {review_count} | "
@@ -2239,6 +2378,28 @@ def _render_boundary_join_markdown_value(worst_join: Any) -> str:
     if output_time_seconds:
         value += f" ({output_time_seconds}s)"
     return value
+
+
+def _render_acoustic_drift_markdown_value(worst_clip: Any) -> str:
+    if not isinstance(worst_clip, dict):
+        return ""
+    parts: list[str] = []
+    f0_cents = _safe_float(worst_clip.get("f0_cents_drift"))
+    if f0_cents is not None and worst_clip.get("f0_drift_reliable", True):
+        parts.append(f"F0 {f0_cents:+.0f}c")
+    elif f0_cents is not None:
+        parts.append("F0 untrusted")
+    centroid_delta = _safe_float(worst_clip.get("spectral_centroid_ratio_delta"))
+    if centroid_delta is not None:
+        parts.append(f"centroid {centroid_delta:+.3g}")
+    clip_index = worst_clip.get("index")
+    text_hint = str(worst_clip.get("text_hint") or "")
+    if clip_index is not None:
+        label = f"clip {clip_index}"
+        if text_hint:
+            label += f" {text_hint}"
+        parts.append(label)
+    return " / ".join(parts)
 
 
 if __name__ == "__main__":

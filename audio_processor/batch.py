@@ -245,6 +245,13 @@ def run_batch_queue(
                             measurement=measurement,
                         )
 
+                    def render_acoustic_drift_measurement(measurement: dict[str, Any]) -> None:
+                        diagnostics.event(
+                            "render.acoustic_drift.measured",
+                            "Measured source-window to rendered-clip acoustic drift",
+                            measurement=measurement,
+                        )
+
                     assemble_material_to_reference_with_progress(
                         item.input_path,
                         Path(settings.material_directory),
@@ -263,6 +270,7 @@ def run_batch_queue(
                         on_progress=progress_callback,
                         should_cancel=should_cancel,
                         on_render_boundary_measurement=render_boundary_measurement,
+                        on_render_acoustic_drift_measurement=render_acoustic_drift_measurement,
                     )
             else:
                 process_audio_with_progress(

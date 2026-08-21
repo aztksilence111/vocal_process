@@ -47,6 +47,8 @@ from audio_processor.engine import (
     _build_duration_correction_args,
     _build_material_filter_graph,
     _build_rendered_clip_concat_args,
+    _compare_acoustic_features,
+    _measure_rendered_clip_acoustic_drift,
     _ensure_audio_duration,
     _measure_rendered_clip_boundary_jumps,
     _write_rendered_clip_concat_list,
@@ -2109,6 +2111,182 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(event["fields"]["measurement"]["status"], "ok")
         self.assertAlmostEqual(event["fields"]["measurement"]["max_sample_jump"], 0.25)
 
+    def test_batch_records_render_acoustic_drift_diagnostics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            reference = root / "reference.wav"
+            material_dir = root / "materials"
+            material_dir.mkdir()
+            _write_tone_wave(reference, duration_seconds=1.0)
+            _write_tone_wave(material_dir / "wo.wav", duration_seconds=1.0)
+            settings = ProcessingSettings(
+                material_directory=str(material_dir),
+                output_directory=str(root / "out"),
+                overwrite=True,
+            )
+            item = create_queue([reference], settings)[0]
+
+            ordering = model_runtime.ModelOrderingResult(
+                reference=model_runtime.ReferenceAnalysis(
+                    source_path=reference,
+                    vocal_path=reference,
+                    transcript="wo",
+                    segments=(VoiceSegment(0.0, 1.0, "wo"),),
+                    speaker_embedding=None,
+                    backend="test",
+                ),
+                library=model_runtime.MaterialLibraryAnalysis(
+                    material_directory=material_dir,
+                    materials=(),
+                    backend_summary={},
+                ),
+                ordered_paths=(material_dir / "wo.wav",),
+                target_durations=(1.0,),
+                target_audible_durations=(1.0,),
+                target_pre_silences=(0.0,),
+                decisions=(
+                    model_runtime.OrderingDecision(
+                        rank=1,
+                        source_path=material_dir / "wo.wav",
+                        score=0.9,
+                        transcript_score=0.0,
+                        filename_score=0.9,
+                        duration_score=0.8,
+                        speaker_score=0.0,
+                        vad_score=1.0,
+                        phonetic_score=0.9,
+                        evidence_count=2,
+                        confidence_label="high",
+                        reference_text="wo",
+                        material_text="wo",
+                        reason="test",
+                        target_duration_seconds=1.0,
+                    ),
+                ),
+                analysis_report={"backend_summary": {}},
+            )
+
+            def fake_assemble(*args: object, **kwargs: object) -> None:
+                callback = kwargs.get("on_render_acoustic_drift_measurement")
+                if callback is not None:
+                    callback(
+                        {
+                            "format": "vocal_process_rendered_clip_acoustic_drift_v1",
+                            "status": "ok",
+                            "clip_count": 1,
+                            "measured_clip_count": 1,
+                            "max_abs_f0_cents_drift": 12.5,
+                            "max_abs_spectral_centroid_ratio_delta": 0.08,
+                            "top_clips": [
+                                {
+                                    "index": 1,
+                                    "acoustic_drift_score": 0.08,
+                                    "f0_cents_drift": 12.5,
+                                    "spectral_centroid_ratio_delta": 0.08,
+                                    "spectral_bandwidth_ratio_delta": 0.04,
+                                    "text_hint": "wo",
+                                }
+                            ],
+                        }
+                    )
+                _write_test_wave(item.output_path, duration_seconds=1.0)
+
+            with patch("audio_processor.batch.build_model_ordering", return_value=ordering):
+                with patch("audio_processor.batch.assemble_material_to_reference_with_progress", side_effect=fake_assemble):
+                    summary = run_batch_queue([item], settings)
+
+            records = [
+                json.loads(line)
+                for line in diagnostic_log_path(item.output_path).read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(summary.completed, 1)
+        event = next(record for record in records if record["stage"] == "render.acoustic_drift.measured")
+        self.assertEqual(event["fields"]["measurement"]["status"], "ok")
+        self.assertAlmostEqual(event["fields"]["measurement"]["max_abs_f0_cents_drift"], 12.5)
+
+    def test_rendered_clip_acoustic_drift_measurement_reports_pitch_and_timbre_delta(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "output.wav"
+            clip_a = root / "clip_a.wav"
+            clip_b = root / "clip_b.wav"
+            _write_tone_wave(output, duration_seconds=1.0)
+            _write_tone_wave(clip_a, duration_seconds=0.5)
+            _write_tone_wave(clip_b, duration_seconds=0.5)
+            measurement = _measure_rendered_clip_acoustic_drift(
+                output,
+                [clip_a, clip_b],
+                clip_context=[
+                    MaterialStretchClip(
+                        index=1,
+                        source_path=clip_a,
+                        source_duration_seconds=0.5,
+                        target_duration_seconds=0.5,
+                        tempo=1.0,
+                        source_window_duration_seconds=0.5,
+                        text_hint="wo",
+                    ),
+                    MaterialStretchClip(
+                        index=2,
+                        source_path=clip_b,
+                        source_duration_seconds=0.5,
+                        target_duration_seconds=0.5,
+                        tempo=1.0,
+                        source_window_duration_seconds=0.5,
+                        text_hint="wo",
+                    ),
+                ],
+            )
+
+        self.assertEqual(measurement["status"], "ok")
+        self.assertEqual(measurement["measured_clip_count"], 2)
+        self.assertIn("top_clips", measurement)
+
+    def test_acoustic_f0_drift_excludes_low_evidence_estimates_from_score(self) -> None:
+        unreliable = _compare_acoustic_features(
+            {
+                "status": "ok",
+                "f0_median_hz": 200.0,
+                "f0_estimate_count": 1,
+                "active_duration_seconds": 0.02,
+                "spectral_centroid_hz": 1000.0,
+                "spectral_bandwidth_hz": 800.0,
+            },
+            {
+                "status": "ok",
+                "f0_median_hz": 400.0,
+                "f0_estimate_count": 1,
+                "active_duration_seconds": 0.02,
+                "spectral_centroid_hz": 1000.0,
+                "spectral_bandwidth_hz": 800.0,
+            },
+        )
+        reliable = _compare_acoustic_features(
+            {
+                "status": "ok",
+                "f0_median_hz": 200.0,
+                "f0_estimate_count": 8,
+                "active_duration_seconds": 0.3,
+                "spectral_centroid_hz": 1000.0,
+                "spectral_bandwidth_hz": 800.0,
+            },
+            {
+                "status": "ok",
+                "f0_median_hz": 210.0,
+                "f0_estimate_count": 8,
+                "active_duration_seconds": 0.3,
+                "spectral_centroid_hz": 1000.0,
+                "spectral_bandwidth_hz": 800.0,
+            },
+        )
+
+        self.assertFalse(unreliable["f0_drift_reliable"])
+        self.assertAlmostEqual(unreliable["f0_cents_drift"], 1200.0)
+        self.assertEqual(unreliable["acoustic_drift_score"], 0.0)
+        self.assertTrue(reliable["f0_drift_reliable"])
+        self.assertGreater(reliable["acoustic_drift_score"], 0.0)
+
     def test_batch_ignores_stored_lyrics_file_when_manual_lyrics_disabled(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2351,6 +2529,30 @@ class RealEvalTests(unittest.TestCase):
                         ],
                     },
                 )
+                diagnostics.event(
+                    "render.acoustic_drift.measured",
+                    "Measured source-window to rendered-clip acoustic drift",
+                    measurement={
+                        "format": "vocal_process_rendered_clip_acoustic_drift_v1",
+                        "status": "ok",
+                        "clip_count": 2,
+                        "measured_clip_count": 2,
+                        "f0_reliable_clip_count": 1,
+                        "f0_unreliable_clip_count": 1,
+                        "max_abs_f0_cents_drift": 48.0,
+                        "max_abs_reliable_f0_cents_drift": 48.0,
+                        "max_abs_spectral_centroid_ratio_delta": 0.24,
+                        "top_clips": [
+                            {
+                                "index": 2,
+                                "text_hint": "ai",
+                                "acoustic_drift_score": 0.24,
+                                "f0_cents_drift": -48.0,
+                                "spectral_centroid_ratio_delta": 0.24,
+                            }
+                        ],
+                    },
+                )
                 _write_test_wave(items[0].output_path, duration_seconds=4.02)
                 return BatchSummary(total=1, completed=1, failed=0, cancelled=0)
 
@@ -2377,10 +2579,29 @@ class RealEvalTests(unittest.TestCase):
         self.assertEqual(result.cases[0].status, "rendered")
         self.assertEqual(case_summary["render_validation"]["status"], "ok")
         self.assertEqual(case_summary["render_validation"]["render_boundary_measured_count"], 1)
+        self.assertEqual(case_summary["render_validation"]["render_acoustic_drift_reliable_f0_count"], 1)
+        self.assertEqual(case_summary["render_validation"]["render_acoustic_drift_unreliable_f0_count"], 1)
         self.assertAlmostEqual(case_summary["render_validation"]["render_boundary_max_sample_jump"], 0.125)
+        self.assertAlmostEqual(
+            case_summary["render_validation"]["render_acoustic_drift_max_abs_reliable_f0_cents"],
+            48.0,
+        )
         self.assertEqual(
             case_summary["render_validation"]["render_boundary_worst_join"]["output_frame_index"],
             1234,
+        )
+        self.assertEqual(case_summary["render_validation"]["render_acoustic_drift_measured_count"], 2)
+        self.assertAlmostEqual(
+            case_summary["render_validation"]["render_acoustic_drift_max_abs_f0_cents"],
+            48.0,
+        )
+        self.assertAlmostEqual(
+            case_summary["render_validation"]["render_acoustic_drift_max_abs_spectral_centroid_ratio_delta"],
+            0.24,
+        )
+        self.assertEqual(
+            case_summary["render_validation"]["render_acoustic_drift_worst_clip"]["index"],
+            2,
         )
         self.assertTrue(case_summary["strict_render_pass"])
         self.assertAlmostEqual(case_summary["match_score_mean"], 0.86)
@@ -2399,6 +2620,8 @@ class RealEvalTests(unittest.TestCase):
         self.assertIn("Render Score", markdown)
         self.assertIn("Stretch Quality", markdown)
         self.assertIn("Boundary Risks", markdown)
+        self.assertIn("Acoustic Drift", markdown)
+        self.assertIn("F0 -48c / centroid +0.24 / clip 2 ai", markdown)
         self.assertIn("0.125 @ 1234 (0.15425s)", markdown)
         self.assertIn("Timed", markdown)
         self.assertIn("Strict Pass", markdown)
