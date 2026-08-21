@@ -1,5 +1,13 @@
 # Conversation Log
 
+## Latest Update - 2026-08-21 Resume And Remote Publication
+
+1. Read `.tmp\codex-admin-resume.md`, `PROJECT_RULES.md`, `CONVERSATION_LOG.md`, `PROJECT_ANALYSIS.md`, the relevant long-term memory, and the current Git state.
+2. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed. No background Python, FFmpeg, Rubber Band, or autonomous worker remained active.
+3. Retried the pending publication. `main`, `codex/render-boundary-metrics`, and `archive/main-before-real-output-closeout` are now available on GitHub. The completed work branch and `main` were fast-forwarded together to `1f29dc9`.
+4. Added the required `2026-08-21` README update log for rendered boundary diagnostics and real-output closeout. The existing portable release asset workflow is unchanged.
+5. Final local state is clean on `main`, with `main` and `codex/render-boundary-metrics` at `1f29dc9`, and the backup branch at `bcb0c6b`.
+
 ## Latest Update - Closeout Publishing Status
 
 1. The closeout log commit was created locally as `86aa37d Record real output closeout`.

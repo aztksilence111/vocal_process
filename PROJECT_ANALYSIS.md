@@ -1,5 +1,15 @@
 # Project Analysis
 
+## Latest Update - 2026-08-21 Resume And Remote Publication
+
+The interrupted operational closeout is complete. The local implementation was already verified before this resume; this round restored the missing publication and documentation steps.
+
+1. `dev_preflight.ps1 -Workspace E:\Workplace\demo -FullGitProbe` passed.
+2. GitHub publication succeeded for `main` and `codex/render-boundary-metrics` at `1f29dc9`.
+3. `archive/main-before-real-output-closeout` was published at `bcb0c6b`, preserving the pre-promotion main state.
+4. `README.md` now records the rendered boundary diagnostics, strict CN/JP real-output closeout, unchanged release assets, and manual-review impact.
+5. No new DSP change was introduced. The governing invariants remain exact original-vocal unit timing and local phonetic identity; current boundary metrics do not justify broad sample-level smoothing.
+
 ## Latest Update - Closeout Publishing Status
 
 The implementation and real-output evidence are complete locally. `main` now contains the boundary-diagnostics work and the closeout log commit `86aa37d`; the local backup `archive/main-before-real-output-closeout` preserves the previous main tip. The repository is clean.
